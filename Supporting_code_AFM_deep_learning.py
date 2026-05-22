@@ -384,8 +384,8 @@ plt.show()
 # Import AFM tip and apply grey dilation
 # ============================================================
 
-tip = io.loadmat(f'{OUTPUT_DIR}/tip.mat')
-tip_shape = tip['tip_tip'] * 1e9
+tip = io.loadmat('tip.mat/tip_estimated.mat')
+tip_shape = tip['tip']
 plt.imshow(tip_shape)
 plt.colorbar()
 plt.title("AFM Tip Shape")
@@ -431,9 +431,10 @@ np.save(f'{OUTPUT_DIR}/dilated_poly_stack.npy', dilated_poly_surf_stack)
 def line_artifact_adder(image_data, image_size):
     # [Fix 5] 修正方向：AFM 掃描偽影為水平（row-based），
     #         line_picker shape 從 (128,1) 改為 (1,128)
+    # 背景值 0.0：新 tip max=0nm，dilation 不產生偏移，無需校正
     processed_images_l = []
     for image in tqdm(image_data, desc="Line Artifacts", unit="img", leave=False):
-        processed_image = image + np.full((128, 128), -167.73)  # Background subtraction
+        processed_image = image + np.full((128, 128), 0.0)  # Background subtraction
         line_picker = np.random.random((1, 128))                 # [Fix 5] (1, 128) → row mask
         line_picker = line_picker > 0.05
         preserved_lines = np.ones((128, 128)) * line_picker      # 廣播：每一行整排同值
@@ -486,8 +487,8 @@ edge_lifted_poly_stack  = edge_lifter(true_poly_surf_stack, target_size)
 np.save(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy', edge_lifted_cubic_stack)
 np.save(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy', edge_lifted_poly_stack)
 
-tip = io.loadmat(f'{OUTPUT_DIR}/tip.mat')
-tip_shape = tip['tip_tip'] * 1e9
+tip = io.loadmat('tip.mat/tip_estimated.mat')
+tip_shape = tip['tip']
 plt.imshow(tip_shape)
 plt.colorbar()
 plt.title("AFM Tip Shape")
@@ -569,7 +570,7 @@ print("Training data loaded.",
 def height_correcter_X(image_data, image_size):
     processed_images_l = []
     for image in tqdm(image_data, desc="Preprocessing X", unit="img", leave=False):
-        processed_image = image + np.full((128, 128), -167.73)  # Background subtraction
+        processed_image = image + np.full((128, 128), 0.0)  # Background subtraction
         processed_images_l.append(processed_image.reshape(image_size[0], image_size[1], 1))
     processed_images_a = np.stack(processed_images_l, axis=0)
     return processed_images_a

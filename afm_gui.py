@@ -19,7 +19,7 @@ from scipy.signal import correlate2d
 
 C = {
     'bg':'#0f1117','panel':'#1a1d27','border':'#2a2d3a',
-    'accent':'#4f9cf9','success':'#22c55e','warn':'#f59e0b','danger':'#ef4444',
+    'accent':'#4f9cf9','accent2':'#7c3aed','success':'#22c55e','warn':'#f59e0b','danger':'#ef4444',
     'text':'#e2e8f0','muted':'#64748b','input_bg':'#252836','hover':'#2d3348',
 }
 
@@ -170,7 +170,13 @@ def make_gt(n_px, scan_nm, geom, shape_type):
                     np.maximum(gt[side], sl, out=gt[side])
     return gt
 
-def make_gt_patch(geom, shape_type, half, px_nm):
+def make_gt_patch(geom, shape_type, half, px_nm, blur_sigma=1.5):
+    """
+    生成單特徵理想 GT patch。
+    blur_sigma：對邊緣做高斯模糊（px），模擬真實過渡，消除銳利邊界假影。
+    設 0 則不模糊。
+    """
+    from scipy.ndimage import gaussian_filter
     size = 2*half; h = geom['height']
     gt = np.zeros((size,size))
     yi,xi = np.indices((size,size))
@@ -185,6 +191,9 @@ def make_gt_patch(geom, shape_type, half, px_nm):
         side = (dist > r_min) & (dist <= r_max)
         if r_max > r_min:
             gt[side] = h*(r_max - dist[side])/(r_max - r_min)
+    # 修正①：邊緣高斯模糊，消除 GT 銳利切斷造成的尖刺假影
+    if blur_sigma > 0:
+        gt = gaussian_filter(gt, sigma=blur_sigma)
     return gt
 
 def align_gt(scan, gt, shape_type):
@@ -247,9 +256,32 @@ def reconstruct(scan, geom, shape_type, meta, ap):
     else: avg -= avg.min()
 
     gt_p = make_gt_patch(geom, shape_type, half, meta['px_nm'])
-    tip  = avg - gt_p
-    tip -= tip.max()
-    return tip, avg, gt_p, len(patches), gt_al, info
+    tip_raw = avg - gt_p
+    tip_raw -= tip_raw.max()
+
+    # 修正②：中心窗截取，去掉邊緣 15% 的假影區域
+    crop = max(1, int(half * 0.15))
+    tip_cropped = tip_raw.copy()
+    tip_cropped[:crop, :]  = 0
+    tip_cropped[-crop:, :] = 0
+    tip_cropped[:, :crop]  = 0
+    tip_cropped[:, -crop:] = 0
+    # 邊緣用內側值平滑填補（避免突然截斷）
+    from scipy.ndimage import gaussian_filter
+    edge_mask = np.zeros_like(tip_cropped, dtype=bool)
+    edge_mask[:crop+2, :] = True; edge_mask[-crop-2:, :] = True
+    edge_mask[:, :crop+2] = True; edge_mask[:, -crop-2:] = True
+    tip_smooth = gaussian_filter(tip_raw, sigma=2)
+    tip_cropped[edge_mask] = tip_smooth[edge_mask]
+
+    # 修正③：左右+上下對稱化（物理上探針應為旋轉對稱）
+    tip_sym = (tip_cropped
+               + tip_cropped[::-1, :]
+               + tip_cropped[:, ::-1]
+               + tip_cropped[::-1, ::-1]) / 4.0
+    tip_sym -= tip_sym.max()
+
+    return tip_sym, avg, gt_p, len(patches), gt_al, info
 
 # ══════════════════════════════════════════════════════════════════
 # GUI
@@ -273,7 +305,6 @@ class App(tk.Tk):
         self.pct_v    = tk.StringVar(value='auto')
         for v in (self.d_bot,self.d_top,self.height):
             v.trace_add('write', lambda *_: self.after(80, self._update_info))
-        self.fig_history = []   # [(label, Figure), ...]
         self._build(); self.protocol('WM_DELETE_WINDOW', self.on_close)
 
     # ── 佈局 ──────────────────────────────────────────────────────
@@ -339,6 +370,8 @@ class App(tk.Tk):
         tk.Frame(sb,bg=C['panel'],height=8).pack()
         self._btn(sb,'▶  執行重建',self.run,big=True).pack(fill='x',padx=14,pady=3)
         self._btn(sb,'💾  儲存 tip.mat',self.save,color=C['success']
+                  ).pack(fill='x',padx=14,pady=3)
+        self._btn(sb,'🖼  儲存圖片',self.save_figure,color=C['accent2']
                   ).pack(fill='x',padx=14,pady=3)
 
         ttk.Separator(sb).pack(fill='x',padx=14)
@@ -410,16 +443,6 @@ class App(tk.Tk):
         self.canvas=FigureCanvasTkAgg(self.fig,master=m)
         self.canvas.get_tk_widget().grid(row=1,column=0,sticky='nsew')
 
-        # 圖片歷史工具列
-        hist_bar = tk.Frame(m, bg=C['panel'], height=38)
-        hist_bar.grid(row=2, column=0, sticky='ew', pady=(8,0))
-        hist_bar.columnconfigure(1, weight=1)
-        tk.Label(hist_bar, text='已保留圖片：', bg=C['panel'], fg=C['muted'],
-                 font=('Helvetica',9)).grid(row=0,column=0,padx=10,pady=8)
-        self.hist_frame = tk.Frame(hist_bar, bg=C['panel'])
-        self.hist_frame.grid(row=0, column=1, sticky='ew', pady=6)
-        self._btn(hist_bar, '📷 保留目前圖片', self.keep_fig,
-                  color=C['accent2']).grid(row=0, column=2, padx=10, pady=4)
         self._placeholder()
 
     def _sec(self,p,t):
@@ -619,89 +642,23 @@ class App(tk.Tk):
             color=C['text'],fontsize=10,fontweight='bold')
         self.canvas.draw()
 
-    def keep_fig(self):
-        """將目前圖表複製一份存入歷史，並在工具列新增縮圖按鈕"""
-        import copy, io
-        from PIL import Image, ImageTk
-
-        # 用 bytes 複製目前 figure（避免共享 axes 物件）
-        buf = io.BytesIO()
-        self.fig.savefig(buf, format='png', dpi=60, facecolor=C['bg'],
-                         bbox_inches='tight')
-        buf.seek(0)
-
-        # 生成標籤
-        afm_name = os.path.basename(self.afm_path.get()) if self.meta else 'preview'
-        label = f"{len(self.fig_history)+1}. {afm_name}"
-
-        # 存成 PNG bytes（輕量，不存整個 Figure 物件）
-        hires_buf = io.BytesIO()
-        self.fig.savefig(hires_buf, format='png', dpi=150, facecolor=C['bg'],
-                         bbox_inches='tight')
-        self.fig_history.append({'label': label, 'png': hires_buf.getvalue(),
-                                  'thumb_png': buf.getvalue()})
-        self._refresh_hist()
-        self.log(f'📷 已保留：{label}')
-
-    def _refresh_hist(self):
-        """重繪歷史縮圖按鈕列"""
-        import io
-        from PIL import Image, ImageTk
-        for w in self.hist_frame.winfo_children():
-            w.destroy()
-        for i, item in enumerate(self.fig_history):
-            # 縮圖
-            img = Image.open(io.BytesIO(item['thumb_png'])).resize((80,52))
-            tk_img = ImageTk.PhotoImage(img)
-            frame = tk.Frame(self.hist_frame, bg=C['border'], padx=1, pady=1)
-            frame.pack(side='left', padx=4)
-            btn = tk.Button(frame, image=tk_img, text=f"{i+1}",
-                            compound='top', bg=C['panel'], fg=C['text'],
-                            relief='flat', cursor='hand2',
-                            font=('Helvetica',7),
-                            command=lambda idx=i: self._show_hist(idx))
-            btn.image = tk_img   # 防止 GC
-            btn.pack()
-            # 右鍵選單（匯出/刪除）
-            menu = tk.Menu(self, tearoff=0, bg=C['panel'], fg=C['text'],
-                           activebackground=C['hover'])
-            menu.add_command(label='💾 匯出為 PNG',
-                             command=lambda idx=i: self._export_hist(idx))
-            menu.add_command(label='🗑 刪除',
-                             command=lambda idx=i: self._delete_hist(idx))
-            btn.bind('<Button-3>', lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
-
-    def _show_hist(self, idx):
-        """點擊縮圖 → 在主畫布顯示該歷史圖片"""
-        import io
-        from PIL import Image
-        import matplotlib.image as mpimg
-        item = self.fig_history[idx]
-        img = mpimg.imread(io.BytesIO(item['png']))
-        self.fig.clear()
-        ax = self.fig.add_axes([0,0,1,1])
-        ax.imshow(img); ax.axis('off')
-        self.fig.patch.set_facecolor(C['bg'])
-        self.canvas.draw()
-        self.log(f'顯示已保留圖片：{item["label"]}')
-
-    def _export_hist(self, idx):
-        """匯出歷史圖片為 PNG"""
-        item = self.fig_history[idx]
-        default_name = item['label'].replace('. ','_').replace(' ','_') + '.png'
-        p = filedialog.asksaveasfilename(title='匯出圖片', defaultextension='.png',
-            initialfile=default_name,
-            filetypes=[('PNG','*.png'),('All','*.*')])
+    def save_figure(self):
+        """將目前畫布儲存為指定路徑的圖片"""
+        afm_name = os.path.splitext(os.path.basename(self.afm_path.get()))[0]                    if self.meta else 'afm_result'
+        p = filedialog.asksaveasfilename(
+            title='儲存圖片',
+            defaultextension='.png',
+            initialfile=f'{afm_name}_result.png',
+            filetypes=[('PNG 圖片','*.png'),('JPEG 圖片','*.jpg'),
+                       ('TIFF 圖片','*.tif'),('All files','*.*')])
         if not p: return
-        with open(p,'wb') as f: f.write(item['png'])
-        self.log(f'✓ 匯出：{os.path.basename(p)}')
-
-    def _delete_hist(self, idx):
-        """刪除一筆歷史"""
-        label = self.fig_history[idx]['label']
-        self.fig_history.pop(idx)
-        self._refresh_hist()
-        self.log(f'🗑 刪除：{label}')
+        try:
+            dpi = 150
+            self.fig.savefig(p, dpi=dpi, facecolor=C['bg'], bbox_inches='tight')
+            self.log(f'✓ 圖片儲存：{p}')
+            messagebox.showinfo('完成', f'圖片已儲存至：\n{p}')
+        except Exception as e:
+            messagebox.showerror('失敗', str(e)); self.log(f'✗ {e}')
 
     def save(self):
         if self.tip is None:

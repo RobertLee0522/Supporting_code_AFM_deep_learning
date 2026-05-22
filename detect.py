@@ -65,8 +65,8 @@ def preprocess_image(image_path):
     img_array = np.array(img_resized, dtype=np.float32)
 
     # 背景減去 (與訓練時相同的處理)
-    # 注意：這裡假設輸入影像的數值範圍與訓練資料相近
-    processed_image = img_array + np.full(TARGET_SIZE, -167.73)
+    # 新 tip (tip_estimated.mat) max=0nm，dilation 無偏移，背景校正值為 0
+    processed_image = img_array + np.full(TARGET_SIZE, 0.0)
 
     # Reshape 為模型期望的格式 (batch_size, height, width, channels)
     processed_image = processed_image.reshape(1, TARGET_SIZE[0], TARGET_SIZE[1], 1)
@@ -177,7 +177,7 @@ def print_input_requirements():
 │  建議前處理：                                                       │
 │    1. 影像尺寸會自動調整為 128x128 像素                              │
 │    2. 彩色影像會自動轉換為灰階                                       │
-│    3. 數值範圍會自動進行背景減去 (-167.73)                           │
+│    3. 數值範圍會自動進行背景減去 (0.0，新 tip 已無偏移)               │
 │                                                                     │
 │  範例：                                                             │
 │    python detect.py C:\\path\\to\\your\\AFM_image.tif                  │
