@@ -1,0 +1,53 @@
+# Keep the repo focused on source code and a few small parameter files.
+*
+
+# Always keep the ignore file itself.
+!.gitignore
+
+# Python source and packages.
+!**/
+!**/*.py
+
+# Small runtime / setup inputs that are useful to version.
+!requirements.txt
+!install_tf_gpu.bat
+
+# Optional text-based references that are still lightweight.
+!DETECT_README.md
+!GPU_SETUP_GUIDE.md
+!OPTIMIZATION_SUMMARY.md
+
+# Temporary / generated content.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+img/
+結果/
+分析/
+afm/
+afm_broken_py37_backup/
+
+# Large data / notebooks / reports.
+*.npy
+*.mat
+*.pdf
+*.ipynb
+*.zip
+*.tar.gz
+*.7z
+*.keras
+*.h5
+*.save
+*.weights
+
+# Logs and scratch files.
+*.log
+*.tmp
