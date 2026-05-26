@@ -101,7 +101,51 @@ def save_plot(filename, dpi=150):
 # 探針前處理常數
 # ============================================================
 SURFACE_SCALE_NM = 5.0   # nm per height unit：訓練曲面高度換算係數
-TARGET_TIP_SIZE  = 55    # 將探針 resize 至此尺寸 (px)
+TARGET_TIP_SIZE  = 55    # 將估算探針 resize 至此尺寸 (px)（供 tip_correction 使用）
+
+# ---- 訓練用合成探針設定 ----------------------------------------
+# 理由：估算探針因四重對稱化造成環形假象，直接用於訓練會讓
+#       dilated 影像完全飽和、失去意義。
+#       改用拋物線形合成探針（z = -r²/2R）：
+#         - 數學上正確，無假象
+#         - 曲率半徑 TIP_RADIUS_NM 可控制銳利程度
+#         - TIP_TRAIN_SIZE 足夠大以容納最深的粒子高度
+# ---------------------------------------------------------------
+TIP_RADIUS_NM  = 15.0   # 探針曲率半徑 (nm)；15nm ≈ 中等銳利的 AFM tip
+TIP_TRAIN_SIZE = 25     # 合成探針尺寸 (px)，奇數；25px×5nm = ±60nm 物理範圍
+
+
+def make_training_tip(size=TIP_TRAIN_SIZE, radius_nm=TIP_RADIUS_NM,
+                      px_nm=SURFACE_SCALE_NM):
+    """
+    建立拋物線形訓練探針：z(r) = -r² / (2R)
+
+    - 中心 = 頂端 = 0 nm（最大值，符合 grey_dilation 慣例）
+    - 向外遞減（越負越深）
+    - 在邊緣 (r = size//2 * px_nm nm) 的深度 = -(edge_nm)²/(2R)
+      若此值 < 任何粒子高度 → 粒子不會擴散出 tip 邊緣 → 不飽和
+
+    Args:
+        size      : 探針 px 數（奇數）
+        radius_nm : 曲率半徑 (nm)，越小越尖
+        px_nm     : 每像素 nm 數（應與 SURFACE_SCALE_NM 一致）
+    Returns:
+        tip_2d : ndarray shape (size, size), max=0 at center
+    """
+    if size % 2 == 0:
+        size += 1            # 確保中心像素存在
+    cy, cx = size // 2, size // 2
+    y_idx, x_idx = np.indices((size, size))
+    r_nm   = np.sqrt((y_idx - cy)**2 + (x_idx - cx)**2) * px_nm
+    tip_2d = -(r_nm ** 2) / (2.0 * radius_nm)
+    tip_2d -= tip_2d.max()  # 確保 max = 0（浮點安全）
+
+    edge_depth = tip_2d[0, 0]
+    print(f"  [訓練探針] size={size}×{size} px, R={radius_nm} nm, "
+          f"px_nm={px_nm} nm/px")
+    print(f"  邊緣深度 = {edge_depth:.1f} nm  "
+          f"（粒子高度需 < {abs(edge_depth):.0f} nm 才不飽和）")
+    return tip_2d
 
 
 def load_and_prepare_tip(mat_path, key='tip', target_size=TARGET_TIP_SIZE):
@@ -469,13 +513,15 @@ save_plot('cylindrical_preview.png')
 # Import AFM tip and apply grey dilation
 # ============================================================
 
-# [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
-print("準備探針形狀 (第一次載入)...")
-tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+# 訓練用合成拋物線探針（替代環形假象的估算探針）
+# 理由：估算探針因四重對稱化造成環形假象，直接用於訓練會讓 dilated 影像飽和
+print("建立訓練用合成探針 (第一次)...")
+tip_shape = make_training_tip()
 plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
-plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
+plt.title(f"Training Tip — Paraboloid  R={TIP_RADIUS_NM} nm  "
+          f"{TIP_TRAIN_SIZE}×{TIP_TRAIN_SIZE} px")
 save_plot('tip_shape.png')
 
 # Load saved stacks
@@ -574,13 +620,14 @@ edge_lifted_poly_stack  = edge_lifter(true_poly_surf_stack, target_size)
 np.save(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy', edge_lifted_cubic_stack)
 np.save(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy', edge_lifted_poly_stack)
 
-# [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
-print("準備探針形狀 (第二次載入，edge-lifted 使用)...")
-tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+# 訓練用合成拋物線探針（edge-lifted dilation 使用相同探針）
+print("建立訓練用合成探針 (第二次，edge-lifted 使用)...")
+tip_shape = make_training_tip()
 plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
-plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
+plt.title(f"Training Tip — Paraboloid  R={TIP_RADIUS_NM} nm  "
+          f"{TIP_TRAIN_SIZE}×{TIP_TRAIN_SIZE} px")
 save_plot('tip_shape_edge.png')
 
 # Dilating the edge-lifted cubic and poly stacks
@@ -1036,14 +1083,22 @@ print(f"  [摘要] {metrics_path}")
 
 # config.txt  — 記錄探針與曲面設定
 config_path = os.path.join(RUN_DIR, 'config.txt')
+_edge_nm     = TIP_TRAIN_SIZE // 2 * SURFACE_SCALE_NM
+_edge_depth  = -(_edge_nm ** 2) / (2.0 * TIP_RADIUS_NM)
 with open(config_path, 'w', encoding='utf-8') as f:
-    f.write(f"[探針設定]\n")
-    f.write(f"  tip_file         : tip.mat/tip_estimated0526.mat\n")
-    f.write(f"  TARGET_TIP_SIZE  : {TARGET_TIP_SIZE} px\n\n")
+    f.write(f"[訓練探針設定]\n")
+    f.write(f"  類型             : 合成拋物線探針 (Paraboloid)\n")
+    f.write(f"  TIP_RADIUS_NM    : {TIP_RADIUS_NM} nm\n")
+    f.write(f"  TIP_TRAIN_SIZE   : {TIP_TRAIN_SIZE} px\n")
+    f.write(f"  邊緣深度          : {_edge_depth:.1f} nm\n")
+    f.write(f"  粒子高度上限      : < {abs(_edge_depth):.0f} nm（不飽和條件）\n\n")
     f.write(f"[曲面設定]\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
-    f.write(f"  sphere radius    : 8–10 px → {8*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f} nm\n")
-    f.write(f"  cubic height     : 16–20 px → {16*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f} nm\n")
+    f.write(f"  sphere 半徑      : 8–10 px → {8*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f} nm\n")
+    f.write(f"  cubic 高度       : 16–20 px → {16*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f} nm\n")
+    f.write(f"\n[估算探針（供 detect.py 推論使用）]\n")
+    f.write(f"  tip_file         : tip.mat/tip_estimated0526.mat\n")
+    f.write(f"  tip_correction   : tip_correction.py\n")
 print(f"  [設定] {config_path}")
 
 print(f"\n{'='*60}")
