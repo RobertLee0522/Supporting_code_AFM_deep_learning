@@ -1027,15 +1027,15 @@ plt.title(f'Line Profile — Sample {idx_end}, row 20, col 30:90')
 plt.tight_layout()
 save_plot(f'profile_sample{idx_end}_zoom.png')
 
-# Sample 200 second profile (row 95, col 70:120)
+# Sample end second profile (row 95, col 70:120)
 plt.figure(figsize=(8, 4))
-plt.plot(decoded[200, 95, 70:120], label='Predicted')
-plt.plot(X_test[200, 95, 70:120],  label='Tip-convoluted')
-plt.plot(Y_test[200, 95, 70:120],  label='Ground-truth')
+plt.plot(decoded[idx_end, 95, 70:120], label='Predicted')
+plt.plot(X_test[idx_end, 95, 70:120],  label='Tip-convoluted')
+plt.plot(Y_test[idx_end, 95, 70:120],  label='Ground-truth')
 plt.legend()
-plt.title('Line Profile — Sample 200, row 95, col 70:120')
+plt.title(f'Line Profile — Sample {idx_end}, row 95, col 70:120')
 plt.tight_layout()
-save_plot('profile_sample200_row95_zoom.png')
+save_plot(f'profile_sample{idx_end}_row95_zoom.png')
 
 
 # ============================================================
