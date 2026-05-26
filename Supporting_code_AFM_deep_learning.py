@@ -384,7 +384,7 @@ plt.show()
 # Import AFM tip and apply grey dilation
 # ============================================================
 
-tip = io.loadmat('tip.mat/tip_estimated.mat')
+tip = io.loadmat('tip.mat/tip_estimated0526.mat')
 tip_shape = tip['tip']
 plt.imshow(tip_shape)
 plt.colorbar()

@@ -1,21 +1,26 @@
 """
-AFM 盲探針重建工具 v4
-修正：自動計算合理 max_sz / half / 偵測閾值
+AFM 盲探針重建工具 v4.2
+修正清單（相對 v4.1）：
+  [FIX-9]  Sidebar 無法向下捲動 → 改用 Canvas+Scrollbar 捲動容器，支援滑鼠滾輪
+  [FIX-10] Cone model 在 cross-section 往上長 → 繪製前對齊基線（令 cone.max()=0）
+  [FIX-11] flatten_rows percentile(80) 在孔洞占多數時基線反落在孔內 → 改用 percentile(95)
+           同時新增 shape_type 參數：孔洞型用高百分位(95)，柱體型用低百分位(5)
+
 依賴：pip install numpy scipy matplotlib Pillow
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading, os, re
+import threading, os, re, platform
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from scipy.ndimage import label, center_of_mass, shift
+from scipy.ndimage import label, center_of_mass, shift, gaussian_filter
 from scipy.io import savemat
-from scipy.signal import correlate2d
+from scipy.signal import fftconvolve  # [FIX-5] 取代 correlate2d
 
 C = {
     'bg':'#0f1117','panel':'#1a1d27','border':'#2a2d3a',
@@ -23,34 +28,69 @@ C = {
     'text':'#e2e8f0','muted':'#64748b','input_bg':'#252836','hover':'#2d3348',
 }
 
+# ── 跨平台字型設定 ────────────────────────────────────────────────
+def get_fonts():
+    sys = platform.system()
+    if sys == 'Windows':
+        cjk = 'Microsoft JhengHei'
+        try:
+            tk.font = __import__('tkinter.font', fromlist=['font'])
+            tk.font.Font(family=cjk)
+        except Exception:
+            cjk = 'Microsoft YaHei'
+    elif sys == 'Darwin':
+        cjk = 'PingFang TC'
+    else:
+        cjk = 'Noto Sans CJK TC'
+    mono = 'Courier New' if platform.system() == 'Windows' else 'Courier'
+    return {
+        'normal' : (cjk, 10),
+        'small'  : (cjk,  9),
+        'tiny'   : (cjk,  8),
+        'bold'   : (cjk, 10, 'bold'),
+        'title'  : (cjk, 20, 'bold'),
+        'sub'    : (cjk, 10),
+        'mono'   : (mono, 8),
+        'mono_n' : (mono, 10),
+    }
+
 # ══════════════════════════════════════════════════════════════════
 # Float Entry
 # ══════════════════════════════════════════════════════════════════
-def make_float_entry(parent, textvariable, **kwargs):
+def make_float_entry(parent, textvariable, font=None, **kwargs):
     def validate(val):
         if val in ('', '-', '.', '-.'): return True
         try: float(val); return True
         except ValueError:
             return val.count('.') <= 1 and all(c in '0123456789.-' for c in val)
     vcmd = (parent.register(validate), '%P')
+    if font is None:
+        sys = platform.system()
+        if sys == 'Windows':   font = ('Microsoft JhengHei', 10)
+        elif sys == 'Darwin':  font = ('PingFang TC', 10)
+        else:                  font = ('Noto Sans CJK TC', 10)
     return tk.Entry(parent, textvariable=textvariable,
                     validate='key', validatecommand=vcmd,
                     bg=C['input_bg'], fg=C['text'],
                     insertbackground=C['text'], relief='flat',
-                    font=('Helvetica', 10), bd=0, **kwargs)
+                    font=font, bd=0, **kwargs)
 
 # ══════════════════════════════════════════════════════════════════
 # Nanoscope 讀取
 # ══════════════════════════════════════════════════════════════════
 def parse_nanoscope(fp):
-    with open(fp,'rb') as f: raw = f.read(65536)
+    with open(fp, 'rb') as f:
+        raw = f.read(65536)
     hdr = raw.decode('latin-1')
+
     def fv(pat, cast=str, default=None):
-        m = re.search(pat, hdr); return cast(m.group(1)) if m else default
+        m = re.search(pat, hdr)
+        return cast(m.group(1)) if m else default
+
     n_px = fv(r'\\Samps/line:\s*(\d+)', int, 256)
     n_ln = fv(r'\\(?:Number of lines|Lines):\s*(\d+)', int, 256)
     m = re.search(r'\\Scan Size:\s*([\d.]+)\s*([\d.]*)\s*(~m|nm|um)', hdr)
-    scan = float(m.group(1))*1000 if m and m.group(3) in ('~m','um') \
+    scan = float(m.group(1)) * 1000 if m and m.group(3) in ('~m', 'um') \
            else (float(m.group(1)) if m else 5000.)
     zss = fv(r'@Sens\. ZsensSens:\s*V\s*([\d.]+)', float, 813.1653)
     zs  = fv(r'@Sens\. Zsens:\s*V\s*([\d.]+)',     float, 32.07862)
@@ -62,69 +102,81 @@ def parse_nanoscope(fp):
         nm  = re.search(r'@2:Image Data:\s*S\s*\[([^\]]+)\].*?"([^"]+)"', blk)
         zsc = re.search(r'@2:Z scale:\s*V \[Sens\.\s*(\w+)\]\s*\(([\d.e+-]+)', blk)
         if off and nm:
-            chs.append({'offset':int(off.group(1)), 'bpp':int(bpp.group(1)) if bpp else 2,
-                        'key':nm.group(1).strip(), 'name':nm.group(2).strip(),
-                        'z_key':zsc.group(1) if zsc else 'ZsensSens',
-                        'z_lsb':float(zsc.group(2)) if zsc else 0.000375})
-    return {'n_px':n_px,'n_lines':n_ln,'scan_nm':scan,'px_nm':scan/n_px,
-            'zsens':zs,'zsens_s':zss,'channels':chs,'filepath':fp}
+            chs.append({
+                'offset': int(off.group(1)),
+                'bpp':    int(bpp.group(1)) if bpp else 2,
+                'key':    nm.group(1).strip(),
+                'name':   nm.group(2).strip(),
+                'z_key':  zsc.group(1) if zsc else 'ZsensSens',
+                'z_lsb':  float(zsc.group(2)) if zsc else 0.000375,
+            })
+    return {
+        'n_px': n_px, 'n_lines': n_ln, 'scan_nm': scan, 'px_nm': scan / n_px,
+        'zsens': zs, 'zsens_s': zss, 'channels': chs, 'filepath': fp,
+    }
 
 def read_channel(fp, meta, idx=0):
-    ch = meta['channels'][idx]; n = meta['n_px']*meta['n_lines']
-    dt = np.int16 if ch['bpp']==2 else np.int32
-    with open(fp,'rb') as f:
-        f.seek(ch['offset']); raw = np.frombuffer(f.read(n*ch['bpp']), dtype=dt)
-    img = raw.reshape(meta['n_lines'], meta['n_px']).astype(np.float64)
+    ch = meta['channels'][idx]
+    n  = meta['n_px'] * meta['n_lines']
+    dt = np.int16 if ch['bpp'] == 2 else np.int32
+    with open(fp, 'rb') as f:
+        f.seek(ch['offset'])
+        raw = np.frombuffer(f.read(n * ch['bpp']), dtype=dt)
+    img  = raw.reshape(meta['n_lines'], meta['n_px']).astype(np.float64)
     sens = meta['zsens_s'] if 'ZsensSens' in ch['z_key'] else meta['zsens']
     return img * ch['z_lsb'] * sens
 
-def flatten_rows(img):
-    flat = img.copy(); x = np.arange(img.shape[1])
+# [FIX-11] 自適應基線：
+#   孔洞型用 percentile(95)，表面像素是高值；掃描範圍<pitch 時孔洞佔多數，
+#   percentile(80) 可能落在孔內，必須取更高百分位才能命中表面。
+#   柱體型用 percentile(5)，基底像素是低值。
+def flatten_rows(img, shape_type='trapezoid_hole'):
+    flat = img.copy()
+    x    = np.arange(img.shape[1])
     for i in range(img.shape[0]):
-        c = np.polyfit(x, flat[i], 1); flat[i] -= np.polyval(c, x)
-    return flat - np.median(flat)
+        c = np.polyfit(x, flat[i], 1)
+        flat[i] -= np.polyval(c, x)
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        baseline = np.percentile(flat, 95)   # 孔洞型：表面是高值
+    else:
+        baseline = np.percentile(flat, 5)    # 柱體型：基底是低值
+    return flat - baseline
 
 def auto_height_ch(meta):
-    for p in ['ZSensor','Height Sensor','Height']:
-        for i,ch in enumerate(meta['channels']):
-            if p.lower() in ch['name'].lower(): return i
+    for p in ['ZSensor', 'Height Sensor', 'Height']:
+        for i, ch in enumerate(meta['channels']):
+            if p.lower() in ch['name'].lower():
+                return i
     return 0
 
 # ══════════════════════════════════════════════════════════════════
-# 自動計算合理參數（核心修正）
+# 自動計算合理參數
 # ══════════════════════════════════════════════════════════════════
 def auto_params(geom, shape_type, meta):
     """
-    根據幾何與掃描參數，自動推算：
+    根據幾何與掃描參數自動推算：
     - half     : patch 半徑（px）
     - max_sz   : 最大連通區域面積（px²）
     - pct_hi/lo: 偵測閾值百分位數
-    - warn_msgs: 警告訊息列表
+    - warnings : 警告訊息列表
     """
     px = meta['px_nm']
     n  = meta['n_px']
     sc = meta['scan_nm']
     p  = geom['pitch']
 
-    # 特徵最大半徑（頂部 or 底部取較大者）
     r_max_nm = max(geom['d_bot'], geom['d_top']) / 2
     r_max_px = r_max_nm / px
 
-    # half：特徵半徑 + 20% buffer，至少比特徵半徑大 5px
     half = max(int(r_max_px * 1.2) + 5, 15)
-    # 不能超過影像的 1/4
     half = min(half, n // 4 - 2)
 
-    # max_sz：特徵頂面面積的 3 倍（容納誤差）
-    feat_area = np.pi * r_max_px**2
-    max_sz = int(feat_area * 3) + 100
-    max_sz = max(max_sz, 500)
+    feat_area = np.pi * r_max_px ** 2
+    max_sz    = int(feat_area * 3) + 100
+    max_sz    = max(max_sz, 500)
 
-    # 偵測閾值：依特徵相對面積調整
-    feat_fill = feat_area / (n * n)      # 特徵占影像比例
-    # 對梯形柱（高點），用高百分位數閾值
-    # 若特徵很大（>10%），把閾值調高
-    if shape_type == 'cylinder_hole':
+    feat_fill = feat_area / (n * n)
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
         pct = max(5, min(15, int(feat_fill * 200)))
         pct_lo, pct_hi = pct, None
     else:
@@ -133,155 +185,409 @@ def auto_params(geom, shape_type, meta):
 
     warnings = []
     if p > sc:
-        warnings.append(f"⚠ 週期({p}nm) > 掃描範圍({sc:.0f}nm)，視野內約 {sc/p:.1f} 個特徵")
-    if half >= n//4:
-        warnings.append(f"⚠ Patch 半徑({half}px)已達上限，建議縮小掃描範圍或降低 pitch")
+        warnings.append(f'⚠ 週期({p}nm) > 掃描範圍({sc:.0f}nm)，視野內約 {sc/p:.1f} 個特徵')
+    if half >= n // 4:
+        warnings.append(f'⚠ Patch 半徑({half}px)已達上限，建議縮小掃描範圍或降低 pitch')
     if feat_fill > 0.3:
-        warnings.append(f"⚠ 特徵占影像 {feat_fill*100:.0f}%，建議用更大掃描範圍")
+        warnings.append(f'⚠ 特徵占影像 {feat_fill*100:.0f}%，建議用更大掃描範圍')
 
-    return {'half': half, 'max_sz': max_sz,
-            'pct_lo': pct_lo, 'pct_hi': pct_hi,
-            'r_max_px': r_max_px, 'feat_area': feat_area,
-            'warnings': warnings}
+    return {
+        'half': half, 'max_sz': max_sz,
+        'pct_lo': pct_lo, 'pct_hi': pct_hi,
+        'r_max_px': r_max_px, 'feat_area': feat_area,
+        'warnings': warnings,
+    }
 
 # ══════════════════════════════════════════════════════════════════
-# GT 生成
+# GT 生成 [FIX-8] 向量化 modulo 取代雙層 for loop
 # ══════════════════════════════════════════════════════════════════
 def make_gt(n_px, scan_nm, geom, shape_type):
-    px = scan_nm / n_px
-    p  = geom['pitch'] / px
-    h  = geom['height']
-    gt = np.zeros((n_px, n_px)) if shape_type == 'trapezoid_pillar' \
-         else np.full((n_px, n_px), h)
-    r_bot = (geom['d_bot']/2) / px
-    r_top = (geom['d_top']/2) / px
-    yi, xi = np.indices((n_px, n_px))
-    for cy in np.arange(-p/2, n_px+p, p):
-        for cx in np.arange(-p/2, n_px+p, p):
-            dist = np.sqrt((xi-cx)**2+(yi-cy)**2)
-            if shape_type == 'cylinder_hole':
-                gt[dist <= r_bot] = 0.
-            else:
-                r_min, r_max = min(r_bot,r_top), max(r_bot,r_top)
-                gt[dist <= r_top] = np.maximum(gt[dist <= r_top], h)
-                side = (dist > r_min) & (dist <= r_max)
-                if r_max > r_min:
-                    sl = h*(r_max - dist[side])/(r_max - r_min)
-                    np.maximum(gt[side], sl, out=gt[side])
-    return gt
+    px    = scan_nm / n_px
+    p_px  = geom['pitch'] / px      # pitch in pixels
+    h     = geom['height']
+    r_bot = (geom['d_bot'] / 2) / px
+    r_top = (geom['d_top'] / 2) / px
 
-def make_gt_patch(geom, shape_type, half, px_nm, blur_sigma=1.5):
-    """
-    生成單特徵理想 GT patch。
-    blur_sigma：對邊緣做高斯模糊（px），模擬真實過渡，消除銳利邊界假影。
-    設 0 則不模糊。
-    """
-    from scipy.ndimage import gaussian_filter
-    size = 2*half; h = geom['height']
-    gt = np.zeros((size,size))
-    yi,xi = np.indices((size,size))
-    dist = np.sqrt((xi-half)**2+(yi-half)**2)
-    r_bot = (geom['d_bot']/2)/px_nm
-    r_top = (geom['d_top']/2)/px_nm
+    yi, xi = np.indices((n_px, n_px))
+    # 對週期取餘數，計算每個 pixel 到最近特徵中心的距離（向量化）
+    # 偏移 p_px/2 使中心落在 [0, p_px) 中央
+    cx_rel = (xi % p_px) - p_px / 2
+    cy_rel = (yi % p_px) - p_px / 2
+    dist   = np.sqrt(cx_rel ** 2 + cy_rel ** 2)
+
     if shape_type == 'cylinder_hole':
-        gt[dist <= r_bot] = -h
-    else:
-        r_min, r_max = min(r_bot,r_top), max(r_bot,r_top)
+        gt = np.full((n_px, n_px), h)
+        gt[dist <= r_bot] = 0.
+
+    elif shape_type == 'trapezoid_hole':
+        gt = np.full((n_px, n_px), h)
+        side = (dist > r_bot) & (dist <= r_top)
+        if r_top > r_bot:
+            gt[side] = h * (dist[side] - r_bot) / (r_top - r_bot)
+        gt[dist <= r_bot] = 0.
+
+    else:   # trapezoid_pillar
+        gt    = np.zeros((n_px, n_px))
+        r_min = min(r_bot, r_top)
+        r_max = max(r_bot, r_top)
         gt[dist <= r_top] = h
         side = (dist > r_min) & (dist <= r_max)
         if r_max > r_min:
-            gt[side] = h*(r_max - dist[side])/(r_max - r_min)
-    # 修正①：邊緣高斯模糊，消除 GT 銳利切斷造成的尖刺假影
+            np.maximum(gt[side],
+                       h * (r_max - dist[side]) / (r_max - r_min),
+                       out=gt[side])
+
+    return gt
+
+def make_gt_patch(geom, shape_type, half, px_nm, blur_sigma=1.5):
+    """單特徵理想 GT patch，邊緣高斯模糊消除銳利切斷假影。"""
+    size  = 2 * half
+    gt    = np.zeros((size, size))
+    yi, xi = np.indices((size, size))
+    dist  = np.sqrt((xi - half) ** 2 + (yi - half) ** 2)
+    r_bot = (geom['d_bot'] / 2) / px_nm
+    r_top = (geom['d_top'] / 2) / px_nm
+    h     = geom['height']
+
+    if shape_type == 'cylinder_hole':
+        gt[dist <= r_bot] = -h
+    elif shape_type == 'trapezoid_hole':
+        gt[dist <= r_bot] = -h
+        side = (dist > r_bot) & (dist <= r_top)
+        if r_top > r_bot:
+            gt[side] = -h * (r_top - dist[side]) / (r_top - r_bot)
+    else:
+        r_min = min(r_bot, r_top)
+        r_max = max(r_bot, r_top)
+        gt[dist <= r_top] = h
+        side = (dist > r_min) & (dist <= r_max)
+        if r_max > r_min:
+            gt[side] = h * (r_max - dist[side]) / (r_max - r_min)
+
     if blur_sigma > 0:
         gt = gaussian_filter(gt, sigma=blur_sigma)
     return gt
 
+# [FIX-5] 用 fftconvolve 取代 correlate2d，大影像快 10–50×
 def align_gt(scan, gt, shape_type):
-    if shape_type == 'cylinder_hole':
-        sb = (scan < np.percentile(scan,15)).astype(float)
-        gb = (gt < gt.max()*0.1).astype(float)
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        sb = (scan < np.percentile(scan, 15)).astype(float)
+        gb = (gt < gt.max() * 0.1).astype(float)
     else:
-        sb = (scan > np.percentile(scan,80)).astype(float)
-        gb = (gt > gt.max()*0.5).astype(float)
-    c = correlate2d(sb, gb, mode='same')
+        sb = (scan > np.percentile(scan, 80)).astype(float)
+        gb = (gt > gt.max() * 0.5).astype(float)
+    # fftconvolve(sb, gb[::-1,::-1]) 等效於 correlate2d(sb, gb)
+    c  = fftconvolve(sb, gb[::-1, ::-1], mode='same')
     pk = np.unravel_index(c.argmax(), c.shape)
-    dy, dx = pk[0]-c.shape[0]//2, pk[1]-c.shape[1]//2
-    return shift(gt,[dy,dx],mode='wrap'), dy, dx
+    dy = pk[0] - c.shape[0] // 2
+    dx = pk[1] - c.shape[1] // 2
+    return shift(gt, [dy, dx], mode='wrap'), dy, dx
 
 # ══════════════════════════════════════════════════════════════════
-# 偵測（max_sz 動態傳入）
+# 偵測
 # ══════════════════════════════════════════════════════════════════
 def detect_features(scan, shape_type, pct_lo, pct_hi, mn=5, mx=65536):
-    if shape_type == 'cylinder_hole':
-        thr = np.percentile(scan, pct_lo); mask = scan < thr
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        thr  = np.percentile(scan, pct_lo)
+        mask = scan < thr
     else:
-        thr = np.percentile(scan, pct_hi); mask = scan > thr
+        thr  = np.percentile(scan, pct_hi)
+        mask = scan > thr
     lbl, n = label(mask)
-    sz  = [(lbl==i).sum() for i in range(1,n+1)]
-    ids = [i+1 for i,s in enumerate(sz) if mn<=s<=mx]
-    return [(int(round(y)),int(round(x)))
-            for y,x in center_of_mass(mask,lbl,ids)], n, len(ids)
+    sz     = [(lbl == i).sum() for i in range(1, n + 1)]
+    ids    = [i + 1 for i, s in enumerate(sz) if mn <= s <= mx]
+    return (
+        [(int(round(y)), int(round(x))) for y, x in center_of_mass(mask, lbl, ids)],
+        n, len(ids),
+    )
 
 def reconstruct(scan, geom, shape_type, meta, ap):
     half   = ap['half']
     max_sz = ap['max_sz']
-    pct_lo = ap['pct_lo'] if ap['pct_lo'] else 8
-    pct_hi = ap['pct_hi'] if ap['pct_hi'] else 92
+    # [FIX-3] 改用 is not None 避免 pct=0 被誤判為 falsy
+    pct_lo = ap['pct_lo'] if ap['pct_lo'] is not None else 8
+    pct_hi = ap['pct_hi'] if ap['pct_hi'] is not None else 92
 
-    gt = make_gt(meta['n_px'], meta['scan_nm'], geom, shape_type)
+    gt    = make_gt(meta['n_px'], meta['scan_nm'], geom, shape_type)
     gt_al, dy, dx = align_gt(scan, gt, shape_type)
 
     centers, n_raw, n_valid = detect_features(
         scan, shape_type, pct_lo, pct_hi, mn=5, mx=max_sz)
 
-    # reflect padding：特徵靠近邊緣時仍可取完整 patch
-    padded = np.pad(scan, half, mode='reflect')
-    n = scan.shape[0]; patches = []; edge_cnt = 0
-    for cy,cx in centers:
+    padded    = np.pad(scan, half, mode='reflect')
+    n         = scan.shape[0]
+    patches   = []
+    edge_cnt  = 0
+    for cy, cx in centers:
+        search = 8
+        y0 = max(0, cy - search); y1 = min(n, cy + search)
+        x0 = max(0, cx - search); x1 = min(n, cx + search)
+        region = scan[y0:y1, x0:x1]
+        if region.size > 0:
+            if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+                loc = np.unravel_index(region.argmin(), region.shape)
+            else:
+                loc = np.unravel_index(region.argmax(), region.shape)
+            cy, cx = y0 + loc[0], x0 + loc[1]
         cy_p, cx_p = cy + half, cx + half
-        p = padded[cy_p-half:cy_p+half, cx_p-half:cx_p+half]
-        if p.shape == (2*half, 2*half):
+        p = padded[cy_p - half:cy_p + half, cx_p - half:cx_p + half]
+        if p.shape == (2 * half, 2 * half):
             patches.append(p)
-            if min(cy, cx, n-1-cy, n-1-cx) < half:
+            if min(cy, cx, n - 1 - cy, n - 1 - cx) < half:
                 edge_cnt += 1
 
     edge_note = f' (含{edge_cnt}個邊緣特徵，用padding補全)' if edge_cnt else ''
-    info = (f'偵測: {n_raw}個候選 → 過濾後{n_valid}個 → patch收集{len(patches)}個{edge_note}\n'
-            f'  GT對齊: dy={dy}px dx={dx}px | half={half}px | max_sz={max_sz}px²')
+    info = (
+        f'偵測: {n_raw}個候選 → 過濾後{n_valid}個 → patch收集{len(patches)}個{edge_note}\n'
+        f'  GT對齊: dy={dy}px dx={dx}px | half={half}px | max_sz={max_sz}px²'
+    )
 
-    if not patches: return None,None,None,0,gt_al,info
+    if not patches:
+        return None, None, None, 0, gt_al, info
 
     avg = np.mean(patches, axis=0)
-    if shape_type == 'cylinder_hole': avg -= avg.max()
-    else: avg -= avg.min()
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        avg -= avg.max()   # 表面=0，孔洞往下
+    else:
+        avg -= avg.min()   # 基底=0，柱體往上
 
-    gt_p = make_gt_patch(geom, shape_type, half, meta['px_nm'])
-    tip_raw = avg - gt_p
-    tip_raw -= tip_raw.max()
+    gt_p = make_gt_patch(geom, shape_type, half, meta['px_nm'],
+                          blur_sigma=0)   # 腐蝕法不需模糊，保持精確幾何
 
-    # 修正②：中心窗截取，去掉邊緣 15% 的假影區域
-    crop = max(1, int(half * 0.15))
-    tip_cropped = tip_raw.copy()
-    tip_cropped[:crop, :]  = 0
-    tip_cropped[-crop:, :] = 0
-    tip_cropped[:, :crop]  = 0
-    tip_cropped[:, -crop:] = 0
-    # 邊緣用內側值平滑填補（避免突然截斷）
-    from scipy.ndimage import gaussian_filter
-    edge_mask = np.zeros_like(tip_cropped, dtype=bool)
-    edge_mask[:crop+2, :] = True; edge_mask[-crop-2:, :] = True
-    edge_mask[:, :crop+2] = True; edge_mask[:, -crop-2:] = True
-    tip_smooth = gaussian_filter(tip_raw, sigma=2)
-    tip_cropped[edge_mask] = tip_smooth[edge_mask]
+    # ── 2D 配準：將 avg 孔洞中心對齊到 GT 中心 ──────────────────
+    avg, reg_dy, reg_dx = recenter_avg(avg, gt_p, shape_type)
+    info += f'\n  2D配準偏移: dy={reg_dy}px dx={reg_dx}px'
 
-    # 修正③：左右+上下對稱化（物理上探針應為旋轉對稱）
-    tip_sym = (tip_cropped
-               + tip_cropped[::-1, :]
-               + tip_cropped[:, ::-1]
-               + tip_cropped[::-1, ::-1]) / 4.0
+    # ── 底部對齊：avg 最低點與 GT 最低點齊平 ─────────────────────
+    # 物理假設：探針確實到達孔底，深度差異來自截面位置偏移而非真實誤差
+    # 對齊後相減，tip 主要反映孔洞側壁的幾何差異（更準確）
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        depth_offset = gt_p.min() - avg.min()   # 負值：avg 比 GT 淺，往下移
+    else:
+        depth_offset = gt_p.max() - avg.max()   # 正值：avg 比 GT 矮，往上移
+    avg_aligned = avg + depth_offset
+    info += f'\n  底部對齊偏移: {depth_offset:+.1f}nm'
+
+    # ── 形態學腐蝕重建（Villarrubia 算法，使用對齊後的 avg）───────
+    tip_morph = reconstruct_morphological(avg_aligned, gt_p, shape_type)
+
+    # ── 四向對稱化（旋轉對稱約束）──────────────────────────────
+    tip_sym = (tip_morph
+               + tip_morph[::-1, :]
+               + tip_morph[:, ::-1]
+               + tip_morph[::-1, ::-1]) / 4.0
     tip_sym -= tip_sym.max()
 
-    return tip_sym, avg, gt_p, len(patches), gt_al, info
+    # ── 徑向平均：強制完全旋轉對稱，消除 XY 殘差 ────────────────
+    tip_sym = radial_average(tip_sym, half)
+
+    # ── Rim 分析（不依賴孔底，低進入率仍有效）─────────────────
+    rim = analyze_rim(avg_aligned, geom, shape_type, half, meta['px_nm'])
+    entry_pct = rim['entry_rate'] * 100
+    info += (f'\n  進入率: {entry_pct:.1f}%  '
+             f'Rim寬: {rim["rim_width_nm"]:.1f}nm  '
+             f'Rim錐角: {rim["cone_angle_deg"]:.1f}°')
+    if entry_pct < 50:
+        info += f'\n  ⚠ 進入率<50%，孔底資訊不可靠，rim分析更準確'
+
+    # avg_aligned 傳回給顯示（讓 cross-section 顯示對齊後的藍線）
+    return tip_sym, avg_aligned, gt_p, len(patches), gt_al, info, rim
+
+# ══════════════════════════════════════════════════════════════════
+# 2D 影像配準：把 avg patch 的孔洞中心對齊到 GT 中心
+# ══════════════════════════════════════════════════════════════════
+def recenter_avg(avg, gt_p, shape_type):
+    """
+    用 2D 互相關找出 avg 相對於 GT 的偏移，
+    然後平移 avg，使孔洞/特徵中心與 GT 中心對齊。
+    回傳 (avg_centered, dy, dx)
+    """
+    from scipy.signal import fftconvolve
+    from scipy.ndimage import shift as ndshift
+
+    # 孔洞型：都是負值，取絕對值後做相關（讓孔洞成為正峰）
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        a = -avg.copy()
+        g = -gt_p.copy()
+    else:
+        a = avg.copy()
+        g = gt_p.copy()
+
+    # 確保非負
+    a -= a.min(); g -= g.min()
+
+    # fftconvolve(a, g[::-1,::-1]) 等效 correlate2d(a, g)
+    corr = fftconvolve(a, g[::-1, ::-1], mode='same')
+    pk   = np.unravel_index(corr.argmax(), corr.shape)
+    dy   = pk[0] - corr.shape[0] // 2
+    dx   = pk[1] - corr.shape[1] // 2
+
+    # 把 avg 往反方向移，使特徵中心貼齊 GT 中心
+    avg_centered = ndshift(avg, [-dy, -dx], mode='nearest')
+    return avg_centered, dy, dx
+
+
+# ══════════════════════════════════════════════════════════════════
+# 徑向平均：強制旋轉對稱（消除 XY 不對稱殘差）
+# ══════════════════════════════════════════════════════════════════
+def radial_average(tip, half):
+    """
+    以中心為原點，把 tip 2D 陣列轉換為徑向平均結果。
+    每個像素的值 = 同半徑圓環上所有像素的平均值。
+    物理假設：探針尖端是旋轉對稱的。
+    """
+    size = 2 * half
+    yi, xi = np.indices((size, size))
+    r_px = np.sqrt((xi - half)**2 + (yi - half)**2)
+    r_int = np.round(r_px).astype(int)
+
+    tip_radial = np.zeros_like(tip)
+    for r in range(0, half + 1):
+        mask = r_int == r
+        if mask.sum() > 0:
+            tip_radial[mask] = tip[mask].mean()
+
+    # 超出 half 半徑範圍的角落像素，用最外圈值填補
+    outer_mask = r_int > half
+    if outer_mask.sum() > 0:
+        edge_val = tip[r_int == half].mean() if (r_int == half).sum() > 0 else 0
+        tip_radial[outer_mask] = edge_val
+
+    tip_radial -= tip_radial.max()  # 尖端歸零
+    return tip_radial
+
+
+# ══════════════════════════════════════════════════════════════════
+# 形態學腐蝕重建（Villarrubia 算法）
+# ══════════════════════════════════════════════════════════════════
+def reconstruct_morphological(avg_patch, gt_p, shape_type):
+    """
+    正確的盲探針重建：形態學腐蝕
+    原理：AFM掃描 = 真實表面 ⊕ 探針  → 探針 = 掃描 ⊖ 表面
+    對孔洞：先反轉（孔洞變峰），再腐蝕，再反轉回來
+    """
+    from scipy.ndimage import grey_erosion
+
+    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
+        # 反轉：孔洞（負值）變峰（正值）
+        avg_inv = -(avg_patch.copy())
+        avg_inv -= avg_inv.min()           # 確保全非負
+        gt_inv  = -(gt_p.copy())
+        gt_inv  -= gt_inv.min()
+
+        # 形態學腐蝕（GT patch 當 structure）
+        # grey_erosion：output[i,j] = min over structure { input[i+dy,j+dx] - structure[dy,dx] }
+        try:
+            tip_inv = grey_erosion(avg_inv, structure=gt_inv)
+            tip = -tip_inv
+        except MemoryError:
+            # structure 太大時退回簡單版本
+            tip = gt_p - avg_patch
+    else:
+        avg_pos = avg_patch.copy(); avg_pos -= avg_pos.min()
+        gt_pos  = gt_p.copy();    gt_pos  -= gt_pos.min()
+        try:
+            tip = grey_erosion(avg_pos, structure=gt_pos)
+        except MemoryError:
+            tip = avg_patch - gt_p
+
+    tip -= tip.max()
+    return tip
+
+
+def analyze_rim(avg_patch, geom, shape_type, half, px_nm):
+    """
+    從孔洞邊緣過渡帶分析探針有效半徑與錐角。
+    不依賴孔底資訊，在進入率低時仍有效。
+    回傳：dict 包含 rim_width_nm, cone_angle_deg, entry_rate
+    """
+    from scipy.optimize import curve_fit
+
+    # 建立平均 radial profile（以中心為圓心）
+    size = avg_patch.shape[0]
+    mid  = half
+    yi, xi = np.indices((size, size))
+    r_px = np.sqrt((xi - mid)**2 + (yi - mid)**2)
+    r_nm = r_px * px_nm
+
+    # 取同心環平均（bin 寬 = 1px）
+    r_max_px = int(np.sqrt(2) * half)
+    r_bins   = np.arange(0, r_max_px + 1)
+    profile  = np.zeros(len(r_bins) - 1)
+    r_centers= np.zeros(len(r_bins) - 1)
+    for i in range(len(r_bins)-1):
+        ring = (r_px >= r_bins[i]) & (r_px < r_bins[i+1])
+        if ring.sum() > 0:
+            profile[i]   = avg_patch[ring].mean()
+            r_centers[i] = (r_bins[i] + r_bins[i+1]) / 2 * px_nm
+
+    # 找過渡帶：從孔底到表面的 20%-80% 位置
+    p_min, p_max = profile.min(), profile.max()
+    p_range = p_max - p_min
+    if p_range < 1:
+        return {'rim_width_nm': float('nan'), 'cone_angle_deg': float('nan'),
+                'entry_rate': 0., 'r_centers': r_centers, 'profile': profile}
+
+    p_norm  = (profile - p_min) / p_range
+    idx_20  = np.argmax(p_norm > 0.2) if (p_norm > 0.2).any() else 0
+    idx_80  = np.argmax(p_norm > 0.8) if (p_norm > 0.8).any() else len(p_norm)-1
+
+    rim_width_nm = abs(r_centers[idx_80] - r_centers[idx_20])
+
+    # 在過渡帶內線性擬合斜率 → 錐角
+    idx_lo = min(idx_20, idx_80); idx_hi = max(idx_20, idx_80)
+    if idx_hi > idx_lo + 1:
+        r_rim = r_centers[idx_lo:idx_hi+1]
+        p_rim = profile[idx_lo:idx_hi+1]
+        try:
+            slope = np.polyfit(r_rim, p_rim, 1)[0]  # nm height / nm radius
+            cone_angle = float(np.degrees(np.arctan(abs(slope))))
+        except Exception:
+            cone_angle = float('nan')
+    else:
+        cone_angle = float('nan')
+
+    entry_rate = abs(p_min) / geom['height'] if geom['height'] > 0 else 0.
+
+    return {
+        'rim_width_nm'  : rim_width_nm,
+        'cone_angle_deg': cone_angle,
+        'entry_rate'    : entry_rate,
+        'r_centers'     : r_centers,
+        'profile'       : profile,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 錐形模型（廠商規格約束）
+# ══════════════════════════════════════════════════════════════════
+def make_cone_tip(half, px_nm, R_nm, theta_deg):
+    """
+    球形尖端 + 錐形側壁的理論探針形狀。
+    R_nm     : 尖端球形半徑（nm）
+    theta_deg: 半錐角（°），從探針軸量起
+    回傳：2D array，中心=0，往外為負值（nm）
+    """
+    size = 2 * half
+    yi, xi = np.indices((size, size))
+    r_nm   = np.sqrt((xi - half) ** 2 + (yi - half) ** 2) * px_nm
+
+    theta   = np.radians(theta_deg)
+    r_trans = R_nm * np.sin(theta)
+    tip     = np.zeros((size, size))
+
+    sphere_mask = r_nm <= r_trans
+    tip[sphere_mask] = -(R_nm - np.sqrt(
+        np.maximum(R_nm ** 2 - r_nm[sphere_mask] ** 2, 0)))
+
+    # [FIX-6] 改用 np.maximum 確保語義一致（雖然此處 r_trans 是 scalar 仍安全）
+    z_trans = -(R_nm - np.sqrt(np.maximum(R_nm ** 2 - r_trans ** 2, 0.0)))
+    cone_mask = r_nm > r_trans
+    tip[cone_mask] = z_trans - (r_nm[cone_mask] - r_trans) / np.tan(theta)
+
+    tip = np.clip(tip, -half * px_nm * 2, 0)
+    tip -= tip.max()
+    return tip
 
 # ══════════════════════════════════════════════════════════════════
 # GUI
@@ -289,399 +595,683 @@ def reconstruct(scan, geom, shape_type, meta, ap):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('AFM Blind Tip Reconstruction  v4')
-        self.configure(bg=C['bg']); self.geometry('1380x900'); self.minsize(1150,740)
-        self.meta=None; self.scan=None; self.tip=None
-        self.afm_path = tk.StringVar(value='尚未選擇')
-        self.ch_var   = tk.StringVar()
-        self.shape_var= tk.StringVar(value='trapezoid_pillar')
-        self.d_bot    = tk.StringVar(value='183.5')
-        self.d_top    = tk.StringVar(value='228.8')
-        self.height   = tk.StringVar(value='125.8')
-        self.pitch    = tk.StringVar(value='1000')
-        # 進階（可覆蓋自動值）
-        self.half_v   = tk.StringVar(value='auto')
-        self.max_sz_v = tk.StringVar(value='auto')
-        self.pct_v    = tk.StringVar(value='auto')
-        for v in (self.d_bot,self.d_top,self.height):
+        self.FT = get_fonts()
+        self.title('AFM Blind Tip Reconstruction  v4.1')
+        self.configure(bg=C['bg'])
+        self.geometry('1420x920')
+        self.minsize(1150, 740)
+
+        self.meta       = None
+        self.scan       = None
+        self.tip        = None          # [FIX-7] _preview() 會重設此值
+        self.tip_half   = None
+        self.geom       = None
+        self.shape_type = None
+
+        self.afm_path  = tk.StringVar(value='尚未選擇')
+        self.ch_var    = tk.StringVar()
+        self.shape_var = tk.StringVar(value='trapezoid_hole')
+        self.d_bot     = tk.StringVar(value='183.5')
+        self.d_top     = tk.StringVar(value='228.8')
+        self.height    = tk.StringVar(value='125.8')
+        self.pitch     = tk.StringVar(value='1000')
+        self.half_v    = tk.StringVar(value='auto')
+        self.max_sz_v  = tk.StringVar(value='auto')
+        self.pct_v     = tk.StringVar(value='auto')
+        self.tip_R_v   = tk.StringVar(value='2')
+        self.tip_angle_v = tk.StringVar(value='25')
+
+        for v in (self.d_bot, self.d_top, self.height):
             v.trace_add('write', lambda *_: self.after(80, self._update_info))
-        self._build(); self.protocol('WM_DELETE_WINDOW', self.on_close)
+
+        self._build()
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
 
     # ── 佈局 ──────────────────────────────────────────────────────
     def _build(self):
-        self.columnconfigure(0,weight=0); self.columnconfigure(1,weight=1)
-        self.rowconfigure(0,weight=1)
-        self._sidebar(); self._main_area()
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        self._sidebar()
+        self._main_area()
 
     def _sidebar(self):
-        sb = tk.Frame(self, bg=C['panel'], width=330)
-        sb.grid(row=0,column=0,sticky='nsew'); sb.grid_propagate(False)
-        sb.columnconfigure(0,weight=1)
+        # [FIX-9] 用 Canvas + Scrollbar 包住 sidebar，支援捲動
+        # 外層容器（固定寬度）
+        outer = tk.Frame(self, bg=C['panel'], width=340)
+        outer.grid(row=0, column=0, sticky='nsew')
+        outer.grid_propagate(False)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
 
-        tk.Label(sb,text='AFM Tip',font=('Helvetica',20,'bold'),
-                 bg=C['panel'],fg=C['accent']).pack(pady=(16,0))
-        tk.Label(sb,text='Reconstruction  v4',font=('Helvetica',10),
-                 bg=C['panel'],fg=C['muted']).pack(pady=(0,10))
-        ttk.Separator(sb).pack(fill='x',padx=14)
+        # 捲動用 Canvas
+        self._sb_canvas = tk.Canvas(outer, bg=C['panel'], highlightthickness=0,
+                                    width=320)
+        self._sb_canvas.grid(row=0, column=0, sticky='nsew')
+
+        sb_scroll = ttk.Scrollbar(outer, orient='vertical',
+                                  command=self._sb_canvas.yview)
+        sb_scroll.grid(row=0, column=1, sticky='ns')
+        self._sb_canvas.configure(yscrollcommand=sb_scroll.set)
+
+        # 真正的 sidebar Frame 放在 Canvas 裡
+        sb = tk.Frame(self._sb_canvas, bg=C['panel'])
+        self._sb_win = self._sb_canvas.create_window(
+            (0, 0), window=sb, anchor='nw', width=320)
+
+        # 內容尺寸變化時更新 scrollregion
+        def _on_frame_configure(event):
+            self._sb_canvas.configure(
+                scrollregion=self._sb_canvas.bbox('all'))
+        sb.bind('<Configure>', _on_frame_configure)
+
+        # Canvas 寬度調整時同步 window 寬度
+        def _on_canvas_configure(event):
+            self._sb_canvas.itemconfig(self._sb_win, width=event.width)
+        self._sb_canvas.bind('<Configure>', _on_canvas_configure)
+
+        # 滑鼠滾輪（Windows / macOS / Linux）
+        def _on_mousewheel(event):
+            if event.delta:                          # Windows / macOS
+                self._sb_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+            elif event.num == 4:                     # Linux scroll up
+                self._sb_canvas.yview_scroll(-1, 'units')
+            elif event.num == 5:                     # Linux scroll down
+                self._sb_canvas.yview_scroll(1, 'units')
+        self._sb_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        self._sb_canvas.bind_all('<Button-4>',   _on_mousewheel)
+        self._sb_canvas.bind_all('<Button-5>',   _on_mousewheel)
+
+        sb.columnconfigure(0, weight=1)
+
+        # ── 以下是原 sidebar 內容，父容器改為 sb ─────────────────
+        tk.Label(sb, text='AFM Tip', font=self.FT['title'],
+                 bg=C['panel'], fg=C['accent']).pack(pady=(16, 0))
+        tk.Label(sb, text='Reconstruction  v4.2', font=self.FT['normal'],
+                 bg=C['panel'], fg=C['muted']).pack(pady=(0, 10))
+        ttk.Separator(sb).pack(fill='x', padx=14)
 
         # ① AFM
-        self._sec(sb,'① 選擇 AFM 檔案')
-        pf=tk.Frame(sb,bg=C['panel']); pf.pack(fill='x',padx=14,pady=(0,6))
-        pf.columnconfigure(0,weight=1)
-        tk.Label(pf,textvariable=self.afm_path,bg=C['input_bg'],fg=C['text'],
-                 font=('Courier',8),wraplength=210,anchor='w',padx=6,pady=5
-                 ).grid(row=0,column=0,sticky='ew',padx=(0,6))
-        self._btn(pf,'瀏覽',self.browse,small=True).grid(row=0,column=1)
-        tk.Label(sb,text='高度通道',bg=C['panel'],fg=C['muted'],font=('Helvetica',9)).pack(anchor='w',padx=14)
-        self.ch_cb=ttk.Combobox(sb,textvariable=self.ch_var,state='readonly',font=('Helvetica',9))
-        self.ch_cb.pack(fill='x',padx=14,pady=(2,10))
-        self.ch_cb.bind('<<ComboboxSelected>>',lambda _:self._preview())
-        ttk.Separator(sb).pack(fill='x',padx=14)
+        self._sec(sb, '① 選擇 AFM 檔案')
+        pf = tk.Frame(sb, bg=C['panel'])
+        pf.pack(fill='x', padx=14, pady=(0, 6))
+        pf.columnconfigure(0, weight=1)
+        tk.Label(pf, textvariable=self.afm_path, bg=C['input_bg'], fg=C['text'],
+                 font=self.FT['mono'], wraplength=210, anchor='w', padx=6, pady=5
+                 ).grid(row=0, column=0, sticky='ew', padx=(0, 6))
+        self._btn(pf, '瀏覽', self.browse, small=True).grid(row=0, column=1)
+        tk.Label(sb, text='高度通道', bg=C['panel'], fg=C['muted'],
+                 font=self.FT['small']).pack(anchor='w', padx=14)
+        self.ch_cb = ttk.Combobox(sb, textvariable=self.ch_var, state='readonly',
+                                  font=self.FT['small'])
+        self.ch_cb.pack(fill='x', padx=14, pady=(2, 10))
+        self.ch_cb.bind('<<ComboboxSelected>>', lambda _: self._preview())
+        ttk.Separator(sb).pack(fill='x', padx=14)
 
         # ② 形狀
-        self._sec(sb,'② 特徵形狀')
-        sf=tk.Frame(sb,bg=C['panel']); sf.pack(fill='x',padx=14,pady=(0,6))
-        for txt,val in [('梯形柱 Trapezoid Pillar','trapezoid_pillar'),
-                        ('圓柱孔 Cylinder Hole',   'cylinder_hole')]:
-            tk.Radiobutton(sf,text=txt,variable=self.shape_var,value=val,
-                           bg=C['panel'],fg=C['text'],selectcolor=C['input_bg'],
-                           activebackground=C['panel'],font=('Helvetica',9),
-                           command=self._on_shape).pack(anchor='w',pady=2)
-        ttk.Separator(sb).pack(fill='x',padx=14)
+        self._sec(sb, '② 特徵形狀')
+        sf = tk.Frame(sb, bg=C['panel'])
+        sf.pack(fill='x', padx=14, pady=(0, 6))
+        for txt, val in [('梯形孔 Trapezoid Hole',   'trapezoid_hole'),
+                         ('梯形柱 Trapezoid Pillar', 'trapezoid_pillar'),
+                         ('圓柱孔 Cylinder Hole',    'cylinder_hole')]:
+            tk.Radiobutton(sf, text=txt, variable=self.shape_var, value=val,
+                           bg=C['panel'], fg=C['text'], selectcolor=C['input_bg'],
+                           activebackground=C['panel'], font=self.FT['small'],
+                           command=self._on_shape).pack(anchor='w', pady=2)
+        ttk.Separator(sb).pack(fill='x', padx=14)
 
         # ③ 幾何
-        self._sec(sb,'③ SEM 幾何參數')
-        self.geom_frame=tk.Frame(sb,bg=C['panel'])
+        self._sec(sb, '③ SEM 幾何參數')
+        self.geom_frame = tk.Frame(sb, bg=C['panel'])
         self.geom_frame.pack(fill='x')
         self._rebuild_geom()
-        ttk.Separator(sb).pack(fill='x',padx=14)
+        ttk.Separator(sb).pack(fill='x', padx=14)
 
-        # ④ 進階（顯示自動計算值，可手動覆蓋）
-        self._sec(sb,'④ 進階設定（auto = 自動計算）')
-        self._row(sb,'Patch 半徑 (px)',   self.half_v)
-        self._row(sb,'最大特徵面積 (px²)', self.max_sz_v)
-        self._row(sb,'偵測閾值 (%)',       self.pct_v)
+        # ④ 進階
+        self._sec(sb, '④ 進階設定（auto = 自動計算）')
+        self._row(sb, 'Patch 半徑 (px)',    self.half_v)
+        self._row(sb, '最大特徵面積 (px²)', self.max_sz_v)
+        self._row(sb, '偵測閾值 (%)',        self.pct_v)
+        self.auto_info = tk.Label(sb, text='', bg=C['panel'], fg=C['warn'],
+                                  font=self.FT['mono'], wraplength=295, justify='left')
+        self.auto_info.pack(anchor='w', padx=14, pady=(4, 0))
+        ttk.Separator(sb).pack(fill='x', padx=14)
 
-        # 自動參數提示框
-        self.auto_info = tk.Label(sb,text='',bg=C['panel'],fg=C['warn'],
-                                  font=('Courier',8),wraplength=295,justify='left')
-        self.auto_info.pack(anchor='w',padx=14,pady=(4,0))
+        # ⑤ 廠商規格
+        self._sec(sb, '⑤ 探針廠商規格（選填）')
+        tk.Label(sb, text='  填入後自動疊加錐形模型做比較',
+                 bg=C['panel'], fg=C['muted'], font=self.FT['tiny']
+                 ).pack(anchor='w', padx=14)
+        self._row(sb, '尖端半徑 R  (nm)', self.tip_R_v)
+        self._row(sb, '半錐角 θ    (°)',  self.tip_angle_v)
+        self.tip_info_lbl = tk.Label(sb, text='', bg=C['panel'], fg=C['success'],
+                                     font=self.FT['mono'], wraplength=295, justify='left')
+        self.tip_info_lbl.pack(anchor='w', padx=14, pady=(2, 0))
+        for v in (self.tip_R_v, self.tip_angle_v):
+            v.trace_add('write', lambda *_: self.after(80, self._update_tip_spec))
 
-        tk.Frame(sb,bg=C['panel'],height=8).pack()
-        self._btn(sb,'▶  執行重建',self.run,big=True).pack(fill='x',padx=14,pady=3)
-        self._btn(sb,'💾  儲存 tip.mat',self.save,color=C['success']
-                  ).pack(fill='x',padx=14,pady=3)
-        self._btn(sb,'🖼  儲存圖片',self.save_figure,color=C['accent2']
-                  ).pack(fill='x',padx=14,pady=3)
+        tk.Frame(sb, bg=C['panel'], height=8).pack()
+        self._btn(sb, '▶  執行重建', self.run, big=True
+                  ).pack(fill='x', padx=14, pady=3)
+        self._btn(sb, '💾  儲存 tip.mat', self.save, color=C['success']
+                  ).pack(fill='x', padx=14, pady=3)
+        self._btn(sb, '🖼  儲存圖片', self.save_figure, color=C['accent2']
+                  ).pack(fill='x', padx=14, pady=3)
 
-        ttk.Separator(sb).pack(fill='x',padx=14)
-        tk.Label(sb,text='LOG',bg=C['panel'],fg=C['muted'],font=('Helvetica',8)
-                 ).pack(anchor='w',padx=14,pady=(6,2))
-        lf=tk.Frame(sb,bg=C['input_bg'])
-        lf.pack(fill='both',expand=True,padx=14,pady=(0,14))
-        self.log_box=tk.Text(lf,bg=C['input_bg'],fg='#94a3b8',font=('Courier',8),
-                             relief='flat',state='disabled',wrap='word')
-        sc=ttk.Scrollbar(lf,command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=sc.set)
-        sc.pack(side='right',fill='y'); self.log_box.pack(fill='both',expand=True,padx=4,pady=4)
+        ttk.Separator(sb).pack(fill='x', padx=14)
+        tk.Label(sb, text='LOG', bg=C['panel'], fg=C['muted'],
+                 font=self.FT['tiny']).pack(anchor='w', padx=14, pady=(6, 2))
+        lf = tk.Frame(sb, bg=C['input_bg'], height=160)
+        lf.pack(fill='x', padx=14, pady=(0, 14))
+        lf.pack_propagate(False)
+        sc = ttk.Scrollbar(lf, orient='vertical')
+        self.log_box = tk.Text(lf, bg=C['input_bg'], fg='#94a3b8',
+                               font=self.FT['mono'], relief='flat',
+                               state='disabled', wrap='word',
+                               yscrollcommand=sc.set, height=8)
+        sc.configure(command=self.log_box.yview)
+        sc.pack(side='right', fill='y')
+        self.log_box.pack(side='left', fill='both', expand=True, padx=4, pady=4)
+        # 底部留白，確保捲動到底時最後一個元件不被截斷
+        tk.Frame(sb, bg=C['panel'], height=12).pack()
 
     def _rebuild_geom(self):
-        for w in self.geom_frame.winfo_children(): w.destroy()
-        s=self.shape_var.get()
-        if s=='trapezoid_pillar':
-            self.angle_lbl=tk.Label(self.geom_frame,text='',bg=C['panel'],fg=C['warn'],
-                                    font=('Helvetica',9)); self.angle_lbl.pack(anchor='w',padx=14)
-            fields=[('底部寬 d_bot (nm)',self.d_bot),
-                    ('頂部寬 d_top (nm)',self.d_top),
-                    ('高度 height  (nm)',self.height),
-                    ('週期 pitch   (nm)',self.pitch)]
+        for w in self.geom_frame.winfo_children():
+            w.destroy()
+        s = self.shape_var.get()
+        if s in ('trapezoid_hole', 'trapezoid_pillar'):
+            self.angle_lbl = tk.Label(self.geom_frame, text='', bg=C['panel'],
+                                      fg=C['warn'], font=self.FT['small'])
+            self.angle_lbl.pack(anchor='w', padx=14)
+            if s == 'trapezoid_hole':
+                fields = [('開口寬 d_top (nm)', self.d_top),
+                          ('底部寬 d_bot (nm)', self.d_bot),
+                          ('深度 depth  (nm)',  self.height),
+                          ('週期 pitch  (nm)',  self.pitch)]
+            else:
+                fields = [('底部寬 d_bot (nm)', self.d_bot),
+                          ('頂部寬 d_top (nm)', self.d_top),
+                          ('高度 height  (nm)', self.height),
+                          ('週期 pitch   (nm)', self.pitch)]
         else:
-            self.angle_lbl=None
-            fields=[('孔洞直徑 d  (nm)',self.d_bot),
-                    ('孔洞深度 z  (nm)',self.height),
-                    ('週期 pitch  (nm)',self.pitch)]
-        for lbl,var in fields: self._row(self.geom_frame,lbl,var)
+            self.angle_lbl = None
+            fields = [('孔洞直徑 d  (nm)', self.d_bot),
+                      ('孔洞深度 z  (nm)', self.height),
+                      ('週期 pitch  (nm)', self.pitch)]
+        for lbl, var in fields:
+            self._row(self.geom_frame, lbl, var)
         self._update_info()
 
-    def _on_shape(self): self._rebuild_geom()
+    def _on_shape(self):
+        self._rebuild_geom()
+        # shape_type 改變時需重新 flatten（基線方向不同）
+        if self.meta and self.scan is not None:
+            raw = read_channel(self.meta['filepath'], self.meta, self.ch_cb.current())
+            self.scan = flatten_rows(raw, self.shape_var.get())
+            self._draw_preview()
 
     def _update_info(self):
-        # 更新側壁角
-        if hasattr(self,'angle_lbl') and self.angle_lbl:
+        if hasattr(self, 'angle_lbl') and self.angle_lbl:
             try:
-                bot=float(self.d_bot.get() or 0); top=float(self.d_top.get() or 0)
-                h=float(self.height.get() or 0)
-                if h>0 and abs(top-bot)>0:
-                    diff=abs(top-bot)/2; taper=np.degrees(np.arctan(diff/h))
-                    kind='倒梯形(底窄頂寬)' if top>bot else '正梯形(底寬頂窄)'
+                bot = float(self.d_bot.get() or 0)
+                top = float(self.d_top.get() or 0)
+                h   = float(self.height.get() or 0)
+                if h > 0 and abs(top - bot) > 0:
+                    taper = np.degrees(np.arctan(abs(top - bot) / 2 / h))
+                    if self.shape_var.get() == 'trapezoid_hole':
+                        kind = '梯形孔(開口寬底部窄)'
+                    else:
+                        kind = '倒梯形(底窄頂寬)' if top > bot else '正梯形(底寬頂窄)'
                     self.angle_lbl.config(text=f'  {kind}  taper: {taper:.1f}°')
-            except: pass
-        # 更新自動參數提示
+            except Exception:
+                pass
         if self.meta:
             try:
-                geom=self._get_geom()
-                ap=auto_params(geom,self.shape_var.get(),self.meta)
-                info=(f'auto: half={ap["half"]}px  max_sz={ap["max_sz"]}px²\n'
-                      f'      pct={ap["pct_hi"] or ap["pct_lo"]}%  '
-                      f'r_feat={ap["r_max_px"]:.1f}px')
+                geom = self._get_geom()
+                ap   = auto_params(geom, self.shape_var.get(), self.meta)
+                info = (f'auto: half={ap["half"]}px  max_sz={ap["max_sz"]}px²\n'
+                        f'      pct={ap["pct_hi"] or ap["pct_lo"]}%  '
+                        f'r_feat={ap["r_max_px"]:.1f}px')
                 if ap['warnings']:
                     info += '\n' + '\n'.join(ap['warnings'])
                 self.auto_info.config(text=info)
-            except: pass
+            except Exception:
+                pass
+
+    def _update_tip_spec(self):
+        try:
+            R     = float(self.tip_R_v.get() or 0)
+            theta = float(self.tip_angle_v.get() or 0)
+            if R > 0 and theta > 0:
+                r_t = R * np.sin(np.radians(theta))
+                d_t = R * (1 - np.cos(np.radians(theta)))
+                self.tip_info_lbl.config(text=(
+                    f'  尖端球形區：r < {r_t:.1f}nm\n'
+                    f'  切入深度:    {d_t:.1f}nm\n'
+                    f'  側壁斜率:    {np.tan(np.radians(theta)):.3f} nm/nm'
+                ))
+            elif R > 0:
+                self.tip_info_lbl.config(text='  請也輸入半錐角 θ')
+            else:
+                self.tip_info_lbl.config(text='')
+        except Exception:
+            pass
 
     def _main_area(self):
-        m=tk.Frame(self,bg=C['bg']); m.grid(row=0,column=1,sticky='nsew',padx=14,pady=14)
-        m.columnconfigure(0,weight=1); m.rowconfigure(1,weight=1)
-        sb=tk.Frame(m,bg=C['panel'],height=44); sb.grid(row=0,column=0,sticky='ew',pady=(0,10))
-        self.stats={}
-        for i,(k,v) in enumerate([('AFM','—'),('掃描範圍','—'),('px_nm','—'),('Ra','—'),('特徵數','—')]):
-            f=tk.Frame(sb,bg=C['panel']); f.grid(row=0,column=i,padx=16,pady=8)
-            tk.Label(f,text=k,bg=C['panel'],fg=C['muted'],font=('Helvetica',8)).pack()
-            l=tk.Label(f,text=v,bg=C['panel'],fg=C['text'],font=('Helvetica',10,'bold'))
-            l.pack(); self.stats[k]=l
-        self.fig=Figure(figsize=(10,6.2),facecolor=C['bg'])
-        self.canvas=FigureCanvasTkAgg(self.fig,master=m)
-        self.canvas.get_tk_widget().grid(row=1,column=0,sticky='nsew')
+        m = tk.Frame(self, bg=C['bg'])
+        m.grid(row=0, column=1, sticky='nsew', padx=14, pady=14)
+        m.columnconfigure(0, weight=1)
+        m.rowconfigure(1, weight=1)
 
+        sb = tk.Frame(m, bg=C['panel'], height=44)
+        sb.grid(row=0, column=0, sticky='ew', pady=(0, 10))
+        self.stats = {}
+        for i, (k, v) in enumerate([('AFM', '—'), ('掃描範圍', '—'),
+                                     ('px_nm', '—'), ('Ra', '—'), ('特徵數', '—')]):
+            f = tk.Frame(sb, bg=C['panel'])
+            f.grid(row=0, column=i, padx=16, pady=8)
+            tk.Label(f, text=k, bg=C['panel'], fg=C['muted'],
+                     font=self.FT['tiny']).pack()
+            lbl = tk.Label(f, text=v, bg=C['panel'], fg=C['text'],
+                           font=self.FT['bold'])
+            lbl.pack()
+            self.stats[k] = lbl
+
+        self.fig    = Figure(figsize=(10, 6.2), facecolor=C['bg'])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=m)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky='nsew')
         self._placeholder()
 
-    def _sec(self,p,t):
-        tk.Label(p,text=t,bg=C['panel'],fg=C['accent'],
-                 font=('Helvetica',10,'bold')).pack(anchor='w',padx=14,pady=(9,3))
+    def _sec(self, p, t):
+        tk.Label(p, text=t, bg=C['panel'], fg=C['accent'],
+                 font=self.FT['bold']).pack(anchor='w', padx=14, pady=(9, 3))
 
-    def _row(self,p,label,var):
-        f=tk.Frame(p,bg=C['panel']); f.pack(fill='x',padx=14,pady=2); f.columnconfigure(1,weight=1)
-        tk.Label(f,text=label,bg=C['panel'],fg=C['muted'],font=('Helvetica',9),
-                 width=19,anchor='w').grid(row=0,column=0)
-        make_float_entry(f,var).grid(row=0,column=1,sticky='ew',ipady=4,padx=(6,0))
+    def _row(self, p, lbl_text, var):
+        f = tk.Frame(p, bg=C['panel'])
+        f.pack(fill='x', padx=14, pady=2)
+        f.columnconfigure(1, weight=1)
+        tk.Label(f, text=lbl_text, bg=C['panel'], fg=C['muted'],
+                 font=self.FT['small'], width=19, anchor='w').grid(row=0, column=0)
+        make_float_entry(f, var, font=self.FT['normal']
+                         ).grid(row=0, column=1, sticky='ew', ipady=4, padx=(6, 0))
 
-    def _btn(self,p,t,cmd,big=False,small=False,color=None):
-        c=color or C['accent']
-        return tk.Button(p,text=t,command=cmd,bg=c,fg='white',
-                         activebackground=C['hover'],activeforeground='white',
-                         relief='flat',cursor='hand2',
-                         font=('Helvetica',11 if big else (9 if small else 10),
-                               'bold' if big else 'normal'),pady=8 if big else 4)
+    def _btn(self, p, t, cmd, big=False, small=False, color=None):
+        c = color or C['accent']
+        return tk.Button(p, text=t, command=cmd, bg=c, fg='white',
+                         activebackground=C['hover'], activeforeground='white',
+                         relief='flat', cursor='hand2',
+                         font=(self.FT['title'] if big else
+                               (self.FT['small'] if small else self.FT['normal'])),
+                         pady=8 if big else 4)
 
     def _placeholder(self):
-        self.fig.clear(); ax=self.fig.add_subplot(111); ax.set_facecolor(C['panel'])
-        ax.text(0.5,0.5,'選擇 AFM 檔案後開始分析',ha='center',va='center',
-                color=C['muted'],fontsize=14,transform=ax.transAxes)
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor(C['panel'])
+        ax.text(0.5, 0.5, '選擇 AFM 檔案後開始分析',
+                ha='center', va='center', color=C['muted'],
+                fontsize=14, transform=ax.transAxes)
         ax.set_xticks([]); ax.set_yticks([])
-        for sp in ax.spines.values(): sp.set_edgecolor(C['border'])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(C['border'])
         self.canvas.draw()
 
-    def log(self,msg):
+    # [FIX-2] 只能在主執行緒操作 Tkinter widget；worker 透過 self.after() 排程
+    def log(self, msg):
         self.log_box.configure(state='normal')
-        self.log_box.insert('end',msg+'\n'); self.log_box.see('end')
+        self.log_box.insert('end', msg + '\n')
+        self.log_box.see('end')
         self.log_box.configure(state='disabled')
 
+    def _log_safe(self, msg):
+        """thread-safe 版本：從 worker thread 呼叫此方法"""
+        self.after(0, lambda m=msg: self.log(m))
+
     def _get_geom(self):
-        s=self.shape_var.get()
-        return {'d_bot':float(self.d_bot.get()),
-                'd_top':float(self.d_top.get()) if s=='trapezoid_pillar' else float(self.d_bot.get()),
-                'height':float(self.height.get()),
-                'pitch':float(self.pitch.get())}
+        s = self.shape_var.get()
+        return {
+            'd_bot':   float(self.d_bot.get()),
+            'd_top':   float(self.d_top.get()) if s in ('trapezoid_pillar', 'trapezoid_hole')
+                       else float(self.d_bot.get()),
+            'height':  float(self.height.get()),
+            'pitch':   float(self.pitch.get()),
+        }
 
     def browse(self):
-        p=filedialog.askopenfilename(title='選擇 Nanoscope 檔案',
-            filetypes=[('Nanoscope','*.000 *.001 *.002 *.003 *.004 *.005'),('All','*.*')])
+        p = filedialog.askopenfilename(
+            title='選擇 Nanoscope 檔案',
+            filetypes=[('Nanoscope', '*.000 *.001 *.002 *.003 *.004 *.005'),
+                       ('All', '*.*')])
         if not p: return
         try:
-            self.meta=parse_nanoscope(p)
+            self.meta = parse_nanoscope(p)
             self.afm_path.set(os.path.basename(p))
-            names=[f"[{i}] {ch['name']}" for i,ch in enumerate(self.meta['channels'])]
-            self.ch_cb['values']=names; auto=auto_height_ch(self.meta)
-            self.ch_cb.current(auto); self.ch_var.set(names[auto])
-            self._preview(); self._update_info()
+            names = [f'[{i}] {ch["name"]}' for i, ch in enumerate(self.meta['channels'])]
+            self.ch_cb['values'] = names
+            auto = auto_height_ch(self.meta)
+            self.ch_cb.current(auto)
+            self.ch_var.set(names[auto])
+            self._preview()
+            self._update_info()
             self.log(f'✓ {os.path.basename(p)} | {len(self.meta["channels"])}通道 | '
                      f'{self.meta["scan_nm"]:.1f}nm | {self.meta["n_px"]}px')
         except Exception as e:
-            messagebox.showerror('讀取失敗',str(e)); self.log(f'✗ {e}')
+            messagebox.showerror('讀取失敗', str(e))
+            self.log(f'✗ {e}')
 
+    # [FIX-7] 切換通道時清除舊 tip，避免誤存
     def _preview(self):
         if not self.meta: return
-        raw=read_channel(self.meta['filepath'],self.meta,self.ch_cb.current())
-        self.scan=flatten_rows(raw)
-        m=self.meta; s=self.scan
+        self.tip        = None      # 清除舊重建結果
+        self.tip_half   = None
+        self.stats['特徵數'].config(text='—')
+
+        # [FIX-11] 把目前選擇的 shape_type 傳給 flatten_rows，讓基線方向正確
+        raw       = read_channel(self.meta['filepath'], self.meta, self.ch_cb.current())
+        self.scan = flatten_rows(raw, self.shape_var.get())
+        m = self.meta; s = self.scan
         self.stats['AFM'].config(text=os.path.basename(m['filepath']))
         self.stats['掃描範圍'].config(text=f'{m["scan_nm"]:.1f}nm')
         self.stats['px_nm'].config(text=f'{m["px_nm"]:.2f}nm/px')
-        self.stats['Ra'].config(text=f'{np.mean(np.abs(s-s.mean())):.2f}nm')
+        self.stats['Ra'].config(text=f'{np.mean(np.abs(s - s.mean())):.2f}nm')
         self._draw_preview()
 
     def _draw_preview(self):
-        self.fig.clear(); self.fig.patch.set_facecolor(C['bg'])
-        gs=self.fig.add_gridspec(1,2,wspace=0.3,left=0.06,right=0.97,top=0.9,bottom=0.1)
-        s=self.scan; m=self.meta; ext=[0,m['scan_nm'],m['scan_nm'],0]
-        def da(ax,t):
-            ax.set_facecolor(C['panel']); ax.set_title(t,color=C['text'],fontsize=10)
-            ax.tick_params(colors=C['muted'],labelsize=7)
-            for sp in ax.spines.values(): sp.set_edgecolor(C['border'])
-        ax1=self.fig.add_subplot(gs[0]); da(ax1,'AFM Scan (Height Sensor)')
-        im=ax1.imshow(s,cmap='afmhot',origin='upper',extent=ext,
-                      vmin=np.percentile(s,2),vmax=np.percentile(s,98))
-        cb=self.fig.colorbar(im,ax=ax1,fraction=0.046); cb.ax.tick_params(colors='#666',labelsize=6)
-        ax1.set_xlabel('nm',color=C['muted'],fontsize=8); ax1.set_ylabel('nm',color=C['muted'],fontsize=8)
-        ax2=self.fig.add_subplot(gs[1]); da(ax2,'Line Profiles')
-        x=np.linspace(0,m['scan_nm'],s.shape[1])
-        for row,col in zip([s.shape[0]//4,s.shape[0]//2,3*s.shape[0]//4],
-                           ['#4f9cf9','#f59e0b','#ef4444']):
-            ax2.plot(x,s[row,:],color=col,lw=1.2,alpha=0.8,label=f'row {row}')
-        ax2.set_xlabel('nm',color=C['muted'],fontsize=8); ax2.set_ylabel('nm',color=C['muted'],fontsize=8)
-        ax2.grid(color=C['border'],alpha=0.5)
-        leg=ax2.legend(fontsize=7,facecolor=C['panel'],edgecolor=C['border'])
+        self.fig.clear()
+        self.fig.patch.set_facecolor(C['bg'])
+        gs = self.fig.add_gridspec(1, 2, wspace=0.3,
+                                   left=0.06, right=0.97, top=0.9, bottom=0.1)
+        s = self.scan; m = self.meta
+        ext = [0, m['scan_nm'], m['scan_nm'], 0]
+
+        def da(ax, t):
+            ax.set_facecolor(C['panel'])
+            ax.set_title(t, color=C['text'], fontsize=10)
+            ax.tick_params(colors=C['muted'], labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(C['border'])
+
+        ax1 = self.fig.add_subplot(gs[0])
+        da(ax1, 'AFM Scan (Height Sensor)')
+        im = ax1.imshow(s, cmap='afmhot', origin='upper', extent=ext,
+                        vmin=np.percentile(s, 2), vmax=np.percentile(s, 98))
+        cb = self.fig.colorbar(im, ax=ax1, fraction=0.046)
+        cb.ax.tick_params(colors='#666', labelsize=6)
+        ax1.set_xlabel('nm', color=C['muted'], fontsize=8)
+        ax1.set_ylabel('nm', color=C['muted'], fontsize=8)
+
+        ax2 = self.fig.add_subplot(gs[1])
+        da(ax2, 'Line Profiles')
+        x = np.linspace(0, m['scan_nm'], s.shape[1])
+        for row, col in zip([s.shape[0] // 4, s.shape[0] // 2, 3 * s.shape[0] // 4],
+                            ['#4f9cf9', '#f59e0b', '#ef4444']):
+            ax2.plot(x, s[row, :], color=col, lw=1.2, alpha=0.8, label=f'row {row}')
+        ax2.set_xlabel('nm', color=C['muted'], fontsize=8)
+        ax2.set_ylabel('nm', color=C['muted'], fontsize=8)
+        ax2.grid(color=C['border'], alpha=0.5)
+        leg = ax2.legend(fontsize=7, facecolor=C['panel'], edgecolor=C['border'])
         [t.set_color(C['text']) for t in leg.get_texts()]
         self.canvas.draw()
 
     def run(self):
         if self.scan is None:
-            messagebox.showwarning('提示','請先選擇 AFM 檔案'); return
+            messagebox.showwarning('提示', '請先選擇 AFM 檔案')
+            return
         try:
-            geom=self._get_geom()
-            s=self.shape_var.get()
-            ap=auto_params(geom,s,self.meta)
-            # 允許手動覆蓋
-            if self.half_v.get() not in ('','auto'):
-                ap['half']=int(float(self.half_v.get()))
-            if self.max_sz_v.get() not in ('','auto'):
-                ap['max_sz']=int(float(self.max_sz_v.get()))
-            if self.pct_v.get() not in ('','auto'):
-                pct=float(self.pct_v.get())
-                if s=='cylinder_hole': ap['pct_lo']=pct
-                else: ap['pct_hi']=pct
+            geom = self._get_geom()
+            s    = self.shape_var.get()
+            ap   = auto_params(geom, s, self.meta)
+            if self.half_v.get() not in ('', 'auto'):
+                ap['half'] = int(float(self.half_v.get()))
+            if self.max_sz_v.get() not in ('', 'auto'):
+                ap['max_sz'] = int(float(self.max_sz_v.get()))
+            if self.pct_v.get() not in ('', 'auto'):
+                pct = float(self.pct_v.get())
+                if s in ('cylinder_hole', 'trapezoid_hole'):
+                    ap['pct_lo'] = pct
+                else:
+                    ap['pct_hi'] = pct
         except ValueError:
-            messagebox.showerror('錯誤','請確認所有參數為有效數字'); return
+            messagebox.showerror('錯誤', '請確認所有參數為有效數字')
+            return
 
         self.log(f'執行重建 shape={s}')
-        self.log(f'  d_bot={geom["d_bot"]} d_top={geom["d_top"]} h={geom["height"]} p={geom["pitch"]}')
-        self.log(f'  half={ap["half"]}px  max_sz={ap["max_sz"]}px²  pct={ap["pct_hi"] or ap["pct_lo"]}%')
-        for w in ap['warnings']: self.log(f'  {w}')
+        self.log(f'  d_bot={geom["d_bot"]} d_top={geom["d_top"]} '
+                 f'h={geom["height"]} p={geom["pitch"]}')
+        self.log(f'  half={ap["half"]}px  max_sz={ap["max_sz"]}px²  '
+                 f'pct={ap["pct_hi"] or ap["pct_lo"]}%')
+        for w in ap['warnings']:
+            self.log(f'  {w}')
 
         def worker():
             try:
-                tip,avg,gt_p,n,gt_al,info=reconstruct(self.scan,geom,s,self.meta,ap)
-                self.log(info)
+                _result = reconstruct(self.scan, geom, s, self.meta, ap)
+                tip, avg, gt_p, n, gt_al, info = _result[:6]
+                rim = _result[6] if len(_result) > 6 else None
+                # [FIX-2] 所有 self.log() 改用 thread-safe 版本
+                self._log_safe(info)
                 if tip is None:
-                    self.after(0,lambda:messagebox.showerror('失敗',
-                        '找不到有效特徵\n\n建議：\n1. 確認形狀選擇正確\n2. 調整偵測閾值\n3. 縮小掃描範圍讓特徵更明顯'))
-                    self.log('✗ 找不到有效特徵'); return
-                self.tip=tip; self.tip_half=ap['half']; self.geom=geom; self.shape_type=s
-                px=self.meta['px_nm']; mid=ap['half']; tip1d=tip[mid,:]
-                beyond=np.where(tip1d < tip.min()*0.1)[0]
-                r_est=(beyond[-1]-beyond[0])*px/2 if len(beyond)>1 else float('nan')
-                feat_h=abs(avg.min() if s=='cylinder_hole' else avg.max())
-                self.log(f'✓ {n}個特徵平均 | 量測高度:{feat_h:.1f}nm (GT:{geom["height"]}nm)')
-                if not np.isnan(r_est): self.log(f'  估算探針半徑:{r_est:.1f}nm')
-                self.after(0,lambda:self._draw_result(tip,avg,gt_p,gt_al,geom,s,n,r_est,ap['half'],px))
-                self.after(0,lambda:self.stats['特徵數'].config(text=str(n)))
+                    self.after(0, lambda: messagebox.showerror(
+                        '失敗',
+                        '找不到有效特徵\n\n建議：\n'
+                        '1. 確認形狀選擇正確\n'
+                        '2. 調整偵測閾值\n'
+                        '3. 縮小掃描範圍讓特徵更明顯'))
+                    self._log_safe('✗ 找不到有效特徵')
+                    return
+
+                self.tip        = tip
+                self.tip_half   = ap['half']
+                self.geom       = geom
+                self.shape_type = s
+                px  = self.meta['px_nm']
+                mid = ap['half']
+                tip1d  = tip[mid, :]
+                beyond = np.where(tip1d < tip.min() * 0.1)[0]
+                r_est  = (beyond[-1] - beyond[0]) * px / 2 if len(beyond) > 1 else float('nan')
+                feat_h = abs(avg.min() if s in ('cylinder_hole', 'trapezoid_hole')
+                             else avg.max())
+                self._log_safe(
+                    f'✓ {n}個特徵平均 | 量測高度:{feat_h:.1f}nm (GT:{geom["height"]}nm)')
+                if not np.isnan(r_est):
+                    self._log_safe(f'  估算探針半徑:{r_est:.1f}nm')
+                self.after(0, lambda: self._draw_result(
+                    tip, avg, gt_p, gt_al, geom, s, n, r_est, ap['half'], px))
+                self.after(0, lambda: self.stats['特徵數'].config(text=str(n)))
             except Exception as e:
-                self.log(f'✗ {e}'); import traceback; traceback.print_exc()
+                self._log_safe(f'✗ {e}')
+                import traceback; traceback.print_exc()
 
-        threading.Thread(target=worker,daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
-    def _draw_result(self,tip,avg,gt_p,gt_al,geom,shape,n,r_est,half,px):
-        self.fig.clear(); self.fig.patch.set_facecolor(C['bg'])
-        gs=self.fig.add_gridspec(2,3,hspace=0.42,wspace=0.32,
-                                 left=0.06,right=0.97,top=0.92,bottom=0.07)
-        m=self.meta; ext=[0,m['scan_nm'],m['scan_nm'],0]; s=self.scan
-        def da(ax,t):
-            ax.set_facecolor(C['panel']); ax.set_title(t,color=C['text'],fontsize=9,pad=4)
-            ax.tick_params(colors=C['muted'],labelsize=6)
-            for sp in ax.spines.values(): sp.set_edgecolor(C['border'])
-        def dcb(im,ax):
-            c=self.fig.colorbar(im,ax=ax,fraction=0.046); c.ax.tick_params(colors='#666',labelsize=5)
+    def _draw_result(self, tip, avg, gt_p, gt_al, geom, shape, n, r_est, half, px, rim=None):
+        self.fig.clear()
+        self.fig.patch.set_facecolor(C['bg'])
+        gs = self.fig.add_gridspec(2, 3, hspace=0.42, wspace=0.32,
+                                   left=0.06, right=0.97, top=0.92, bottom=0.07)
+        m   = self.meta
+        ext = [0, m['scan_nm'], m['scan_nm'], 0]
+        s   = self.scan
 
-        ax1=self.fig.add_subplot(gs[0,0]); da(ax1,'AFM Scan')
-        im=ax1.imshow(s,cmap='afmhot',origin='upper',extent=ext,
-                      vmin=np.percentile(s,2),vmax=np.percentile(s,98)); dcb(im,ax1)
-        ax1.set_xlabel('nm',color=C['muted'],fontsize=7)
+        def da(ax, t):
+            ax.set_facecolor(C['panel'])
+            ax.set_title(t, color=C['text'], fontsize=9, pad=4)
+            ax.tick_params(colors=C['muted'], labelsize=6)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(C['border'])
 
-        lbl=(f'd_bot={geom["d_bot"]:.1f} d_top={geom["d_top"]:.1f} h={geom["height"]:.1f}nm'
-             if shape=='trapezoid_pillar' else f'd={geom["d_bot"]:.1f} z={geom["height"]:.1f}nm')
-        ax2=self.fig.add_subplot(gs[0,1]); da(ax2,f'Synthetic GT  {lbl}')
-        im2=ax2.imshow(gt_al,cmap='afmhot',origin='upper',extent=ext); dcb(im2,ax2)
+        def dcb(im, ax):
+            c = self.fig.colorbar(im, ax=ax, fraction=0.046)
+            c.ax.tick_params(colors='#666', labelsize=5)
 
-        avg_d=avg.copy()
-        if shape=='cylinder_hole': avg_d-=avg_d.max()
-        else: avg_d-=avg_d.min()
-        ax3=self.fig.add_subplot(gs[0,2]); da(ax3,f'Avg AFM Feature  (n={n})')
-        im3=ax3.imshow(avg_d,cmap='afmhot',origin='upper'); dcb(im3,ax3)
-        ax3.axhline(half,color='#f00',ls='--',lw=0.6,alpha=0.6)
-        ax3.axvline(half,color='#f00',ls='--',lw=0.6,alpha=0.6)
+        ax1 = self.fig.add_subplot(gs[0, 0]); da(ax1, 'AFM Scan')
+        im  = ax1.imshow(s, cmap='afmhot', origin='upper', extent=ext,
+                         vmin=np.percentile(s, 2), vmax=np.percentile(s, 98))
+        dcb(im, ax1); ax1.set_xlabel('nm', color=C['muted'], fontsize=7)
 
-        ax4=self.fig.add_subplot(gs[1,0]); da(ax4,'Estimated Tip Shape')
-        im4=ax4.imshow(tip,cmap='RdBu_r',origin='upper',vmin=tip.min(),vmax=0); dcb(im4,ax4)
-        ax4.axhline(half,color='w',ls='--',lw=0.5,alpha=0.4)
-        ax4.axvline(half,color='w',ls='--',lw=0.5,alpha=0.4)
+        if shape == 'trapezoid_hole':
+            lbl = f'開口={geom["d_top"]:.1f} 底={geom["d_bot"]:.1f} z={geom["height"]:.1f}nm'
+        elif shape == 'trapezoid_pillar':
+            lbl = f'd_bot={geom["d_bot"]:.1f} d_top={geom["d_top"]:.1f} h={geom["height"]:.1f}nm'
+        else:
+            lbl = f'd={geom["d_bot"]:.1f} z={geom["height"]:.1f}nm'
 
-        ax5=self.fig.add_subplot(gs[1,1]); da(ax5,'Cross-section Profile')
-        x=(np.arange(2*half)-half)*px
-        ax5.plot(x,avg_d[half,:],color='#4f9cf9',lw=1.8,label='AFM feature')
-        ax5.plot(x,gt_p[half,:], color='#ef4444',lw=1.5,ls='--',label='GT ideal')
-        ax5.plot(x,tip[half,:],  color='#22c55e',lw=2,  label='Tip')
-        ax5.axvline(0,color=C['border'],ls=':',lw=1)
-        ax5.set_xlabel('nm',color=C['muted'],fontsize=7); ax5.set_ylabel('nm',color=C['muted'],fontsize=7)
-        leg=ax5.legend(fontsize=7,facecolor=C['panel'],edgecolor=C['border'])
+        ax2 = self.fig.add_subplot(gs[0, 1]); da(ax2, f'Synthetic GT  {lbl}')
+        im2 = ax2.imshow(gt_al, cmap='afmhot', origin='upper', extent=ext)
+        dcb(im2, ax2)
+
+        avg_d = avg.copy()
+        if shape in ('cylinder_hole', 'trapezoid_hole'):
+            avg_d -= avg_d.max()
+        else:
+            avg_d -= avg_d.min()
+        ax3 = self.fig.add_subplot(gs[0, 2]); da(ax3, f'Avg AFM Feature  (n={n})')
+        im3 = ax3.imshow(avg_d, cmap='afmhot', origin='upper')
+        dcb(im3, ax3)
+        ax3.axhline(half, color='#f00', ls='--', lw=0.6, alpha=0.6)
+        ax3.axvline(half, color='#f00', ls='--', lw=0.6, alpha=0.6)
+
+        ax4 = self.fig.add_subplot(gs[1, 0]); da(ax4, 'Estimated Tip Shape')
+        im4 = ax4.imshow(tip, cmap='RdBu_r', origin='upper', vmin=tip.min(), vmax=0)
+        dcb(im4, ax4)
+        ax4.axhline(half, color='w', ls='--', lw=0.5, alpha=0.4)
+        ax4.axvline(half, color='w', ls='--', lw=0.5, alpha=0.4)
+
+        ax5 = self.fig.add_subplot(gs[1, 1]); da(ax5, 'Cross-section Profile')
+        x_nm = (np.arange(2 * half) - half) * px
+        ax5.plot(x_nm, avg_d[half, :], color='#4f9cf9', lw=1.8, label='AFM feature')
+        ax5.plot(x_nm, gt_p[half, :],  color='#ef4444', lw=1.5, ls='--', label='GT ideal')
+        ax5.plot(x_nm, tip[half, :],   color='#22c55e', lw=2,   label='Tip (reconstructed)')
+        try:
+            R  = float(self.tip_R_v.get() or 0)
+            th = float(self.tip_angle_v.get() or 0)
+            if R > 0 and th > 0:
+                cone = make_cone_tip(half, px, R, th)
+                # [FIX-10] cone 基線對齊：令頂點=0（向下為負），與其他曲線一致
+                cone_prof = cone[half, :] - cone[half, :].max()
+                ax5.plot(x_nm, cone_prof, color='#f59e0b', lw=1.5, ls=':',
+                         label=f'Cone model R={R:.0f}nm θ={th:.0f}°')
+        except Exception:
+            pass
+        ax5.axvline(0, color=C['border'], ls=':', lw=1)
+        ax5.set_xlabel('nm', color=C['muted'], fontsize=7)
+        ax5.set_ylabel('nm', color=C['muted'], fontsize=7)
+        leg = ax5.legend(fontsize=7, facecolor=C['panel'], edgecolor=C['border'])
         [t.set_color(C['text']) for t in leg.get_texts()]
-        ax5.grid(color=C['border'],alpha=0.5)
+        ax5.grid(color=C['border'], alpha=0.5)
 
-        ax6=self.fig.add_subplot(gs[1,2],projection='3d'); ax6.set_facecolor(C['panel'])
-        X=np.linspace(-half*px,half*px,2*half); Xg,Yg=np.meshgrid(X,X)
-        ax6.plot_surface(Xg,Yg,tip,cmap='plasma',alpha=0.9,linewidth=0)
-        ax6.set_xlabel('X(nm)',color=C['muted'],fontsize=6,labelpad=1)
-        ax6.set_ylabel('Y(nm)',color=C['muted'],fontsize=6,labelpad=1)
-        ax6.set_zlabel('nm',   color=C['muted'],fontsize=6,labelpad=1)
-        ax6.tick_params(colors=C['muted'],labelsize=5)
-        ax6.set_title('Tip 3D',color=C['text'],fontsize=9,pad=3)
+        # 右下：Rim 分析（進入率低時比 Tip 3D 更可靠）
+        if rim is not None and not np.isnan(rim.get('rim_width_nm', float('nan'))):
+            ax6 = self.fig.add_subplot(gs[1, 2])
+            ax6.set_facecolor(C['panel'])
+            rc = rim['r_centers']; rp = rim['profile']
+            ax6.plot(rc, rp, color='#4f9cf9', lw=2, label='Radial avg')
+            ax6.axhline(rp.max(), color='#ef4444', ls='--', lw=1, alpha=0.6, label='Surface')
+            ax6.axhline(rp.min(), color='#f59e0b', ls='--', lw=1, alpha=0.6, label='Hole bottom')
+            ax6.set_xlabel('r (nm)', color=C['muted'], fontsize=7)
+            ax6.set_ylabel('Height (nm)', color=C['muted'], fontsize=7)
+            entry_str = f'{rim["entry_rate"]*100:.0f}%'
+            rim_str   = f'{rim["rim_width_nm"]:.1f}nm'
+            cone_str  = f'{rim["cone_angle_deg"]:.1f}°' if not np.isnan(rim["cone_angle_deg"]) else 'N/A'
+            ax6.set_title(f'Rim Analysis  (最可靠的資訊)\n進入率:{entry_str}  Rim寬:{rim_str}  錐角:{cone_str}',
+                          color=C['warn'], fontsize=8, pad=3)
+            ax6.tick_params(colors=C['muted'], labelsize=6)
+            for sp in ax6.spines.values(): sp.set_edgecolor(C['border'])
+            leg6 = ax6.legend(fontsize=7, facecolor=C['panel'], edgecolor=C['border'])
+            [t.set_color(C['text']) for t in leg6.get_texts()]
+            ax6.grid(color=C['border'], alpha=0.5)
+        else:
+            ax6 = self.fig.add_subplot(gs[1, 2], projection='3d')
+            ax6.set_facecolor(C['panel'])
+            X  = np.linspace(-half * px, half * px, 2 * half)
+            Xg, Yg = np.meshgrid(X, X)
+            ax6.plot_surface(Xg, Yg, tip, cmap='plasma', alpha=0.9, linewidth=0)
+            ax6.set_xlabel('X(nm)', color=C['muted'], fontsize=6, labelpad=1)
+            ax6.set_ylabel('Y(nm)', color=C['muted'], fontsize=6, labelpad=1)
+            ax6.set_zlabel('nm',    color=C['muted'], fontsize=6, labelpad=1)
+            ax6.tick_params(colors=C['muted'], labelsize=5)
+            ax6.set_title('Tip 3D', color=C['text'], fontsize=9, pad=3)
 
-        r_str=f'{r_est:.0f}nm' if not np.isnan(r_est) else 'N/A'
+        r_str     = f'{r_est:.0f}nm' if not np.isnan(r_est) else 'N/A'
+        spec_note = ''
+        try:
+            R  = float(self.tip_R_v.get() or 0)
+            th = float(self.tip_angle_v.get() or 0)
+            if R > 0 and th > 0:
+                cone   = make_cone_tip(half, px, R, th)
+                c_half = half // 2
+                t_in   = tip[half - c_half:half + c_half,
+                             half - c_half:half + c_half].ravel()
+                c_in   = cone[half - c_half:half + c_half,
+                              half - c_half:half + c_half].ravel()
+                corr = np.corrcoef(t_in, c_in)[0, 1]
+                spec_note = f'  │  vs cone(R={R:.0f}nm,θ={th:.0f}°): corr={corr:.2f}'
+        except Exception:
+            pass
+
         self.fig.suptitle(
             f'Blind Tip Reconstruction  |  {os.path.basename(m["filepath"])}  '
-            f'|  {shape}  |  est. tip radius: {r_str}',
-            color=C['text'],fontsize=10,fontweight='bold')
+            f'|  {shape}  |  est. tip radius: {r_str}{spec_note}',
+            color=C['text'], fontsize=10, fontweight='bold')
         self.canvas.draw()
 
+    # [FIX-1] 三元表達式加括號，消除跨行 SyntaxError
     def save_figure(self):
         """將目前畫布儲存為指定路徑的圖片"""
-        afm_name = os.path.splitext(os.path.basename(self.afm_path.get()))[0]                    if self.meta else 'afm_result'
+        afm_name = (
+            os.path.splitext(os.path.basename(self.afm_path.get()))[0]
+            if self.meta else 'afm_result'
+        )
         p = filedialog.asksaveasfilename(
             title='儲存圖片',
             defaultextension='.png',
             initialfile=f'{afm_name}_result.png',
-            filetypes=[('PNG 圖片','*.png'),('JPEG 圖片','*.jpg'),
-                       ('TIFF 圖片','*.tif'),('All files','*.*')])
+            filetypes=[('PNG 圖片', '*.png'), ('JPEG 圖片', '*.jpg'),
+                       ('TIFF 圖片', '*.tif'), ('All files', '*.*')])
         if not p: return
         try:
-            dpi = 150
-            self.fig.savefig(p, dpi=dpi, facecolor=C['bg'], bbox_inches='tight')
+            self.fig.savefig(p, dpi=150, facecolor=C['bg'], bbox_inches='tight')
             self.log(f'✓ 圖片儲存：{p}')
             messagebox.showinfo('完成', f'圖片已儲存至：\n{p}')
         except Exception as e:
-            messagebox.showerror('失敗', str(e)); self.log(f'✗ {e}')
+            messagebox.showerror('失敗', str(e))
+            self.log(f'✗ {e}')
 
     def save(self):
         if self.tip is None:
-            messagebox.showwarning('提示','請先執行重建'); return
-        p=filedialog.asksaveasfilename(title='儲存 tip.mat',defaultextension='.mat',
-            initialfile='tip_estimated.mat',filetypes=[('MATLAB','*.mat'),('All','*.*')])
+            messagebox.showwarning('提示', '請先執行重建')
+            return
+        p = filedialog.asksaveasfilename(
+            title='儲存 tip.mat', defaultextension='.mat',
+            initialfile='tip_estimated.mat',
+            filetypes=[('MATLAB', '*.mat'), ('All', '*.*')])
         if not p: return
         try:
-            savemat(p,{'tip':self.tip,'px_nm':self.meta['px_nm'],
-                       'shape_type':self.shape_type,
-                       'd_bot_nm':self.geom['d_bot'],'d_top_nm':self.geom['d_top'],
-                       'height_nm':self.geom['height'],'pitch_nm':self.geom['pitch'],
-                       'scan_size_nm':self.meta['scan_nm'],'n_px':self.meta['n_px'],
-                       'patch_half_px':self.tip_half})
-            png=p.replace('.mat','_report.png')
-            self.fig.savefig(png,dpi=150,facecolor=C['bg'],bbox_inches='tight')
+            savemat(p, {
+                'tip':          self.tip,
+                'px_nm':        self.meta['px_nm'],
+                'shape_type':   self.shape_type,
+                'd_bot_nm':     self.geom['d_bot'],
+                'd_top_nm':     self.geom['d_top'],
+                'height_nm':    self.geom['height'],
+                'pitch_nm':     self.geom['pitch'],
+                'scan_size_nm': self.meta['scan_nm'],
+                'n_px':         self.meta['n_px'],
+                'patch_half_px': self.tip_half,
+            })
+            png = p.replace('.mat', '_report.png')
+            self.fig.savefig(png, dpi=150, facecolor=C['bg'], bbox_inches='tight')
             self.log(f'✓ {os.path.basename(p)} + report PNG')
-            messagebox.showinfo('完成',f'已儲存：\n{p}\n\n報告：\n{png}')
+            messagebox.showinfo('完成', f'已儲存：\n{p}\n\n報告：\n{png}')
         except Exception as e:
-            messagebox.showerror('失敗',str(e)); self.log(f'✗ {e}')
+            messagebox.showerror('失敗', str(e))
+            self.log(f'✗ {e}')
 
     def on_close(self):
-        plt.close('all'); self.destroy()
+        plt.close('all')
+        self.destroy()
+
 
 if __name__ == '__main__':
     App().mainloop()
