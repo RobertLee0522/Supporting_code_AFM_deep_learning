@@ -104,15 +104,24 @@ SURFACE_SCALE_NM = 5.0   # nm per height unit：訓練曲面高度換算係數
 TARGET_TIP_SIZE  = 55    # 將估算探針 resize 至此尺寸 (px)（供 tip_correction 使用）
 
 # ---- 訓練用合成探針設定 ----------------------------------------
-# 理由：估算探針因四重對稱化造成環形假象，直接用於訓練會讓
-#       dilated 影像完全飽和、失去意義。
-#       改用拋物線形合成探針（z = -r²/2R）：
-#         - 數學上正確，無假象
-#         - 曲率半徑 TIP_RADIUS_NM 可控制銳利程度
-#         - TIP_TRAIN_SIZE 足夠大以容納最深的粒子高度
+# ROC 從 tip_estimated0526.mat 量得：
+#   頂端 (17,51) 到中心 (57,57) = 104 nm，值差 74 nm
+#   paraboloid: R = 104² / (2×74) ≈ 73 nm
+#
+# TIP_TRAIN_SIZE = 51 px：
+#   邊緣物理距離 = 25×5 = 125 nm
+#   邊緣深度     = -125²/(2×73) ≈ -107 nm
+#   → 孔洞深度 125.8 nm 時，中心可被正確量測（壁面誤差 ~15%，可學習）
 # ---------------------------------------------------------------
-TIP_RADIUS_NM  = 15.0   # 探針曲率半徑 (nm)；15nm ≈ 中等銳利的 AFM tip
-TIP_TRAIN_SIZE = 25     # 合成探針尺寸 (px)，奇數；25px×5nm = ±60nm 物理範圍
+TIP_RADIUS_NM  = 73.0   # 從 tip_estimated0526.mat 量得的真實探針 ROC (nm)
+TIP_TRAIN_SIZE = 51     # 合成探針尺寸 (px)，奇數；51px×5nm = ±125nm 物理範圍
+
+# ---- 梯形孔樣品標稱參數（用於訓練資料生成）--------------------
+# 來源：用戶實際掃描的校正樣品
+TRAP_OPEN_NM  = 228.8   # 開口寬度 (nm)
+TRAP_BOT_NM   = 183.5   # 底部寬度 (nm)
+TRAP_DEPTH_NM = 125.8   # 深度 (nm)
+TRAP_VARIATION = 0.20   # 隨機變異範圍 ±20%
 
 
 def make_training_tip(size=TIP_TRAIN_SIZE, radius_nm=TIP_RADIUS_NM,
@@ -146,6 +155,114 @@ def make_training_tip(size=TIP_TRAIN_SIZE, radius_nm=TIP_RADIUS_NM,
     print(f"  邊緣深度 = {edge_depth:.1f} nm  "
           f"（粒子高度需 < {abs(edge_depth):.0f} nm 才不飽和）")
     return tip_2d
+
+
+# ============================================================
+# 梯形孔 (Trapezoidal Hole) 曲面生成器
+# 依據用戶實際掃描樣品參數：
+#   開口 228.8 nm / 底部 183.5 nm / 深度 125.8 nm
+# ============================================================
+
+def trapezoid_hole_creator(centers, half_opens_px, half_bots_px,
+                           depths_nm, size):
+    """
+    向量化生成梯形孔截頭方錐形凹坑（square frustum pit）。
+
+    截面形狀（Chebyshev 距離 d 從孔中心起）：
+      d ≤ half_bot  : 孔底（均勻 -depth nm）
+      half_bot < d ≤ half_open : 斜壁（線性從 -depth 到 0）
+      d > half_open : 平坦表面（0 nm）
+
+    Args:
+        centers      : list of (row, col) 孔中心座標 (px，可為浮點)
+        half_opens_px: list of 開口半寬 (px)
+        half_bots_px : list of 底部半寬 (px)
+        depths_nm    : list of 深度 (nm，正數)
+        size         : 影像邊長 (px)
+    Returns:
+        surface : ndarray (size, size)，單位 nm，0=平面，負值=孔洞
+    """
+    rr, cc = np.indices((size, size))
+    surface = np.zeros((size, size), dtype=np.float64)
+
+    for (r0, c0), h_open, h_bot, depth in zip(
+            centers, half_opens_px, half_bots_px, depths_nm):
+
+        # Chebyshev 距離（正方形截面）
+        d = np.maximum(np.abs(rr - r0), np.abs(cc - c0))
+
+        z = np.zeros((size, size))
+
+        # 孔底區域
+        bottom_mask = d <= h_bot
+        z[bottom_mask] = -depth
+
+        # 斜壁區域
+        wall_mask = (d > h_bot) & (d <= h_open)
+        if (h_open - h_bot) > 1e-6:
+            t = (d[wall_mask] - h_bot) / (h_open - h_bot)
+            z[wall_mask] = -depth * (1.0 - t)
+
+        # 多孔重疊時取最深值
+        surface = np.minimum(surface, z)
+
+    return surface
+
+
+def trapezoid_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
+                         max_attempts=2000):
+    """
+    生成梯形孔隨機參數（±TRAP_VARIATION 變異，1–3 個孔，不重疊）。
+
+    Returns:
+        centers      : list of (row, col)
+        half_opens_px: list of 開口半寬 (px)
+        half_bots_px : list of 底部半寬 (px)
+        depths_nm    : list of 深度 (nm)
+    """
+    n_holes = random.randint(1, 3)
+    centers, half_opens_px, half_bots_px, depths_nm = [], [], [], []
+
+    for _ in range(n_holes):
+        v = TRAP_VARIATION
+        open_nm  = random.uniform(TRAP_OPEN_NM  * (1 - v), TRAP_OPEN_NM  * (1 + v))
+        bot_nm   = random.uniform(TRAP_BOT_NM   * (1 - v), TRAP_BOT_NM   * (1 + v))
+        depth_nm = random.uniform(TRAP_DEPTH_NM * (1 - v), TRAP_DEPTH_NM * (1 + v))
+
+        # 確保 bottom ≤ open（物理限制）
+        bot_nm = min(bot_nm, open_nm * 0.95)
+
+        h_open = (open_nm / px_nm) / 2.0   # 半寬 (px)
+        h_bot  = (bot_nm  / px_nm) / 2.0
+
+        margin   = h_open + 3
+        min_pos  = margin
+        max_pos  = img_size - margin
+
+        if max_pos < min_pos:
+            break   # 影像太小，放不下
+
+        placed = False
+        for _ in range(max_attempts):
+            r = random.uniform(min_pos, max_pos)
+            c = random.uniform(min_pos, max_pos)
+
+            overlap = any(
+                max(abs(r - pr), abs(c - pc)) < (h_open + po) * 1.05
+                for (pr, pc), po in zip(centers, half_opens_px)
+            )
+            if not overlap:
+                centers.append((r, c))
+                half_opens_px.append(h_open)
+                half_bots_px.append(h_bot)
+                depths_nm.append(depth_nm)
+                placed = True
+                break
+
+        if not placed:
+            break   # 放不下更多孔
+
+    return centers, half_opens_px, half_bots_px, depths_nm
 
 
 def load_and_prepare_tip(mat_path, key='tip', target_size=TARGET_TIP_SIZE):
@@ -510,6 +627,43 @@ save_plot('cylindrical_preview.png')
 
 
 # ============================================================
+# Simulate trapezoidal holes  ← 用戶真實樣品幾何
+#   開口 228.8 nm / 底部 183.5 nm / 深度 125.8 nm
+#   ±20% 隨機變異；1-3 個孔/張；單位直接為 nm
+# ============================================================
+
+list_trap_gndtruth_image = []
+
+N = 400
+
+print(f"Generating trapezoidal holes "
+      f"(open={TRAP_OPEN_NM}nm, bot={TRAP_BOT_NM}nm, "
+      f"depth={TRAP_DEPTH_NM}nm, ±{int(TRAP_VARIATION*100)}%)...")
+for i in tqdm(range(N), desc="Trapezoid", unit="img",
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
+    centers, h_opens, h_bots, depths = trapezoid_randomizer(
+        px_nm=SURFACE_SCALE_NM, img_size=size)
+    true_trap = trapezoid_hole_creator(
+        centers, h_opens, h_bots, depths, size)
+    list_trap_gndtruth_image.append(true_trap)
+
+true_trap_surf_stack = np.stack(list_trap_gndtruth_image, axis=0)
+np.save(f'{OUTPUT_DIR}/true_trap_stack.npy', true_trap_surf_stack)
+
+# 視覺化檢查（顯示前 2 張：ground-truth）
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, idx in zip(axes, [0, 1, 2]):
+    if idx < len(true_trap_surf_stack):
+        im = ax.imshow(true_trap_surf_stack[idx], cmap='viridis')
+        ax.set_title(f"Trapezoid GT #{idx}  "
+                     f"(min={true_trap_surf_stack[idx].min():.1f} nm)")
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='nm')
+plt.tight_layout()
+save_plot('trapezoid_preview.png')
+
+
+# ============================================================
 # Import AFM tip and apply grey dilation
 # ============================================================
 
@@ -528,10 +682,12 @@ save_plot('tip_shape.png')
 true_spherical_surf_stack = np.load(f'{OUTPUT_DIR}/true_spherical_stack.npy').astype('float32')
 true_cubic_surf_stack     = np.load(f'{OUTPUT_DIR}/true_cubic_stack.npy').astype('float32')
 true_poly_surf_stack      = np.load(f'{OUTPUT_DIR}/true_poly_stack.npy').astype('float32')
+true_trap_surf_stack      = np.load(f'{OUTPUT_DIR}/true_trap_stack.npy').astype('float32')
 
 list_spherical_dilated_image = []
-list_cubic_dilated_image = []
-list_poly_dilated_image = []
+list_cubic_dilated_image     = []
+list_poly_dilated_image      = []
+list_trap_dilated_image      = []
 
 print("Applying dilation to images...")
 for i in tqdm(range(400), desc="Dilation", unit="img",
@@ -539,22 +695,27 @@ for i in tqdm(range(400), desc="Dilation", unit="img",
     true_spherical_surf = true_spherical_surf_stack[i, :, :]
     true_cubic_surf     = true_cubic_surf_stack[i, :, :]
     true_poly_surf      = true_poly_surf_stack[i, :, :]
+    true_trap_surf      = true_trap_surf_stack[i, :, :]
 
     dilated_spherical_surf = scipy.ndimage.grey_dilation(true_spherical_surf, structure=tip_shape)
-    dilated_cubic_surf     = scipy.ndimage.grey_dilation(true_cubic_surf, structure=tip_shape)
-    dilated_poly_surf      = scipy.ndimage.grey_dilation(true_poly_surf, structure=tip_shape)
+    dilated_cubic_surf     = scipy.ndimage.grey_dilation(true_cubic_surf,     structure=tip_shape)
+    dilated_poly_surf      = scipy.ndimage.grey_dilation(true_poly_surf,      structure=tip_shape)
+    dilated_trap_surf      = scipy.ndimage.grey_dilation(true_trap_surf,      structure=tip_shape)
 
     list_spherical_dilated_image.append(dilated_spherical_surf)
     list_cubic_dilated_image.append(dilated_cubic_surf)
     list_poly_dilated_image.append(dilated_poly_surf)
+    list_trap_dilated_image.append(dilated_trap_surf)
 
 dilated_spherical_surf_stack = np.stack(list_spherical_dilated_image, axis=0)
-dilated_cubic_surf_stack     = np.stack(list_cubic_dilated_image, axis=0)
-dilated_poly_surf_stack      = np.stack(list_poly_dilated_image, axis=0)
+dilated_cubic_surf_stack     = np.stack(list_cubic_dilated_image,     axis=0)
+dilated_poly_surf_stack      = np.stack(list_poly_dilated_image,      axis=0)
+dilated_trap_surf_stack      = np.stack(list_trap_dilated_image,      axis=0)
 
 np.save(f'{OUTPUT_DIR}/dilated_spherical_stack.npy', dilated_spherical_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_cubic_stack.npy', dilated_cubic_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_poly_stack.npy', dilated_poly_surf_stack)
+np.save(f'{OUTPUT_DIR}/dilated_cubic_stack.npy',     dilated_cubic_surf_stack)
+np.save(f'{OUTPUT_DIR}/dilated_poly_stack.npy',      dilated_poly_surf_stack)
+np.save(f'{OUTPUT_DIR}/dilated_trap_stack.npy',      dilated_trap_surf_stack)
 
 
 # ============================================================
@@ -670,32 +831,40 @@ dilated_images_path_cubic     = f'{OUTPUT_DIR}/dilated_cubic_stack.npy'
 true_images_path_cubic        = f'{OUTPUT_DIR}/true_cubic_stack.npy'
 dilated_images_path_poly      = f'{OUTPUT_DIR}/dilated_poly_stack.npy'
 true_images_path_poly         = f'{OUTPUT_DIR}/true_poly_stack.npy'
+dilated_images_path_trap      = f'{OUTPUT_DIR}/dilated_trap_stack.npy'   # 梯形孔
+true_images_path_trap         = f'{OUTPUT_DIR}/true_trap_stack.npy'
 
-X1 = np.load(dilated_images_path_spherical).astype('float32')  # Input:  tip-convoluted
-y1 = np.load(true_images_path_spherical).astype('float32')     # Label:  true surface
+X1 = np.load(dilated_images_path_spherical).astype('float32')
+y1 = np.load(true_images_path_spherical).astype('float32')
 X2 = np.load(dilated_images_path_cubic).astype('float32')
 y2 = np.load(true_images_path_cubic).astype('float32')
 X3 = np.load(dilated_images_path_poly).astype('float32')
 y3 = np.load(true_images_path_poly).astype('float32')
+X4 = np.load(dilated_images_path_trap).astype('float32')   # 梯形孔 dilated
+y4 = np.load(true_images_path_trap).astype('float32')      # 梯形孔 ground-truth
 
-# Split the entire dataset to training and testing dataset
+# Split
 X_1_train, X_1_test, y_1_train, y_1_test = train_test_split(X1, y1, test_size=0.2, random_state=42)
 X_2_train, X_2_test, y_2_train, y_2_test = train_test_split(X2, y2, test_size=0.2, random_state=42)
 X_3_train, X_3_test, y_3_train, y_3_test = train_test_split(X3, y3, test_size=0.2, random_state=42)
+X_4_train, X_4_test, y_4_train, y_4_test = train_test_split(X4, y4, test_size=0.2, random_state=42)
 
-X_merged_train = np.concatenate((X_1_train, X_2_train, X_3_train), axis=0)
-y_merged_train = np.concatenate((y_1_train, y_2_train, y_3_train), axis=0)
+X_merged_train = np.concatenate((X_1_train, X_2_train, X_3_train, X_4_train), axis=0)
+y_merged_train = np.concatenate((y_1_train, y_2_train, y_3_train, y_4_train), axis=0)
 
-# Shuffle the training dataset only to help improve the model's performance
 X_merged_train, y_merged_train = shuffle(X_merged_train, y_merged_train)
 
-X_merged_test = np.concatenate((X_1_test, X_2_test, X_3_test), axis=0)
-y_merged_test = np.concatenate((y_1_test, y_2_test, y_3_test), axis=0)
+X_merged_test = np.concatenate((X_1_test, X_2_test, X_3_test, X_4_test), axis=0)
+y_merged_test = np.concatenate((y_1_test, y_2_test, y_3_test, y_4_test), axis=0)
 
 print("Training data loaded.",
-      "\nno. of images in the training set:", str(X_merged_train.shape[0]),
-      "\nno. of images in the testing set:", str(X_merged_test.shape[0]),
-      "\nresolution of each image:", str((X_merged_train.shape[1], X_merged_train.shape[2])))
+      f"\n  Spherical  : {X1.shape[0]} imgs",
+      f"\n  Cubic      : {X2.shape[0]} imgs",
+      f"\n  Cylindrical: {X3.shape[0]} imgs",
+      f"\n  Trapezoid  : {X4.shape[0]} imgs  ← 用戶真實樣品",
+      f"\n  Train total: {X_merged_train.shape[0]}",
+      f"\n  Test  total: {X_merged_test.shape[0]}",
+      f"\n  Resolution : {X_merged_train.shape[1:3]}")
 
 
 # ============================================================
@@ -1096,6 +1265,11 @@ with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
     f.write(f"  sphere 半徑      : 8–10 px → {8*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f} nm\n")
     f.write(f"  cubic 高度       : 16–20 px → {16*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f} nm\n")
+    f.write(f"\n[梯形孔樣品設定（用戶真實樣品）]\n")
+    f.write(f"  開口寬度  : {TRAP_OPEN_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
+    f.write(f"  底部寬度  : {TRAP_BOT_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
+    f.write(f"  深度      : {TRAP_DEPTH_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
+    f.write(f"  壁角      : {math.degrees(math.atan((TRAP_OPEN_NM-TRAP_BOT_NM)/2/TRAP_DEPTH_NM)):.1f}°\n")
     f.write(f"\n[估算探針（供 detect.py 推論使用）]\n")
     f.write(f"  tip_file         : tip.mat/tip_estimated0526.mat\n")
     f.write(f"  tip_correction   : tip_correction.py\n")
