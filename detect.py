@@ -253,73 +253,105 @@ def predict(model, input_image):
     return predicted
 
 
-def save_results(input_image, predicted_image, output_prefix):
+def get_predict_dir(model_path):
     """
-    儲存預測結果
+    根據模型路徑自動決定輸出目錄（YOLO 風格自動遞增）。
+
+    runs/train7/weights/XXX.keras
+        → runs/train7/predictions/predict1/   (首次)
+        → runs/train7/predictions/predict2/   (再次)
+
+    無法解析 trainN 時退回 img/predictions/predict{N}/
+    """
+    norm = os.path.normpath(model_path)
+    parts = norm.split(os.sep)
+    train_dir = None
+    for i, p in enumerate(parts):
+        if re.match(r'^train\d+$', p):
+            train_dir = os.path.join(*parts[:i + 1])
+            break
+
+    base = os.path.join(train_dir, 'predictions') if train_dir \
+           else os.path.join(OUTPUT_DIR, 'predictions')
+
+    idx = 1
+    while os.path.exists(os.path.join(base, f'predict{idx}')):
+        idx += 1
+    out = os.path.join(base, f'predict{idx}')
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def save_results(input_image, predicted_image, output_prefix, predict_dir):
+    """
+    儲存預測結果至指定目錄。
 
     Args:
-        input_image: 原始輸入影像
-        predicted_image: 預測結果
-        output_prefix: 輸出檔案前綴
+        input_image   : 正規化後的輸入 (1,H,W,1)，值域 [0,1]
+        predicted_image: 模型輸出（已反正規化至 nm）
+        output_prefix : 檔名前綴（通常為輸入檔名的 stem）
+        predict_dir   : 輸出目錄（由 get_predict_dir 決定）
     """
-    output_dir = os.path.join(OUTPUT_DIR, 'predictions')
-    os.makedirs(output_dir, exist_ok=True)
-
     # 提取資料 (移除 batch 和 channel 維度)
-    input_2d = input_image[0, :, :, 0]
+    input_2d     = denormalize_output(input_image)[0, :, :, 0]   # 反正規化回 nm
     predicted_2d = predicted_image[0, :, :, 0]
 
+    def _stem(name):
+        return os.path.join(predict_dir, f'{output_prefix}_{name}')
+
     # 儲存為 .npy
-    np.save(os.path.join(output_dir, f'{output_prefix}_input.npy'), input_2d)
-    np.save(os.path.join(output_dir, f'{output_prefix}_predicted.npy'), predicted_2d)
+    np.save(_stem('input.npy'),     input_2d)
+    np.save(_stem('predicted.npy'), predicted_2d)
 
     # 儲存為 .mat (MATLAB 格式)
-    savemat(os.path.join(output_dir, f'{output_prefix}_input.mat'), {'image': input_2d})
-    savemat(os.path.join(output_dir, f'{output_prefix}_predicted.mat'), {'image': predicted_2d})
+    savemat(_stem('input.mat'),     {'image': input_2d})
+    savemat(_stem('predicted.mat'), {'image': predicted_2d})
 
-    # 儲存為影像 (.png)
-    # 正規化到 0-255 範圍
-    input_norm = ((input_2d - input_2d.min()) / (input_2d.max() - input_2d.min()) * 255).astype(np.uint8)
-    predicted_norm = ((predicted_2d - predicted_2d.min()) / (predicted_2d.max() - predicted_2d.min()) * 255).astype(np.uint8)
+    # 儲存為影像 (.png) — 各自拉伸至 0-255
+    def _to_u8(arr):
+        mn, mx = arr.min(), arr.max()
+        if mx == mn:
+            return np.zeros_like(arr, dtype=np.uint8)
+        return ((arr - mn) / (mx - mn) * 255).astype(np.uint8)
 
-    Image.fromarray(input_norm).save(os.path.join(output_dir, f'{output_prefix}_input.png'))
-    Image.fromarray(predicted_norm).save(os.path.join(output_dir, f'{output_prefix}_predicted.png'))
+    Image.fromarray(_to_u8(input_2d)).save(_stem('input.png'))
+    Image.fromarray(_to_u8(predicted_2d)).save(_stem('predicted.png'))
 
-    print(f"\n結果已儲存至: {output_dir}/")
+    print(f"\n結果已儲存至: {predict_dir}/")
     print(f"  - {output_prefix}_input.npy/.mat/.png")
     print(f"  - {output_prefix}_predicted.npy/.mat/.png")
 
 
-def visualize_results(input_image, predicted_image, output_prefix):
+def visualize_results(input_image, predicted_image, output_prefix,
+                      predict_dir, no_display=False):
     """
-    視覺化預測結果
+    視覺化預測結果並儲存至 predict_dir。
     """
-    input_2d = input_image[0, :, :, 0]
-    predicted_2d = predicted_image[0, :, :, 0]
+    input_2d     = denormalize_output(input_image)[0, :, :, 0]   # nm
+    predicted_2d = predicted_image[0, :, :, 0]                   # nm
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # 輸入影像
     im1 = axes[0].imshow(input_2d, cmap='viridis')
-    axes[0].set_title('Input (Dilated Image)')
+    axes[0].set_title('Input (Dilated Image)  [nm]')
     axes[0].axis('off')
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
-    # 預測結果
     im2 = axes[1].imshow(predicted_2d, cmap='viridis')
-    axes[1].set_title('Predicted (Deconvolved)')
+    axes[1].set_title('Predicted (Deconvolved)  [nm]')
     axes[1].axis('off')
     plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
 
-    # 儲存圖片
-    output_dir = os.path.join(OUTPUT_DIR, 'predictions')
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, f'{output_prefix}_comparison.png'), dpi=300, bbox_inches='tight')
+    save_path = os.path.join(predict_dir, f'{output_prefix}_comparison.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"  - {output_prefix}_comparison.png")
 
-    plt.show()
+    if no_display:
+        plt.close('all')
+    else:
+        plt.show()
 
 
 def print_input_requirements():
@@ -394,6 +426,14 @@ def main():
     model = load_model(args.model)
     print(f"✓ 模型已載入: {args.model}\n")
 
+    # ── YOLO 風格輸出目錄（根據模型路徑自動遞增）──────────────────
+    predict_dir = get_predict_dir(args.model)
+    # 以輸入檔名 stem 作為檔案前綴（若使用者有指定 -o 則優先）
+    input_stem  = os.path.splitext(os.path.basename(args.image))[0]
+    file_prefix = args.output if args.output != 'result' else input_stem
+    print(f"輸出目錄：{predict_dir}/")
+    print(f"檔案前綴：{file_prefix}\n")
+
     # 預處理輸入影像
     print(f"處理輸入影像: {args.image}")
     input_image, original_size, resized_original = preprocess_image(args.image)
@@ -408,13 +448,13 @@ def main():
     print(f"  輸出範圍（nm）: [{predicted_image.min():.2f}, {predicted_image.max():.2f}]\n")
 
     # 儲存結果
-    save_results(input_image, predicted_image, args.output)
+    save_results(input_image, predicted_image, file_prefix, predict_dir)
 
     # 視覺化結果
-    if not args.no_display:
-        visualize_results(input_image, predicted_image, args.output)
+    visualize_results(input_image, predicted_image, file_prefix,
+                      predict_dir, no_display=args.no_display)
 
-    print("\n✓ 預測完成！")
+    print(f"\n✓ 全部完成！結果存於：{predict_dir}/")
 
 
 if __name__ == '__main__':
