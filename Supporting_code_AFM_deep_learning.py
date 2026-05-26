@@ -448,7 +448,11 @@ def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
     centers_px, radii_px, depths_nm = [], [], []
 
     for _ in range(n_holes):
-        r_px    = random.uniform(4, 10)          # 半徑 4–10 px → 20–50 nm
+        # ── 半徑下限 = sqrt(2 × R_tip × depth) / px_nm ─────────────
+        # 此條件確保探針可觸達孔底，孔心 dilation 值 = 真實深度
+        # R=73nm, depth≈100nm → r_min = sqrt(14600)/5 ≈ 24px (120nm)
+        # 取 20–28px 讓部分樣本「剛好在臨界附近」增加難度多樣性
+        r_px    = random.uniform(20, 28)         # 半徑 20–28 px → 100–140 nm
         depth   = random.uniform(80.0, 130.0)   # 深度 80–130 nm
         margin  = r_px + 3
         min_pos = margin
@@ -861,9 +865,14 @@ def calculate_metrics(y_true, y_pred):
     mse = np.mean((y_true - y_pred)**2)
     # Root Mean Squared Error
     rmse = np.sqrt(mse)
-    # Peak Signal-to-Noise Ratio
-    max_pixel = np.max(y_true)
-    psnr = 20 * np.log10(max_pixel / rmse) if rmse != 0 else float('inf')
+    # Peak Signal-to-Noise Ratio（以訊號動態範圍為基準，避免孔洞資料 max=0 導致 -inf）
+    data_range_psnr = float(y_true.max() - y_true.min())
+    if rmse != 0 and data_range_psnr > 0:
+        psnr = 20 * np.log10(data_range_psnr / rmse)
+    elif rmse == 0:
+        psnr = float('inf')
+    else:
+        psnr = float('nan')
     # Structural Similarity Index — [Fix 9] 使用正確的 skimage SSIM
     y_true_sq = y_true.squeeze()  # (N, H, W)
     y_pred_sq = y_pred.squeeze()
@@ -990,28 +999,33 @@ def show_triplet(idx, row_slice=None, col_slice=slice(None), label=""):
 # Sample 0 (row 65, full width)
 show_triplet(0, row_slice=65, label="sample 0")
 
-# Sample 100 (row 60, full width + zoomed 25:100)
-show_triplet(100, row_slice=60, label="sample 100")
+# 動態計算安全索引（避免超出測試集大小導致 IndexError）
+n_test = len(decoded)
+idx_mid = min(100, n_test - 1)   # ~測試集中段
+idx_end = min(130, n_test - 1)   # ~測試集後段
+
+# Sample mid (row 60, full width + zoomed 25:100)
+show_triplet(idx_mid, row_slice=60, label=f"sample_{idx_mid}")
 # Zoomed view
 plt.figure(figsize=(8, 4))
-plt.plot(decoded[100, 60, 25:100], label='Predicted')
-plt.plot(X_test[100, 60, 25:100],  label='Tip-convoluted')
-plt.plot(Y_test[100, 60, 25:100],  label='Ground-truth')
+plt.plot(decoded[idx_mid, 60, 25:100], label='Predicted')
+plt.plot(X_test[idx_mid, 60, 25:100],  label='Tip-convoluted')
+plt.plot(Y_test[idx_mid, 60, 25:100],  label='Ground-truth')
 plt.legend()
-plt.title('Line Profile — Sample 100, row 60, col 25:100')
+plt.title(f'Line Profile — Sample {idx_mid}, row 60, col 25:100')
 plt.tight_layout()
-save_plot('profile_sample100_zoom.png')
+save_plot(f'profile_sample{idx_mid}_zoom.png')
 
-# Sample 200 (row 20, full width + zoomed 30:90)
-show_triplet(200, row_slice=20, label="sample 200")
+# Sample end (row 20, full width + zoomed 30:90)
+show_triplet(idx_end, row_slice=20, label=f"sample_{idx_end}")
 plt.figure(figsize=(8, 4))
-plt.plot(decoded[200, 20, 30:90], label='Predicted')
-plt.plot(X_test[200, 20, 30:90],  label='Tip-convoluted')
-plt.plot(Y_test[200, 20, 30:90],  label='Ground-truth')
+plt.plot(decoded[idx_end, 20, 30:90], label='Predicted')
+plt.plot(X_test[idx_end, 20, 30:90],  label='Tip-convoluted')
+plt.plot(Y_test[idx_end, 20, 30:90],  label='Ground-truth')
 plt.legend()
-plt.title('Line Profile — Sample 200, row 20, col 30:90')
+plt.title(f'Line Profile — Sample {idx_end}, row 20, col 30:90')
 plt.tight_layout()
-save_plot('profile_sample200_zoom.png')
+save_plot(f'profile_sample{idx_end}_zoom.png')
 
 # Sample 200 second profile (row 95, col 70:120)
 plt.figure(figsize=(8, 4))
