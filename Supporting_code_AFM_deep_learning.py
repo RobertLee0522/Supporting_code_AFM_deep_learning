@@ -33,6 +33,8 @@ import os
 import math
 import random
 from math import sqrt
+import matplotlib
+matplotlib.use('Agg')          # 不開視窗，直接存檔
 import matplotlib.pyplot as plt
 import scipy
 from scipy import ndimage
@@ -59,9 +61,41 @@ import time
 # Data saving
 from scipy.io import savemat
 
-# Create output directory
+# ============================================================
+# 輸出目錄（中間資料）
+# ============================================================
 OUTPUT_DIR = 'img'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ============================================================
+# YOLO 風格自動遞增訓練目錄
+#   runs/train1/  →  runs/train2/  →  ...
+#   weights/   存放 .keras / .weights.h5
+# ============================================================
+RUNS_DIR = 'runs'
+os.makedirs(RUNS_DIR, exist_ok=True)
+_run_idx = 1
+while os.path.exists(os.path.join(RUNS_DIR, f'train{_run_idx}')):
+    _run_idx += 1
+RUN_DIR     = os.path.join(RUNS_DIR, f'train{_run_idx}')
+WEIGHTS_DIR = os.path.join(RUN_DIR, 'weights')
+os.makedirs(RUN_DIR, exist_ok=True)
+os.makedirs(WEIGHTS_DIR, exist_ok=True)
+print(f"\n{'='*60}")
+print(f"  本次訓練目錄：{RUN_DIR}")
+print(f"{'='*60}\n")
+
+# 圖片編號計數器（確保檔名排序正確）
+_fig_counter = [0]
+
+def save_plot(filename, dpi=150):
+    """儲存目前 figure 至本次訓練目錄並關閉，同時印出路徑。"""
+    _fig_counter[0] += 1
+    numbered = f'{_fig_counter[0]:02d}_{filename}'
+    path = os.path.join(RUN_DIR, numbered)
+    plt.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close('all')
+    print(f"  [圖片] {path}")
 
 # ============================================================
 # 探針前處理常數
@@ -301,7 +335,7 @@ axis[0].set_title("ground-truth (spherical)")
 axis[1].set_title("(dilated will appear after dilation step)")
 axis[1].axis('off')
 plt.tight_layout()
-plt.show()
+save_plot('spherical_preview.png')
 
 
 # ============================================================
@@ -394,7 +428,7 @@ axis[0].set_title("ground-truth (cubic)")
 axis[1].set_title("(dilated will appear after dilation step)")
 axis[1].axis('off')
 plt.tight_layout()
-plt.show()
+save_plot('cubic_preview.png')
 
 
 # ============================================================
@@ -428,7 +462,7 @@ axis[0].set_title("ground-truth (cylindrical)")
 axis[1].set_title("(dilated will appear after dilation step)")
 axis[1].axis('off')
 plt.tight_layout()
-plt.show()
+save_plot('cylindrical_preview.png')
 
 
 # ============================================================
@@ -438,10 +472,11 @@ plt.show()
 # [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
 print("準備探針形狀 (第一次載入)...")
 tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
 plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
-plt.show()
+save_plot('tip_shape.png')
 
 # Load saved stacks
 true_spherical_surf_stack = np.load(f'{OUTPUT_DIR}/true_spherical_stack.npy').astype('float32')
@@ -542,10 +577,11 @@ np.save(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy', edge_lifted_poly_stack)
 # [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
 print("準備探針形狀 (第二次載入，edge-lifted 使用)...")
 tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
 plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
-plt.show()
+save_plot('tip_shape_edge.png')
 
 # Dilating the edge-lifted cubic and poly stacks
 edge_lifted_cubic_surf_stack = np.load(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy').astype('float32')
@@ -688,7 +724,7 @@ plt.colorbar()
 plt.title("Label (true) 5")
 
 plt.tight_layout()
-plt.show()
+save_plot('training_samples.png')
 
 
 # ============================================================
@@ -758,15 +794,17 @@ training_data = autoencoder.fit(
 # [Fix 6] 統一使用 .keras 格式存檔（移除 .h5 不一致問題）
 # ============================================================
 
-MODEL_PATH = f'{OUTPUT_DIR}/AFM_MAE_autoencoder.keras'
-WEIGHTS_PATH = f'{OUTPUT_DIR}/AFM_MAE_autoencoder.weights.h5'
+MODEL_PATH   = os.path.join(WEIGHTS_DIR, 'AFM_MAE_autoencoder.keras')
+WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, 'AFM_MAE_autoencoder.weights.h5')
 
 autoencoder.save(MODEL_PATH)
 autoencoder.save_weights(WEIGHTS_PATH)
 
-np.save(f'{OUTPUT_DIR}/train_history.npy', training_data.history)
-history = np.load(f'{OUTPUT_DIR}/train_history.npy', allow_pickle=True).item()
+np.save(os.path.join(RUN_DIR, 'train_history.npy'), training_data.history)
+history = np.load(os.path.join(RUN_DIR, 'train_history.npy'), allow_pickle=True).item()
 
+print(f'Model  → {MODEL_PATH}')
+print(f'Weights→ {WEIGHTS_PATH}')
 print('Model and weights saved.\n')
 
 # Visualize the loss curve
@@ -778,7 +816,7 @@ plt.ylabel('Loss (MAE)')
 plt.xlabel('Epoch')
 plt.legend()
 plt.tight_layout()
-plt.show()
+save_plot('loss_curve.png')
 
 
 # ============================================================
@@ -870,7 +908,7 @@ for col in range(3):
     ax[1, col].axis('off')
 
 plt.tight_layout()
-plt.show(block=True)
+save_plot('predictions_grid.png')
 
 
 # ============================================================
@@ -889,9 +927,11 @@ decoded = decoded.squeeze()
 
 def show_triplet(idx, row_slice=None, col_slice=slice(None), label=""):
     """
-    顯示單一樣本的 tip-convoluted / ground-truth / predicted 三張圖，
-    並繪製指定切線的剖面圖。
+    儲存單一樣本的 tip-convoluted / ground-truth / predicted 三張圖，
+    並繪製指定切線的剖面圖。（不顯示視窗，直接存檔）
     """
+    safe_label = label.replace(' ', '_')
+
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for ax, data, title in zip(axes,
                                 [X_test[idx], Y_test[idx], decoded[idx]],
@@ -900,7 +940,7 @@ def show_triplet(idx, row_slice=None, col_slice=slice(None), label=""):
         ax.set_title(f'{title} [{label}]')
         plt.colorbar(im, ax=ax)
     plt.tight_layout()
-    plt.show()
+    save_plot(f'triplet_{safe_label}.png')
 
     if row_slice is not None:
         plt.figure(figsize=(8, 4))
@@ -912,7 +952,7 @@ def show_triplet(idx, row_slice=None, col_slice=slice(None), label=""):
         plt.xlabel('Pixel')
         plt.ylabel('Height (nm)')
         plt.tight_layout()
-        plt.show()
+        save_plot(f'profile_{safe_label}.png')
 
 
 # Sample 0 (row 65, full width)
@@ -928,7 +968,7 @@ plt.plot(Y_test[100, 60, 25:100],  label='Ground-truth')
 plt.legend()
 plt.title('Line Profile — Sample 100, row 60, col 25:100')
 plt.tight_layout()
-plt.show()
+save_plot('profile_sample100_zoom.png')
 
 # Sample 200 (row 20, full width + zoomed 30:90)
 show_triplet(200, row_slice=20, label="sample 200")
@@ -939,7 +979,7 @@ plt.plot(Y_test[200, 20, 30:90],  label='Ground-truth')
 plt.legend()
 plt.title('Line Profile — Sample 200, row 20, col 30:90')
 plt.tight_layout()
-plt.show()
+save_plot('profile_sample200_zoom.png')
 
 # Sample 200 second profile (row 95, col 70:120)
 plt.figure(figsize=(8, 4))
@@ -949,7 +989,7 @@ plt.plot(Y_test[200, 95, 70:120],  label='Ground-truth')
 plt.legend()
 plt.title('Line Profile — Sample 200, row 95, col 70:120')
 plt.tight_layout()
-plt.show()
+save_plot('profile_sample200_row95_zoom.png')
 
 
 # ============================================================
@@ -966,4 +1006,47 @@ savemat(f'{OUTPUT_DIR}/Test_Dilated.mat', {"a": X_test})
 savemat(f'{OUTPUT_DIR}/Test_Ground.mat',  {"a": Y_test})
 savemat(f'{OUTPUT_DIR}/Decoded.mat',      {"a": decoded})
 
+# ============================================================
+# 儲存本次訓練摘要至 RUN_DIR
+# ============================================================
+import datetime
+
+# metrics.txt
+metrics_path = os.path.join(RUN_DIR, 'metrics.txt')
+with open(metrics_path, 'w', encoding='utf-8') as f:
+    f.write(f"AFM Deep Learning — 訓練摘要\n")
+    f.write(f"{'='*50}\n")
+    f.write(f"訓練目錄  : {RUN_DIR}\n")
+    f.write(f"完成時間  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    f.write(f"[訓練設定]\n")
+    f.write(f"  Epochs      : {EPOCHS}\n")
+    f.write(f"  Batch Size  : {BATCH_SIZE}\n")
+    f.write(f"  Train 樣本  : {X_processed_train.shape[0]}\n")
+    f.write(f"  Val 樣本    : {X_processed_test.shape[0]}\n\n")
+    f.write(f"[最終 Loss]\n")
+    f.write(f"  Train Loss  : {training_data.history['loss'][-1]:.6f}\n")
+    f.write(f"  Val Loss    : {training_data.history['val_loss'][-1]:.6f}\n\n")
+    f.write(f"[評估指標 (測試集)]\n")
+    for k, v in metrics.items():
+        f.write(f"  {k:<6}: {v:.6f}\n")
+    f.write(f"\n[模型路徑]\n")
+    f.write(f"  {MODEL_PATH}\n")
+    f.write(f"  {WEIGHTS_PATH}\n")
+print(f"  [摘要] {metrics_path}")
+
+# config.txt  — 記錄探針與曲面設定
+config_path = os.path.join(RUN_DIR, 'config.txt')
+with open(config_path, 'w', encoding='utf-8') as f:
+    f.write(f"[探針設定]\n")
+    f.write(f"  tip_file         : tip.mat/tip_estimated0526.mat\n")
+    f.write(f"  TARGET_TIP_SIZE  : {TARGET_TIP_SIZE} px\n\n")
+    f.write(f"[曲面設定]\n")
+    f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
+    f.write(f"  sphere radius    : 8–10 px → {8*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f} nm\n")
+    f.write(f"  cubic height     : 16–20 px → {16*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f} nm\n")
+print(f"  [設定] {config_path}")
+
+print(f"\n{'='*60}")
+print(f"  訓練完成！所有結果已儲存至：{RUN_DIR}")
+print(f"{'='*60}")
 print("All results saved successfully.")
