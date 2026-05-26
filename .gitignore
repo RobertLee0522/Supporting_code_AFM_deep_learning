@@ -18,11 +18,8 @@
 !GPU_SETUP_GUIDE.md
 !OPTIMIZATION_SUMMARY.md
 
-# runs/ 目錄：只追蹤 metrics.txt / config.txt，不追蹤權重與圖片
-!runs/
-!runs/*/
-!runs/*/metrics.txt
-!runs/*/config.txt
+# runs/ 目錄：完全不追蹤（權重 / 圖片 / log 均不上傳）
+runs/
 
 # Temporary / generated content.
 __pycache__/

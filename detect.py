@@ -123,7 +123,11 @@ def read_nanoscope_channel(fp, meta, ch_idx=None):
     img  = raw[:actual_lines * meta['n_px']].reshape(
                actual_lines, meta['n_px']).astype(np.float64)
     sens = meta['zsens_s'] if 'ZsensSens' in ch['z_key'] else meta['zsens']
-    return img * ch['z_lsb'] * sens
+    nm_per_lsb = ch['z_lsb'] * sens
+    print(f"  [Z校正] ch='{ch['name']}'  z_key={ch['z_key']}  "
+          f"z_lsb={ch['z_lsb']:.6g}  sens={sens:.4f}  "
+          f"→ {nm_per_lsb:.4f} nm/LSB")
+    return img * nm_per_lsb
 
 
 def flatten_rows_holes(img):
@@ -156,10 +160,21 @@ def load_nanoscope(filepath):
     img_nm = flatten_rows_holes(img_nm)
     print(f"  基線校正後範圍：[{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
 
-    # Resize to 128×128
-    if img_nm.shape != (128, 128):
-        zf = 128 / img_nm.shape[0]
-        img_nm = zoom(img_nm, zf, order=3)
+    # Resize to 128×128（分別指定行、列縮放倍率，避免非正方形影像變形）
+    h, w = img_nm.shape
+    if (h, w) != (128, 128):
+        img_nm = zoom(img_nm, (128 / h, 128 / w), order=3)
+
+    # Z 範圍保護：若超出訓練正規化範圍 10 倍以上，自動縮放至合理範圍
+    z_range = img_nm.max() - img_nm.min()
+    train_range = NORM_MAX - NORM_MIN  # 260 nm
+    if z_range > train_range * 10:
+        scale = train_range / z_range
+        img_nm = img_nm * scale
+        print(f"  [Z保護] 偵測到異常 Z 範圍 {z_range:.1f} nm，"
+              f"已縮放 ×{scale:.4f} → 新範圍 [{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
+        print(f"  ※ 建議檢查 Z 靈敏度設定（見上方 [Z校正] 輸出）")
+
     return img_nm.astype(np.float32)
 
 

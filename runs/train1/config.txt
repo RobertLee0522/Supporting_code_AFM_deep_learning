@@ -1,8 +1,0 @@
-[探針設定]
-  tip_file         : tip.mat/tip_estimated0526.mat
-  TARGET_TIP_SIZE  : 55 px
-
-[曲面設定]
-  SURFACE_SCALE_NM : 5.0 nm/unit
-  sphere radius    : 8–10 px → 40–50 nm
-  cubic height     : 16–20 px → 80–100 nm

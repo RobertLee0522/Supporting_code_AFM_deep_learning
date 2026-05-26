@@ -100,21 +100,21 @@ def save_plot(filename, dpi=150):
 # ============================================================
 # 探針前處理常數
 # ============================================================
-SURFACE_SCALE_NM = 5.0   # nm per height unit：訓練曲面高度換算係數
+SURFACE_SCALE_NM = 39.1  # nm/px：對應真實掃描 5000nm ÷ 128px
+#   此值必須與 detect.py 推論掃描的 px_nm 一致：
+#   5000nm 掃描 / 256px → resize 128px = 5000/128 = 39.1 nm/px
 TARGET_TIP_SIZE  = 55    # 將估算探針 resize 至此尺寸 (px)（供 tip_correction 使用）
 
 # ---- 訓練用合成探針設定 ----------------------------------------
-# ROC 從 tip_estimated0526.mat 量得：
-#   頂端 (17,51) 到中心 (57,57) = 104 nm，值差 74 nm
-#   paraboloid: R = 104² / (2×74) ≈ 73 nm
+# ROC 從 tip_estimated0526.mat 量得：R ≈ 73 nm
 #
-# TIP_TRAIN_SIZE = 51 px：
-#   邊緣物理距離 = 25×5 = 125 nm
-#   邊緣深度     = -125²/(2×73) ≈ -107 nm
-#   → 孔洞深度 125.8 nm 時，中心可被正確量測（壁面誤差 ~15%，可學習）
+# TIP_TRAIN_SIZE = 9 px（at 39.1 nm/px）：
+#   有效探針半徑 = 73 nm / 39.1 nm/px ≈ 1.87 px
+#   偏移 3px：深度 = -(3×39.1)²/(2×73) = -94 nm（超過最深孔洞 →不影響）
+#   故 9px（半徑 4px）已足夠完整捕捉 dilation 物理效應
 # ---------------------------------------------------------------
 TIP_RADIUS_NM  = 73.0   # 從 tip_estimated0526.mat 量得的真實探針 ROC (nm)
-TIP_TRAIN_SIZE = 51     # 合成探針尺寸 (px)，奇數；51px×5nm = ±125nm 物理範圍
+TIP_TRAIN_SIZE = 9      # 合成探針尺寸 (px)，奇數；9px × 39.1nm = ±156nm 物理範圍
 
 # ---- 梯形孔樣品標稱參數（用於訓練資料生成）--------------------
 # 來源：用戶實際掃描的校正樣品
@@ -448,11 +448,11 @@ def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
     centers_px, radii_px, depths_nm = [], [], []
 
     for _ in range(n_holes):
-        # ── 半徑下限 = sqrt(2 × R_tip × depth) / px_nm ─────────────
-        # 此條件確保探針可觸達孔底，孔心 dilation 值 = 真實深度
-        # R=73nm, depth≈100nm → r_min = sqrt(14600)/5 ≈ 24px (120nm)
-        # 取 20–28px 讓部分樣本「剛好在臨界附近」增加難度多樣性
-        r_px    = random.uniform(20, 28)         # 半徑 20–28 px → 100–140 nm
+        # ── 可見度門檻（at 39.1 nm/px）──────────────────────────────
+        # r_min = sqrt(2 × R_tip × depth) / px_nm
+        # R=73nm, depth≈100nm → r_min = sqrt(14600)/39.1 ≈ 3.1px
+        # 取 3–8px 覆蓋臨界附近（117–313nm），增加難度多樣性
+        r_px    = random.uniform(3, 8)           # 半徑 3–8 px → 117–313 nm
         depth   = random.uniform(80.0, 130.0)   # 深度 80–130 nm
         margin  = r_px + 3
         min_pos = margin
@@ -499,14 +499,14 @@ def cylinder_hole_creator(centers_px, radii_px, depths_nm, size):
 N = 400
 list_cyl_hole_images = []
 
-print(f"Generating cylinder holes (r=4–10px={4*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f}nm, "
+print(f"Generating cylinder holes (r=3–8px={3*SURFACE_SCALE_NM:.0f}–{8*SURFACE_SCALE_NM:.0f}nm, "
       f"depth=80–130nm, 1–3 holes/img)...")
 for i in tqdm(range(N), desc="Cylinder Holes", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     ctrs, rads, deps = cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=size)
     if not ctrs:                        # 極少情況放不下任何孔，放一個在中心
         ctrs  = [(size//2, size//2)]
-        rads  = [7.0]
+        rads  = [5.0]
         deps  = [100.0]
     surf = cylinder_hole_creator(ctrs, rads, deps, size)
     list_cyl_hole_images.append(surf)
