@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 
-def batch_predict(input_dir, pattern='*.tif', output_dir=None):
+def batch_predict(input_dir, pattern='*.tif *.000 *.001 *.002 *.003 *.004', output_dir=None):
     """
     批次處理資料夾中的所有影像
 
@@ -21,9 +21,12 @@ def batch_predict(input_dir, pattern='*.tif', output_dir=None):
         pattern: 檔案匹配模式 (預設: *.tif)
         output_dir: 輸出資料夾 (可選)
     """
-    # 尋找所有匹配的檔案
-    search_pattern = os.path.join(input_dir, '**', pattern)
-    files = glob.glob(search_pattern, recursive=True)
+    # 尋找所有匹配的檔案（支援多個 pattern，以空白分隔）
+    files = []
+    for pat in pattern.split():
+        search_pattern = os.path.join(input_dir, '**', pat)
+        files.extend(glob.glob(search_pattern, recursive=True))
+    files = sorted(set(files))
 
     if not files:
         print(f"找不到符合 '{pattern}' 的檔案於 '{input_dir}'")

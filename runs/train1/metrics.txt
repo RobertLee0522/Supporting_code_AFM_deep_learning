@@ -1,0 +1,25 @@
+AFM Deep Learning — 訓練摘要
+==================================================
+訓練目錄  : runs\train1
+完成時間  : 2026-05-26 13:37:34
+
+[訓練設定]
+  Epochs      : 2000
+  Batch Size  : 32
+  Train 樣本  : 960
+  Val 樣本    : 240
+
+[最終 Loss]
+  Train Loss  : 9.301883
+  Val Loss    : 9.261827
+
+[評估指標 (測試集)]
+  MAE   : 9.261819
+  MSE   : 805.726013
+  RMSE  : 28.385313
+  PSNR  : 10.938127
+  SSIM  : 0.790046
+
+[模型路徑]
+  runs\train1\weights\AFM_MAE_autoencoder.keras
+  runs\train1\weights\AFM_MAE_autoencoder.weights.h5

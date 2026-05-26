@@ -1,0 +1,15 @@
+[訓練探針設定]
+  類型             : 合成拋物線探針 (Paraboloid)
+  TIP_RADIUS_NM    : 15.0 nm
+  TIP_TRAIN_SIZE   : 25 px
+  邊緣深度          : -120.0 nm
+  粒子高度上限      : < 120 nm（不飽和條件）
+
+[曲面設定]
+  SURFACE_SCALE_NM : 5.0 nm/unit
+  sphere 半徑      : 8–10 px → 40–50 nm
+  cubic 高度       : 16–20 px → 80–100 nm
+
+[估算探針（供 detect.py 推論使用）]
+  tip_file         : tip.mat/tip_estimated0526.mat
+  tip_correction   : tip_correction.py

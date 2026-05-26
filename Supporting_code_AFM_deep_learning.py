@@ -123,6 +123,28 @@ TRAP_BOT_NM   = 183.5   # 底部寬度 (nm)
 TRAP_DEPTH_NM = 125.8   # 深度 (nm)
 TRAP_VARIATION = 0.20   # 隨機變異範圍 ±20%
 
+# ---- 全域正規化常數（解決模型輸出全零的關鍵）---------------------
+# 訓練資料物理範圍：
+#   負值：梯形孔最深 = -125.8 × 1.2 ≈ -151 nm → 取 -155 nm（安全邊界）
+#   正值：cubic/cylinder 最高 = 20 px × 5 nm = 100 nm → 取 105 nm
+# 公式：x_norm = (x - NORM_MIN) / (NORM_MAX - NORM_MIN)  → [0, 1]
+# 效果：背景 0 nm 正規化後 = 0.597（不再是特殊零值）
+#       孔洞 -125 nm → 0.097，突起 100 nm → 0.984
+#       模型無法靠「全零輸出」最小化 loss，被迫真正學習
+# ---------------------------------------------------------------
+NORM_MIN = -155.0   # nm（含安全邊界）
+NORM_MAX = +105.0   # nm（含安全邊界）
+
+
+def normalize_data(data):
+    """將 nm 資料正規化至 [0, 1]。"""
+    return (data.astype('float32') - NORM_MIN) / (NORM_MAX - NORM_MIN)
+
+
+def denormalize_data(data):
+    """將 [0, 1] 預測結果還原至 nm 單位。"""
+    return data.astype('float32') * (NORM_MAX - NORM_MIN) + NORM_MIN
+
 
 def make_training_tip(size=TIP_TRAIN_SIZE, radius_nm=TIP_RADIUS_NM,
                       px_nm=SURFACE_SCALE_NM):
@@ -400,230 +422,104 @@ else:
 print("="*70 + "\n")
 
 # ============================================================
-# Simulate the spherical particles
+# 孔洞樣品模擬（全部為凹洞，與真實 AFM 掃描一致）
+# 移除：球形/方形/圓柱突起粒子（物理行為與孔洞完全相反，不應混訓）
+# 保留：梯形孔（trapezoid_hole）+ 新增圓柱孔（cylinder_hole）
 # ============================================================
 size = 128
 
-# Create non-overlapping circles with randomized radii and centers
-def circle_randomizer(max_attempts=10000):
-    # [Fix 2] 加入最大嘗試次數，防止在圖像空間不足時陷入無限迴圈
-    number_of_circles = random.randint(4, 10)
-    radius_list = np.zeros(number_of_circles)
-    center_coords = np.zeros(shape=(number_of_circles, 2))
+# ============================================================
+# Simulate cylindrical holes (圓柱形孔洞)
+#   圓形截面，垂直側壁，平底
+#   直徑：8–20 px → 40–100 nm（5 nm/px）
+#   深度：16–25 px → 80–125 nm
+# ============================================================
 
-    i = 0
-    attempts = 0
-    while i < number_of_circles:
-        attempts += 1
-        if attempts > max_attempts:
-            # 若嘗試次數過多，縮減粒子數量後重試
-            number_of_circles = i  # 保留已放置成功的粒子
-            radius_list = radius_list[:number_of_circles]
-            center_coords = center_coords[:number_of_circles]
+def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
+                              max_attempts=5000):
+    """
+    生成不重疊的圓柱孔隨機參數（1–3 個孔）。
+    Returns:
+        centers_px  : list of (row, col) 孔中心 (px)
+        radii_px    : list of 半徑 (px)
+        depths_nm   : list of 深度 (nm, 正數)
+    """
+    n_holes = random.randint(1, 3)
+    centers_px, radii_px, depths_nm = [], [], []
+
+    for _ in range(n_holes):
+        r_px    = random.uniform(4, 10)          # 半徑 4–10 px → 20–50 nm
+        depth   = random.uniform(80.0, 130.0)   # 深度 80–130 nm
+        margin  = r_px + 3
+        min_pos = margin
+        max_pos = img_size - margin
+        if max_pos < min_pos:
+            break
+        placed  = False
+        for _ in range(max_attempts):
+            r = random.uniform(min_pos, max_pos)
+            c = random.uniform(min_pos, max_pos)
+            overlap = any(
+                np.sqrt((r - pr)**2 + (c - pc)**2) < (r_px + er) * 1.1
+                for (pr, pc), er in zip(centers_px, radii_px)
+            ) if centers_px else False
+            if not overlap:
+                centers_px.append((r, c))
+                radii_px.append(r_px)
+                depths_nm.append(depth)
+                placed = True
+                break
+        if not placed:
             break
 
-        radius_list[i] = random.uniform(8, 10)
-        center_coords[i, 0] = random.uniform(0, size)
-        center_coords[i, 1] = random.uniform(0, size)
-        j = 0
-        overlapping = False
-
-        while j < i:
-            dx = center_coords[i, 0] - center_coords[j, 0]
-            dy = center_coords[i, 1] - center_coords[j, 1]
-            dist2 = dx**2 + dy**2
-            min_dist2 = (radius_list[i] + radius_list[j])**2
-            if dist2 < min_dist2:
-                overlapping = True
-                break
-            j += 1
-
-        if overlapping:
-            # 重新取樣此粒子，不改變 i
-            continue
-
-        i += 1
-
-    return radius_list, center_coords
+    return centers_px, radii_px, depths_nm
 
 
-# [Fix 1] 重新命名為 spherical_image_creator，防止被後面的 cubic 版本覆蓋
-# [Fix 4] arange 從 0 開始、迴圈涵蓋 0..size-1，修正邊緣像素缺漏
-def spherical_image_creator(centers, radii, size):
-    x = np.arange(0, size, 1)  # 0..size-1
-    y = np.arange(0, size, 1)
+def cylinder_hole_creator(centers_px, radii_px, depths_nm, size):
+    """
+    向量化生成圓柱孔：
+      d ≤ r  : 孔底（均勻 -depth nm）
+      d > r  : 平坦表面（0 nm）
+    """
+    rr, cc = np.indices((size, size))
+    surface = np.zeros((size, size), dtype=np.float64)
+    for (r0, c0), r_px, depth in zip(centers_px, radii_px, depths_nm):
+        d = np.sqrt((rr - r0)**2 + (cc - c0)**2)
+        z = np.zeros((size, size))
+        z[d <= r_px] = -depth
+        surface = np.minimum(surface, z)
+    return surface
 
-    img_data = np.zeros(shape=(size, size))
 
-    for c in range(len(centers)):
-        x0 = centers[c, 0]
-        y0 = centers[c, 1]
-        radius = radii[c]
-        for i in range(0, size):      # [Fix 4] 涵蓋全部行
-            for j in range(0, size):  # [Fix 4] 涵蓋全部列
-                upheight2 = radius**2 - (x[i] - x0)**2 - (y[j] - y0)**2
-                if upheight2 >= 0:
-                    img_data[i, j] = radius + sqrt(upheight2)
-
-    return img_data
-
-radius_list, center_coords = circle_randomizer()
-img_data = spherical_image_creator(center_coords, radius_list, size)
-
+# ---- 圓柱孔 N=400 ---------------------------------------------------
 N = 400
+list_cyl_hole_images = []
 
-list_of_true_surf = []
-list_of_dilated_surf = []
-
-# Use the functions above to generate ground-truth and tip-convoluted pairs
-print("Generating spherical particles...")
-for i in tqdm(range(N), desc="Spherical", unit="img",
+print(f"Generating cylinder holes (r=4–10px={4*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f}nm, "
+      f"depth=80–130nm, 1–3 holes/img)...")
+for i in tqdm(range(N), desc="Cylinder Holes", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    radii, centers = circle_randomizer()
-    true_surface = spherical_image_creator(centers, radii, size)  # [Fix 1]
-    true_surface = true_surface.astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
-    list_of_true_surf.append(true_surface)
+    ctrs, rads, deps = cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=size)
+    if not ctrs:                        # 極少情況放不下任何孔，放一個在中心
+        ctrs  = [(size//2, size//2)]
+        rads  = [7.0]
+        deps  = [100.0]
+    surf = cylinder_hole_creator(ctrs, rads, deps, size)
+    list_cyl_hole_images.append(surf)
 
-# Save the images
-true_spherical_surf_stack = np.stack(list_of_true_surf, axis=0)
-np.save(f'{OUTPUT_DIR}/true_spherical_stack.npy', true_spherical_surf_stack)
+true_cyl_hole_stack = np.stack(list_cyl_hole_images, axis=0)
+np.save(f'{OUTPUT_DIR}/true_cyl_hole_stack.npy', true_cyl_hole_stack)
 
-# Plot the images
-# [Fix 12] 補上 tight_layout 與 show
-figure, axis = plt.subplots(1, 2, sharey=True)
-axis[0].imshow(true_spherical_surf_stack[0])
-axis[0].set_title("ground-truth (spherical)")
-axis[1].set_title("(dilated will appear after dilation step)")
-axis[1].axis('off')
+# Preview
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, idx in zip(axes, [0, 1, 2]):
+    im = ax.imshow(true_cyl_hole_stack[idx], cmap='viridis')
+    ax.set_title(f"Cylinder Hole GT #{idx}  "
+                 f"(min={true_cyl_hole_stack[idx].min():.1f} nm)")
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='nm')
 plt.tight_layout()
-save_plot('spherical_preview.png')
-
-
-# ============================================================
-# Simulate the cuboidal particles
-# ============================================================
-
-def cubic_randomizer(max_attempts=10000):
-    # [Fix 2] 加入最大嘗試次數，防止無限迴圈
-    number_of_rects = random.randint(4, 10)
-    l_list = np.zeros(number_of_rects)
-    w_list = np.zeros(number_of_rects)
-    h_list = np.zeros(number_of_rects)
-    center_coords = np.zeros(shape=(number_of_rects, 2))
-
-    i = 0
-    attempts = 0
-    while i < number_of_rects:
-        attempts += 1
-        if attempts > max_attempts:
-            number_of_rects = i
-            l_list = l_list[:number_of_rects]
-            w_list = w_list[:number_of_rects]
-            h_list = h_list[:number_of_rects]
-            center_coords = center_coords[:number_of_rects]
-            break
-
-        l_list[i] = random.uniform(8, 10)
-        w_list[i] = random.uniform(8, 10)
-        h_list[i] = random.uniform(16, 20)
-        center_coords[i, 0] = random.uniform(0, size)
-        center_coords[i, 1] = random.uniform(0, size)
-
-        overlapping = False
-        for j in range(i):
-            dx = abs(center_coords[i, 0] - center_coords[j, 0])  # [Fix 3] 使用 abs()
-            dy = abs(center_coords[i, 1] - center_coords[j, 1])  # [Fix 3]
-            if dx <= (l_list[i] + l_list[j]) and dy <= (w_list[i] + w_list[j]):
-                overlapping = True
-                break
-
-        if overlapping:
-            continue
-
-        i += 1
-
-    return l_list, w_list, h_list, center_coords
-
-
-# [Fix 4] cubic image_creator：arange 從 0 開始、迴圈涵蓋全部像素
-def cubic_image_creator(l, w, h, centers, size):
-    x = np.arange(0, size, 1)  # [Fix 4]
-    y = np.arange(0, size, 1)
-    img_data = np.zeros(shape=(size, size))
-    for c in range(len(centers)):
-        x0 = centers[c, 0]
-        y0 = centers[c, 1]
-        l0 = l[c]
-        w0 = w[c]
-        h0 = h[c]
-        for i in range(0, size):      # [Fix 4]
-            for j in range(0, size):
-                if abs(x[i] - x0) <= l0 and abs(y[j] - y0) <= w0:
-                    img_data[i, j] = h0
-    return img_data
-
-
-l_list, w_list, h_list, center_coords = cubic_randomizer()
-img_data = cubic_image_creator(l_list, w_list, h_list, center_coords, size)
-
-N = 400
-
-list_of_true_surf = []
-list_of_dilated_surf = []
-
-print("Generating cubic particles...")
-for i in tqdm(range(N), desc="Cubic", unit="img",
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    l_list, w_list, h_list, center_coords = cubic_randomizer()
-    true_surface = cubic_image_creator(l_list, w_list, h_list, center_coords, size)
-    true_surface = true_surface.astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
-    list_of_true_surf.append(true_surface)
-
-true_cubic_surf_stack = np.stack(list_of_true_surf, axis=0)
-np.save(f'{OUTPUT_DIR}/true_cubic_stack.npy', true_cubic_surf_stack)
-
-# [Fix 12]
-figure, axis = plt.subplots(1, 2, sharey=True)
-axis[0].imshow(true_cubic_surf_stack[0])
-axis[0].set_title("ground-truth (cubic)")
-axis[1].set_title("(dilated will appear after dilation step)")
-axis[1].axis('off')
-plt.tight_layout()
-save_plot('cubic_preview.png')
-
-
-# ============================================================
-# Simulate the cylindrical particles
-# ============================================================
-
-list_poly_gndtruth_image = []
-list_poly_dilated_image = []
-
-N = 400
-
-# Background subtraction to ensure height consistency
-background = np.full((128, 128), -255)
-
-print("Generating cylindrical particles...")
-for i in tqdm(range(N), desc="Cylindrical", unit="img",
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    result = random_shapes((128, 128), max_shapes=10, min_shapes=4,
-                           min_size=16, max_size=20, intensity_range=((235, 239),))
-    surface, labels = result
-    poly_gndtruth_image = np.negative(np.add(surface[:, :, 0], background)).astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
-    list_poly_gndtruth_image.append(poly_gndtruth_image)
-
-true_poly_surf_stack = np.stack(list_poly_gndtruth_image, axis=0)
-np.save(f'{OUTPUT_DIR}/true_poly_stack.npy', true_poly_surf_stack)
-
-# [Fix 12]
-figure, axis = plt.subplots(1, 2, sharey=True)
-axis[0].imshow(true_poly_surf_stack[0])
-axis[0].set_title("ground-truth (cylindrical)")
-axis[1].set_title("(dilated will appear after dilation step)")
-axis[1].axis('off')
-plt.tight_layout()
-save_plot('cylindrical_preview.png')
+save_plot('cylinder_hole_preview.png')
 
 
 # ============================================================
@@ -664,12 +560,14 @@ save_plot('trapezoid_preview.png')
 
 
 # ============================================================
-# Import AFM tip and apply grey dilation
+# 套用 Grey Dilation（模擬 AFM 掃描，凹洞版本）
+# Grey dilation 對孔洞的效果：
+#   dilated[i,j] = max_{u,v}{ surface[i-u,j-v] + tip[u,v] }
+#   孔洞（負值）+ tip（0 到負值）→ 孔洞在 dilated 中變淺/變窄
+#   這正確模擬 AFM 探針無法完全進入孔洞的物理現象
 # ============================================================
 
-# 訓練用合成拋物線探針（替代環形假象的估算探針）
-# 理由：估算探針因四重對稱化造成環形假象，直接用於訓練會讓 dilated 影像飽和
-print("建立訓練用合成探針 (第一次)...")
+print("建立訓練用合成探針（拋物線，R=73nm）...")
 tip_shape = make_training_tip()
 plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
@@ -678,190 +576,82 @@ plt.title(f"Training Tip — Paraboloid  R={TIP_RADIUS_NM} nm  "
           f"{TIP_TRAIN_SIZE}×{TIP_TRAIN_SIZE} px")
 save_plot('tip_shape.png')
 
-# Load saved stacks
-true_spherical_surf_stack = np.load(f'{OUTPUT_DIR}/true_spherical_stack.npy').astype('float32')
-true_cubic_surf_stack     = np.load(f'{OUTPUT_DIR}/true_cubic_stack.npy').astype('float32')
-true_poly_surf_stack      = np.load(f'{OUTPUT_DIR}/true_poly_stack.npy').astype('float32')
-true_trap_surf_stack      = np.load(f'{OUTPUT_DIR}/true_trap_stack.npy').astype('float32')
+# 載入兩種孔洞 ground-truth
+true_trap_surf_stack     = np.load(f'{OUTPUT_DIR}/true_trap_stack.npy').astype('float32')
+true_cyl_hole_surf_stack = np.load(f'{OUTPUT_DIR}/true_cyl_hole_stack.npy').astype('float32')
 
-list_spherical_dilated_image = []
-list_cubic_dilated_image     = []
-list_poly_dilated_image      = []
-list_trap_dilated_image      = []
+list_trap_dilated_image     = []
+list_cyl_hole_dilated_image = []
 
-print("Applying dilation to images...")
+print("Applying dilation to hole images...")
 for i in tqdm(range(400), desc="Dilation", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    true_spherical_surf = true_spherical_surf_stack[i, :, :]
-    true_cubic_surf     = true_cubic_surf_stack[i, :, :]
-    true_poly_surf      = true_poly_surf_stack[i, :, :]
-    true_trap_surf      = true_trap_surf_stack[i, :, :]
+    true_trap_surf     = true_trap_surf_stack[i, :, :]
+    true_cyl_hole_surf = true_cyl_hole_surf_stack[i, :, :]
 
-    dilated_spherical_surf = scipy.ndimage.grey_dilation(true_spherical_surf, structure=tip_shape)
-    dilated_cubic_surf     = scipy.ndimage.grey_dilation(true_cubic_surf,     structure=tip_shape)
-    dilated_poly_surf      = scipy.ndimage.grey_dilation(true_poly_surf,      structure=tip_shape)
-    dilated_trap_surf      = scipy.ndimage.grey_dilation(true_trap_surf,      structure=tip_shape)
+    dilated_trap_surf     = scipy.ndimage.grey_dilation(true_trap_surf,     structure=tip_shape)
+    dilated_cyl_hole_surf = scipy.ndimage.grey_dilation(true_cyl_hole_surf, structure=tip_shape)
 
-    list_spherical_dilated_image.append(dilated_spherical_surf)
-    list_cubic_dilated_image.append(dilated_cubic_surf)
-    list_poly_dilated_image.append(dilated_poly_surf)
     list_trap_dilated_image.append(dilated_trap_surf)
+    list_cyl_hole_dilated_image.append(dilated_cyl_hole_surf)
 
-dilated_spherical_surf_stack = np.stack(list_spherical_dilated_image, axis=0)
-dilated_cubic_surf_stack     = np.stack(list_cubic_dilated_image,     axis=0)
-dilated_poly_surf_stack      = np.stack(list_poly_dilated_image,      axis=0)
-dilated_trap_surf_stack      = np.stack(list_trap_dilated_image,      axis=0)
+dilated_trap_surf_stack     = np.stack(list_trap_dilated_image,     axis=0)
+dilated_cyl_hole_surf_stack = np.stack(list_cyl_hole_dilated_image, axis=0)
 
-np.save(f'{OUTPUT_DIR}/dilated_spherical_stack.npy', dilated_spherical_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_cubic_stack.npy',     dilated_cubic_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_poly_stack.npy',      dilated_poly_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_trap_stack.npy',      dilated_trap_surf_stack)
+np.save(f'{OUTPUT_DIR}/dilated_trap_stack.npy',     dilated_trap_surf_stack)
+np.save(f'{OUTPUT_DIR}/dilated_cyl_hole_stack.npy', dilated_cyl_hole_surf_stack)
 
-
-# ============================================================
-# Add line-like artifacts (post-dilation)
-# ============================================================
-
-def line_artifact_adder(image_data, image_size):
-    # [Fix 5] 修正方向：AFM 掃描偽影為水平（row-based），
-    #         line_picker shape 從 (128,1) 改為 (1,128)
-    # 背景值 0.0：新 tip max=0nm，dilation 不產生偏移，無需校正
-    processed_images_l = []
-    for image in tqdm(image_data, desc="Line Artifacts", unit="img", leave=False):
-        processed_image = image + np.full((128, 128), 0.0)  # Background subtraction
-        line_picker = np.random.random((1, 128))                 # [Fix 5] (1, 128) → row mask
-        line_picker = line_picker > 0.05
-        preserved_lines = np.ones((128, 128)) * line_picker      # 廣播：每一行整排同值
-        processed_image = processed_image * preserved_lines
-        processed_images_l.append(processed_image.reshape(image_size[0], image_size[1], 1))
-    processed_images_a = np.stack(processed_images_l, axis=0)
-    return processed_images_a
-
-dilated_spherical_surf_stack       = np.load(f'{OUTPUT_DIR}/dilated_spherical_stack.npy').astype('float32')
-dilated_edge_lifted_cubic_surf_stack = np.load(f'{OUTPUT_DIR}/dilated_cubic_stack.npy').astype('float32')
-dilated_edge_lifted_poly_surf_stack  = np.load(f'{OUTPUT_DIR}/dilated_poly_stack.npy').astype('float32')
-
-target_size = (128, 128)
-spherical_dilated_line_artifact = line_artifact_adder(dilated_spherical_surf_stack, target_size)
-cubic_dilated_line_artifact     = line_artifact_adder(dilated_edge_lifted_cubic_surf_stack, target_size)
-poly_dilated_line_artifact      = line_artifact_adder(dilated_edge_lifted_poly_surf_stack, target_size)
-
-np.save(f'{OUTPUT_DIR}/dilated_spherical_incl_line_artifact.npy', spherical_dilated_line_artifact)
-np.save(f'{OUTPUT_DIR}/dilated_cubic_incl_line_artifact.npy', cubic_dilated_line_artifact)
-np.save(f'{OUTPUT_DIR}/dilated_poly_incl_line_artifact.npy', poly_dilated_line_artifact)
-
-
-# ============================================================
-# Add edge-lift artifacts (prior to dilation)
-# ============================================================
-
-def edge_lifter(image_data, image_size):
-    import cv2
-    processed_images_l = []
-    for image in tqdm(image_data, desc="Edge Lifting", unit="img", leave=False):
-        processed_image = image
-
-        # Detect the edges
-        img = image.astype(np.uint8)
-        laplacian = cv2.Laplacian(img, cv2.CV_64F)
-        laplacian2 = laplacian < 0
-
-        # Raise the edges by 1 nm
-        processed_image = image + laplacian2 * 1
-        processed_images_l.append(processed_image.reshape(image_size[0], image_size[1]))
-    processed_images_a = np.stack(processed_images_l, axis=0)
-    return processed_images_a
-
-target_size = (128, 128)
-print("Loading cubic and poly stacks for edge lifting...")
-true_cubic_surf_stack = np.load(f'{OUTPUT_DIR}/true_cubic_stack.npy').astype('float32')
-true_poly_surf_stack  = np.load(f'{OUTPUT_DIR}/true_poly_stack.npy').astype('float32')
-edge_lifted_cubic_stack = edge_lifter(true_cubic_surf_stack, target_size)
-edge_lifted_poly_stack  = edge_lifter(true_poly_surf_stack, target_size)
-np.save(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy', edge_lifted_cubic_stack)
-np.save(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy', edge_lifted_poly_stack)
-
-# 訓練用合成拋物線探針（edge-lifted dilation 使用相同探針）
-print("建立訓練用合成探針 (第二次，edge-lifted 使用)...")
-tip_shape = make_training_tip()
-plt.figure()
-plt.imshow(tip_shape, cmap='viridis')
-plt.colorbar()
-plt.title(f"Training Tip — Paraboloid  R={TIP_RADIUS_NM} nm  "
-          f"{TIP_TRAIN_SIZE}×{TIP_TRAIN_SIZE} px")
-save_plot('tip_shape_edge.png')
-
-# Dilating the edge-lifted cubic and poly stacks
-edge_lifted_cubic_surf_stack = np.load(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy').astype('float32')
-edge_lifted_poly_surf_stack  = np.load(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy').astype('float32')
-
-list_cubic_dilated_image = []
-list_poly_dilated_image = []
-
-print("Dilating edge-lifted images...")
-for i in tqdm(range(400), desc="Edge Dilation", unit="img",
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    edge_lifted_cubic_surf = edge_lifted_cubic_surf_stack[i, :, :]
-    edge_lifted_poly_surf  = edge_lifted_poly_surf_stack[i, :, :]
-
-    dilated_cubic_surf = scipy.ndimage.grey_dilation(edge_lifted_cubic_surf, structure=tip_shape)
-    dilated_poly_surf  = scipy.ndimage.grey_dilation(edge_lifted_poly_surf, structure=tip_shape)
-
-    list_cubic_dilated_image.append(dilated_cubic_surf)
-    list_poly_dilated_image.append(dilated_poly_surf)
-
-dilated_cubic_surf_stack = np.stack(list_cubic_dilated_image, axis=0)
-dilated_poly_surf_stack  = np.stack(list_poly_dilated_image, axis=0)
-
-np.save(f'{OUTPUT_DIR}/dilated_edge_lifted_cubic_stack.npy', dilated_cubic_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_edge_lifted_poly_stack.npy', dilated_poly_surf_stack)
+# 快速視覺驗證（確認孔洞在 dilation 後變淺/變窄，符合 AFM 物理）
+fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+for col in range(4):
+    axes[0, col].imshow(true_trap_surf_stack[col], cmap='viridis',
+                        vmin=-160, vmax=10)
+    axes[0, col].set_title(f'Trap GT #{col}')
+    axes[0, col].axis('off')
+    axes[1, col].imshow(dilated_trap_surf_stack[col], cmap='viridis',
+                        vmin=-160, vmax=10)
+    axes[1, col].set_title(f'Trap Dilated #{col}')
+    axes[1, col].axis('off')
+plt.suptitle('梯形孔：Ground-Truth vs Dilated（孔洞應變淺/變窄）', fontsize=11)
+plt.tight_layout()
+save_plot('trap_dilation_check.png')
 
 
 # ============================================================
 # Load images and prepare training/testing datasets
 # ============================================================
+# 訓練資料全部為孔洞（凹洞）：
+#   X1 / y1 : 梯形孔 (trapezoid_hole)  400 張
+#   X2 / y2 : 圓柱孔 (cylinder_hole)   400 張
+#   共 800 張，train:test = 8:2 → train 640, test 160 per type
+#   合計 train 1280, test 320
 
-# [Fix 10] 修正路徑變數命名：
-#   dilated_images_path_* = 卷積圖 (模型輸入 X)
-#   true_images_path_*    = 真實表面 (模型標籤 y)
+dilated_images_path_trap     = f'{OUTPUT_DIR}/dilated_trap_stack.npy'
+true_images_path_trap        = f'{OUTPUT_DIR}/true_trap_stack.npy'
+dilated_images_path_cyl_hole = f'{OUTPUT_DIR}/dilated_cyl_hole_stack.npy'
+true_images_path_cyl_hole    = f'{OUTPUT_DIR}/true_cyl_hole_stack.npy'
 
-dilated_images_path_spherical = f'{OUTPUT_DIR}/dilated_spherical_stack.npy'
-true_images_path_spherical    = f'{OUTPUT_DIR}/true_spherical_stack.npy'
-dilated_images_path_cubic     = f'{OUTPUT_DIR}/dilated_cubic_stack.npy'
-true_images_path_cubic        = f'{OUTPUT_DIR}/true_cubic_stack.npy'
-dilated_images_path_poly      = f'{OUTPUT_DIR}/dilated_poly_stack.npy'
-true_images_path_poly         = f'{OUTPUT_DIR}/true_poly_stack.npy'
-dilated_images_path_trap      = f'{OUTPUT_DIR}/dilated_trap_stack.npy'   # 梯形孔
-true_images_path_trap         = f'{OUTPUT_DIR}/true_trap_stack.npy'
-
-X1 = np.load(dilated_images_path_spherical).astype('float32')
-y1 = np.load(true_images_path_spherical).astype('float32')
-X2 = np.load(dilated_images_path_cubic).astype('float32')
-y2 = np.load(true_images_path_cubic).astype('float32')
-X3 = np.load(dilated_images_path_poly).astype('float32')
-y3 = np.load(true_images_path_poly).astype('float32')
-X4 = np.load(dilated_images_path_trap).astype('float32')   # 梯形孔 dilated
-y4 = np.load(true_images_path_trap).astype('float32')      # 梯形孔 ground-truth
+X1 = np.load(dilated_images_path_trap).astype('float32')
+y1 = np.load(true_images_path_trap).astype('float32')
+X2 = np.load(dilated_images_path_cyl_hole).astype('float32')
+y2 = np.load(true_images_path_cyl_hole).astype('float32')
 
 # Split
 X_1_train, X_1_test, y_1_train, y_1_test = train_test_split(X1, y1, test_size=0.2, random_state=42)
 X_2_train, X_2_test, y_2_train, y_2_test = train_test_split(X2, y2, test_size=0.2, random_state=42)
-X_3_train, X_3_test, y_3_train, y_3_test = train_test_split(X3, y3, test_size=0.2, random_state=42)
-X_4_train, X_4_test, y_4_train, y_4_test = train_test_split(X4, y4, test_size=0.2, random_state=42)
 
-X_merged_train = np.concatenate((X_1_train, X_2_train, X_3_train, X_4_train), axis=0)
-y_merged_train = np.concatenate((y_1_train, y_2_train, y_3_train, y_4_train), axis=0)
+X_merged_train = np.concatenate((X_1_train, X_2_train), axis=0)
+y_merged_train = np.concatenate((y_1_train, y_2_train), axis=0)
 
 X_merged_train, y_merged_train = shuffle(X_merged_train, y_merged_train)
 
-X_merged_test = np.concatenate((X_1_test, X_2_test, X_3_test, X_4_test), axis=0)
-y_merged_test = np.concatenate((y_1_test, y_2_test, y_3_test, y_4_test), axis=0)
+X_merged_test = np.concatenate((X_1_test, X_2_test), axis=0)
+y_merged_test = np.concatenate((y_1_test, y_2_test), axis=0)
 
 print("Training data loaded.",
-      f"\n  Spherical  : {X1.shape[0]} imgs",
-      f"\n  Cubic      : {X2.shape[0]} imgs",
-      f"\n  Cylindrical: {X3.shape[0]} imgs",
-      f"\n  Trapezoid  : {X4.shape[0]} imgs  ← 用戶真實樣品",
+      f"\n  ✓ Trapezoid holes : {X1.shape[0]} imgs",
+      f"\n  ✓ Cylinder  holes : {X2.shape[0]} imgs",
+      f"\n  ✗ Sphere/Cubic/Poly: 已移除（突起資料，物理行為相反）",
       f"\n  Train total: {X_merged_train.shape[0]}",
       f"\n  Test  total: {X_merged_test.shape[0]}",
       f"\n  Resolution : {X_merged_train.shape[1:3]}")
@@ -897,6 +687,20 @@ X_processed_train = height_correcter_X(X_merged_train, target_size)
 X_processed_test  = height_correcter_X(X_merged_test, target_size)
 y_processed_train = preprocessing_Y(y_merged_train, target_size)
 y_processed_test  = preprocessing_Y(y_merged_test, target_size)
+
+# ---- 全域正規化 → [0, 1]（解決模型輸出全零問題）-----------------
+print(f"\n{'='*60}")
+print(f"  全域正規化  NORM_MIN={NORM_MIN} nm  NORM_MAX={NORM_MAX} nm")
+print(f"  背景 0 nm → {(0-NORM_MIN)/(NORM_MAX-NORM_MIN):.3f}（不再是特殊零值）")
+print(f"{'='*60}")
+X_processed_train = normalize_data(X_processed_train)
+X_processed_test  = normalize_data(X_processed_test)
+y_processed_train = normalize_data(y_processed_train)
+y_processed_test  = normalize_data(y_processed_test)
+print(f"  X_train  : [{X_processed_train.min():.3f}, {X_processed_train.max():.3f}]")
+print(f"  y_train  : [{y_processed_train.min():.3f}, {y_processed_train.max():.3f}]")
+print(f"  X_test   : [{X_processed_test.min():.3f}, {X_processed_test.max():.3f}]")
+print(f"  y_test   : [{y_processed_test.min():.3f}, {y_processed_test.max():.3f}]\n")
 
 # Show the processed images with scale
 fig = plt.figure(figsize=(10, 7))
@@ -969,14 +773,18 @@ autoencoder.add(Conv2DTranspose(32, (4, 4), strides=2, kernel_initializer=ini, a
 autoencoder.add(Conv2DTranspose(16, (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
 autoencoder.add(Conv2DTranspose(8,  (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
 autoencoder.add(Conv2DTranspose(4,  (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(Conv2DTranspose(1,  (3, 3), kernel_initializer=ini, padding='same'))
+autoencoder.add(Conv2DTranspose(1,  (3, 3), kernel_initializer=ini,
+                               activation='sigmoid', padding='same'))
+# sigmoid 輸出恰好限制在 [0, 1]，與正規化資料範圍匹配
+# 防止模型輸出超出範圍的數值
 
 # List the training parameters and their information
 autoencoder.summary()
 
 # [Fix 7] 移除未使用的 input_img = Input(shape=(...))
 # Apply the optimizer with desired learning rate and loss function
-opt = tf.keras.optimizers.Adam(learning_rate=0.001)
+# learning_rate 從 0.001 → 0.0003：配合正規化後數值範圍較小，步進更穩定
+opt = tf.keras.optimizers.Adam(learning_rate=0.0003)
 autoencoder.compile(optimizer=opt, loss='MAE')
 
 
@@ -1084,11 +892,16 @@ def get_decoded_imgs(input_imgs, filepath, nb_channels=1):
 # [Fix 11] 保持為 numpy array，不轉換成 list
 decoded_imgs = get_decoded_imgs(X_processed_test, MODEL_PATH)
 
+# ---- 反正規化回 nm，指標與視覺化均以物理量 nm 呈現 --------------
+decoded_imgs_nm   = denormalize_data(decoded_imgs)
+y_processed_nm    = denormalize_data(y_processed_test)
+X_processed_nm    = denormalize_data(X_processed_test)
+
 # 計算並顯示預測評估指標
 print("\n" + "="*70)
-print("預測結果評估")
+print("預測結果評估（單位：nm）")
 print("="*70)
-metrics = calculate_metrics(y_processed_test, decoded_imgs)
+metrics = calculate_metrics(y_processed_nm, decoded_imgs_nm)
 print(f"\n測試集評估指標:")
 print(f"  MAE  (平均絕對誤差): {metrics['MAE']:.6f} nm")
 print(f"  MSE  (均方誤差):      {metrics['MSE']:.6f} nm²")
@@ -1096,10 +909,10 @@ print(f"  RMSE (均方根誤差):    {metrics['RMSE']:.6f} nm")
 print(f"  PSNR (峰值信噪比):    {metrics['PSNR']:.2f} dB")
 print(f"  SSIM (結構相似性):    {metrics['SSIM']:.4f}  [0=差, 1=完美]")
 
-# 計算像素級準確率 (使用閾值)
+# 計算像素級準確率 (使用閾值，基於 nm 範圍)
 threshold = 0.1  # 10% 誤差容限
-diff = np.abs(y_processed_test - decoded_imgs)
-max_val = np.max(y_processed_test)
+diff = np.abs(y_processed_nm - decoded_imgs_nm)
+max_val = np.max(np.abs(y_processed_nm))
 accuracy = np.mean((diff / (max_val + 1e-10)) < threshold) * 100
 print(f"  Pixel Accuracy (<10% error): {accuracy:.2f}%")
 print("="*70 + "\n")
@@ -1112,15 +925,15 @@ print("="*70 + "\n")
 fig, ax = plt.subplots(2, 3, figsize=(12, 8))
 
 for col in range(3):
-    # Row 0: model output
-    img_out = decoded_imgs[col].reshape(target_size[0], target_size[1])
-    ax[0, col].imshow(img_out, cmap='gray')
-    ax[0, col].set_title(f'Output {col + 1}')
+    # Row 0: model output（反正規化後 nm）
+    img_out = decoded_imgs_nm[col].reshape(target_size[0], target_size[1])
+    ax[0, col].imshow(img_out, cmap='viridis')
+    ax[0, col].set_title(f'Output {col + 1}  (nm)')
     ax[0, col].axis('off')
-    # Row 1: model input
-    img_in = X_processed_test[col].reshape(target_size[0], target_size[1])
-    ax[1, col].imshow(img_in, cmap='gray')
-    ax[1, col].set_title(f'Input {col + 1}')
+    # Row 1: model input（反正規化後 nm）
+    img_in = X_processed_nm[col].reshape(target_size[0], target_size[1])
+    ax[1, col].imshow(img_in, cmap='viridis')
+    ax[1, col].set_title(f'Input {col + 1}  (nm)')
     ax[1, col].axis('off')
 
 plt.tight_layout()
@@ -1135,9 +948,12 @@ save_plot('predictions_grid.png')
 model = load_model(MODEL_PATH)
 decoded = model.predict(X_processed_test)
 
+# 反正規化回 nm，剖面圖縱軸單位正確
+decoded = denormalize_data(decoded)
+
 # Squeeze channel dimension for visualization
-X_test  = X_processed_test.squeeze()
-Y_test  = y_processed_test.squeeze()
+X_test  = denormalize_data(X_processed_test).squeeze()
+Y_test  = denormalize_data(y_processed_test).squeeze()
 decoded = decoded.squeeze()
 
 
@@ -1237,12 +1053,16 @@ with open(metrics_path, 'w', encoding='utf-8') as f:
     f.write(f"[訓練設定]\n")
     f.write(f"  Epochs      : {EPOCHS}\n")
     f.write(f"  Batch Size  : {BATCH_SIZE}\n")
-    f.write(f"  Train 樣本  : {X_processed_train.shape[0]}\n")
+    f.write(f"  Train 樣本  : {X_processed_train.shape[0]}  (梯形孔+圓柱孔)\n")
     f.write(f"  Val 樣本    : {X_processed_test.shape[0]}\n\n")
-    f.write(f"[最終 Loss]\n")
+    f.write(f"[正規化設定]\n")
+    f.write(f"  NORM_MIN    : {NORM_MIN} nm\n")
+    f.write(f"  NORM_MAX    : {NORM_MAX} nm\n")
+    f.write(f"  背景 0 nm   : → {(0-NORM_MIN)/(NORM_MAX-NORM_MIN):.3f}\n\n")
+    f.write(f"[最終 Loss（正規化空間 [0,1]）]\n")
     f.write(f"  Train Loss  : {training_data.history['loss'][-1]:.6f}\n")
     f.write(f"  Val Loss    : {training_data.history['val_loss'][-1]:.6f}\n\n")
-    f.write(f"[評估指標 (測試集)]\n")
+    f.write(f"[評估指標 (測試集，單位 nm，反正規化後)]\n")
     for k, v in metrics.items():
         f.write(f"  {k:<6}: {v:.6f}\n")
     f.write(f"\n[模型路徑]\n")
@@ -1261,15 +1081,21 @@ with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"  TIP_TRAIN_SIZE   : {TIP_TRAIN_SIZE} px\n")
     f.write(f"  邊緣深度          : {_edge_depth:.1f} nm\n")
     f.write(f"  粒子高度上限      : < {abs(_edge_depth):.0f} nm（不飽和條件）\n\n")
-    f.write(f"[曲面設定]\n")
+    f.write(f"[訓練策略]\n")
+    f.write(f"  樣品類型         : 全凹洞（移除突起粒子，突起與孔洞物理行為相反）\n")
+    f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  400 張\n")
+    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   400 張\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
-    f.write(f"  sphere 半徑      : 8–10 px → {8*SURFACE_SCALE_NM:.0f}–{10*SURFACE_SCALE_NM:.0f} nm\n")
-    f.write(f"  cubic 高度       : 16–20 px → {16*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f} nm\n")
     f.write(f"\n[梯形孔樣品設定（用戶真實樣品）]\n")
     f.write(f"  開口寬度  : {TRAP_OPEN_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
     f.write(f"  底部寬度  : {TRAP_BOT_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
     f.write(f"  深度      : {TRAP_DEPTH_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")
     f.write(f"  壁角      : {math.degrees(math.atan((TRAP_OPEN_NM-TRAP_BOT_NM)/2/TRAP_DEPTH_NM)):.1f}°\n")
+    f.write(f"\n[全域正規化（訓練與推論必須一致）]\n")
+    f.write(f"  NORM_MIN         : {NORM_MIN} nm\n")
+    f.write(f"  NORM_MAX         : {NORM_MAX} nm\n")
+    f.write(f"  x_norm = (x - NORM_MIN) / (NORM_MAX - NORM_MIN)\n")
+    f.write(f"  背景 0 nm → {(0-NORM_MIN)/(NORM_MAX-NORM_MIN):.3f}（不是零，模型不能偷懶）\n")
     f.write(f"\n[估算探針（供 detect.py 推論使用）]\n")
     f.write(f"  tip_file         : tip.mat/tip_estimated0526.mat\n")
     f.write(f"  tip_correction   : tip_correction.py\n")
