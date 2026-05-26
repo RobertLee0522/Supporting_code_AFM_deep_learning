@@ -63,6 +63,57 @@ from scipy.io import savemat
 OUTPUT_DIR = 'img'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ============================================================
+# 探針前處理常數
+# ============================================================
+SURFACE_SCALE_NM = 5.0   # nm per height unit：訓練曲面高度換算係數
+TARGET_TIP_SIZE  = 55    # 將探針 resize 至此尺寸 (px)
+
+
+def load_and_prepare_tip(mat_path, key='tip', target_size=TARGET_TIP_SIZE):
+    """
+    載入 AFM 探針估計結果，修正方向與尺寸。
+
+    FIX A:
+      - 找出最大值位置（探針頂端）並移至中心（shift）
+      - 強制 max = 0
+      - 套用徑向平均，使探針具有旋轉對稱性
+
+    FIX B:
+      - Resize 至 target_size × target_size（預設 55×55）
+      - 確保 resize 後 max 仍為 0
+    """
+    raw = io.loadmat(mat_path)[key].astype(np.float64)
+
+    # FIX A-1：將最大值移到中心
+    max_idx = np.unravel_index(raw.argmax(), raw.shape)
+    cy, cx = raw.shape[0] // 2, raw.shape[1] // 2
+    shifted = ndimage.shift(raw, [cy - max_idx[0], cx - max_idx[1]], mode='nearest')
+    shifted -= shifted.max()  # 確保 max = 0
+
+    # FIX A-2：徑向平均 → 強制旋轉對稱
+    ny, nx = shifted.shape
+    cy2, cx2 = ny // 2, nx // 2
+    y_idx, x_idx = np.indices((ny, nx))
+    r_map = np.round(np.sqrt((y_idx - cy2)**2 + (x_idx - cx2)**2)).astype(int)
+    radially_averaged = np.zeros_like(shifted)
+    for ri in range(r_map.max() + 1):
+        mask = r_map == ri
+        if mask.any():
+            radially_averaged[mask] = shifted[mask].mean()
+    radially_averaged -= radially_averaged.max()  # 再確保 max = 0
+
+    # FIX B：Resize 至 target_size × target_size
+    zoom_factor = target_size / radially_averaged.shape[0]
+    tip_out = ndimage.zoom(radially_averaged, zoom_factor, order=3)
+    tip_out -= tip_out.max()  # 確保插值後 max 仍為 0
+
+    print(f"  Tip loaded from: {mat_path}")
+    print(f"  Raw shape: {raw.shape}  →  Prepared shape: {tip_out.shape}")
+    print(f"  Raw max idx: {max_idx}  →  center: ({cy}, {cx})")
+    print(f"  Tip value range: [{tip_out.min():.3f}, {tip_out.max():.3f}] nm")
+    return tip_out
+
 
 # Custom callback for training progress bar and metrics display
 class TrainingProgressCallback(Callback):
@@ -235,7 +286,7 @@ for i in tqdm(range(N), desc="Spherical", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     radii, centers = circle_randomizer()
     true_surface = spherical_image_creator(centers, radii, size)  # [Fix 1]
-    true_surface = true_surface.astype(int)
+    true_surface = true_surface.astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
     list_of_true_surf.append(true_surface)
 
 # Save the images
@@ -330,7 +381,7 @@ for i in tqdm(range(N), desc="Cubic", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     l_list, w_list, h_list, center_coords = cubic_randomizer()
     true_surface = cubic_image_creator(l_list, w_list, h_list, center_coords, size)
-    true_surface = true_surface.astype(int)
+    true_surface = true_surface.astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
     list_of_true_surf.append(true_surface)
 
 true_cubic_surf_stack = np.stack(list_of_true_surf, axis=0)
@@ -364,7 +415,7 @@ for i in tqdm(range(N), desc="Cylindrical", unit="img",
     result = random_shapes((128, 128), max_shapes=10, min_shapes=4,
                            min_size=16, max_size=20, intensity_range=((235, 239),))
     surface, labels = result
-    poly_gndtruth_image = np.negative(np.add(surface[:, :, 0], background)).astype(int)
+    poly_gndtruth_image = np.negative(np.add(surface[:, :, 0], background)).astype(float) * SURFACE_SCALE_NM  # [FIX C] 換算為 nm
     list_poly_gndtruth_image.append(poly_gndtruth_image)
 
 true_poly_surf_stack = np.stack(list_poly_gndtruth_image, axis=0)
@@ -384,11 +435,12 @@ plt.show()
 # Import AFM tip and apply grey dilation
 # ============================================================
 
-tip = io.loadmat('tip.mat/tip_estimated0526.mat')
-tip_shape = tip['tip']
-plt.imshow(tip_shape)
+# [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
+print("準備探針形狀 (第一次載入)...")
+tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
-plt.title("AFM Tip Shape")
+plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
 plt.show()
 
 # Load saved stacks
@@ -487,11 +539,12 @@ edge_lifted_poly_stack  = edge_lifter(true_poly_surf_stack, target_size)
 np.save(f'{OUTPUT_DIR}/edge_lifted_cubic_stack.npy', edge_lifted_cubic_stack)
 np.save(f'{OUTPUT_DIR}/edge_lifted_poly_stack.npy', edge_lifted_poly_stack)
 
-tip = io.loadmat('tip.mat/tip_estimated.mat')
-tip_shape = tip['tip']
-plt.imshow(tip_shape)
+# [FIX A+B] 使用 load_and_prepare_tip 修正探針方向、徑向對稱化、Resize
+print("準備探針形狀 (第二次載入，edge-lifted 使用)...")
+tip_shape = load_and_prepare_tip('tip.mat/tip_estimated0526.mat')
+plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
-plt.title("AFM Tip Shape")
+plt.title("AFM Tip Shape (prepared: centered + radial avg + resized)")
 plt.show()
 
 # Dilating the edge-lifted cubic and poly stacks
