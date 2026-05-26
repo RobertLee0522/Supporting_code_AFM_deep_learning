@@ -108,7 +108,20 @@ def read_nanoscope_channel(fp, meta, ch_idx=None):
     with open(fp, 'rb') as f:
         f.seek(ch['offset'])
         raw = np.frombuffer(f.read(n * ch['bpp']), dtype=dt)
-    img  = raw.reshape(meta['n_lines'], meta['n_px']).astype(np.float64)
+
+    # 實際讀到的元素可能少於 n_px*n_lines（多通道檔案各通道行數可能不同）
+    # → 從資料長度反推實際行數，zoom 會統一縮放至 128×128
+    actual_lines = len(raw) // meta['n_px']
+    if actual_lines == 0:
+        raise ValueError(
+            f"通道資料不足：只讀到 {len(raw)} 個元素，"
+            f"無法組成 {meta['n_px']} px 寬的影像"
+        )
+    if actual_lines != meta['n_lines']:
+        print(f"  [注意] 通道 '{ch['name']}' 實際行數 {actual_lines}"
+              f"（header 記載 {meta['n_lines']}），以實際值為準")
+    img  = raw[:actual_lines * meta['n_px']].reshape(
+               actual_lines, meta['n_px']).astype(np.float64)
     sens = meta['zsens_s'] if 'ZsensSens' in ch['z_key'] else meta['zsens']
     return img * ch['z_lsb'] * sens
 
