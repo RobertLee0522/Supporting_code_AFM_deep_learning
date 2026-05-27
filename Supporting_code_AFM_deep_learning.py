@@ -444,15 +444,14 @@ def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
         radii_px    : list of 半徑 (px)
         depths_nm   : list of 深度 (nm, 正數)
     """
-    n_holes = random.randint(1, 3)
+    n_holes = random.randint(1, 6)       # 最多 6 個，模擬密集孔陣
     centers_px, radii_px, depths_nm = [], [], []
 
     for _ in range(n_holes):
         # ── 可見度門檻（at 39.1 nm/px）──────────────────────────────
-        # r_min = sqrt(2 × R_tip × depth) / px_nm
-        # R=73nm, depth≈100nm → r_min = sqrt(14600)/39.1 ≈ 3.1px
-        # 取 3–8px 覆蓋臨界附近（117–313nm），增加難度多樣性
-        r_px    = random.uniform(3, 8)           # 半徑 3–8 px → 117–313 nm
+        # r_min ≈ 3.1px；取 1.5–8px 讓模型同時學習極小孔與一般孔
+        # 1.5px = 59nm（尖銳小孔）；8px = 313nm（較大孔洞）
+        r_px    = random.uniform(1.5, 8)         # 半徑 1.5–8 px → 59–313 nm
         depth   = random.uniform(80.0, 130.0)   # 深度 80–130 nm
         margin  = r_px + 3
         min_pos = margin
@@ -495,12 +494,48 @@ def cylinder_hole_creator(centers_px, radii_px, depths_nm, size):
     return surface
 
 
-# ---- 圓柱孔 N=400 ---------------------------------------------------
-N = 400
+# ============================================================
+# 真實掃描 artifact 模擬（只加到 X/input，不加到 GT）
+# ============================================================
+
+def add_scan_line_artifacts(img, n_events=None, max_band_px=3,
+                             amplitude_nm=8.0):
+    """
+    模擬 AFM 逐行掃描的水平條紋 Z 漂移 artifact。
+    每個 event：隨機選 row，加上隨機正/負偏移，寬度 1–max_band_px 行。
+
+    50% 機率完全不加（讓模型同時看過有/無 artifact 的樣本）。
+    """
+    if random.random() < 0.5:
+        return img.copy()
+    result = img.copy()
+    h = img.shape[0]
+    if n_events is None:
+        n_events = random.randint(1, 5)
+    for _ in range(n_events):
+        row0  = random.randint(0, h - 1)
+        width = random.randint(1, max_band_px)
+        amp   = random.gauss(0, amplitude_nm)
+        result[row0:min(row0 + width, h), :] += amp
+    return result
+
+
+def add_gaussian_noise(img, sigma_nm=None):
+    """
+    加入高斯隨機雜訊，模擬 AFM 熱雜訊 + 電子雜訊。
+    sigma_nm 預設從 0.5–2.5 nm 隨機選取。
+    """
+    if sigma_nm is None:
+        sigma_nm = random.uniform(0.5, 2.5)
+    return img + np.random.normal(0, sigma_nm, img.shape).astype(np.float32)
+
+
+# ---- 圓柱孔 N=800 ---------------------------------------------------
+N = 800
 list_cyl_hole_images = []
 
-print(f"Generating cylinder holes (r=3–8px={3*SURFACE_SCALE_NM:.0f}–{8*SURFACE_SCALE_NM:.0f}nm, "
-      f"depth=80–130nm, 1–3 holes/img)...")
+print(f"Generating cylinder holes (r=1.5–8px={1.5*SURFACE_SCALE_NM:.0f}–{8*SURFACE_SCALE_NM:.0f}nm, "
+      f"depth=80–130nm, 1–6 holes/img, N={N})...")
 for i in tqdm(range(N), desc="Cylinder Holes", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     ctrs, rads, deps = cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=size)
@@ -534,11 +569,11 @@ save_plot('cylinder_hole_preview.png')
 
 list_trap_gndtruth_image = []
 
-N = 400
+N = 800
 
 print(f"Generating trapezoidal holes "
       f"(open={TRAP_OPEN_NM}nm, bot={TRAP_BOT_NM}nm, "
-      f"depth={TRAP_DEPTH_NM}nm, ±{int(TRAP_VARIATION*100)}%)...")
+      f"depth={TRAP_DEPTH_NM}nm, ±{int(TRAP_VARIATION*100)}%, N={N})...")
 for i in tqdm(range(N), desc="Trapezoid", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     centers, h_opens, h_bots, depths = trapezoid_randomizer(
@@ -587,14 +622,24 @@ true_cyl_hole_surf_stack = np.load(f'{OUTPUT_DIR}/true_cyl_hole_stack.npy').asty
 list_trap_dilated_image     = []
 list_cyl_hole_dilated_image = []
 
-print("Applying dilation to hole images...")
-for i in tqdm(range(400), desc="Dilation", unit="img",
+n_data = len(true_trap_surf_stack)   # 自動對齊實際生成數量
+print(f"Applying dilation + scan artifacts + noise to {n_data} images each...")
+for i in tqdm(range(n_data), desc="Dilation+Artifact", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     true_trap_surf     = true_trap_surf_stack[i, :, :]
     true_cyl_hole_surf = true_cyl_hole_surf_stack[i, :, :]
 
+    # Grey dilation（模擬 AFM 探針卷積）
     dilated_trap_surf     = scipy.ndimage.grey_dilation(true_trap_surf,     structure=tip_shape)
     dilated_cyl_hole_surf = scipy.ndimage.grey_dilation(true_cyl_hole_surf, structure=tip_shape)
+
+    # 加入真實掃描 artifact（只加到 X，GT 不變）
+    # ① 水平條紋（Z 漂移，50% 機率觸發）
+    dilated_trap_surf     = add_scan_line_artifacts(dilated_trap_surf)
+    dilated_cyl_hole_surf = add_scan_line_artifacts(dilated_cyl_hole_surf)
+    # ② 高斯雜訊（模擬熱雜訊 / 電子雜訊）
+    dilated_trap_surf     = add_gaussian_noise(dilated_trap_surf)
+    dilated_cyl_hole_surf = add_gaussian_noise(dilated_cyl_hole_surf)
 
     list_trap_dilated_image.append(dilated_trap_surf)
     list_cyl_hole_dilated_image.append(dilated_cyl_hole_surf)
@@ -625,10 +670,11 @@ save_plot('trap_dilation_check.png')
 # Load images and prepare training/testing datasets
 # ============================================================
 # 訓練資料全部為孔洞（凹洞）：
-#   X1 / y1 : 梯形孔 (trapezoid_hole)  400 張
-#   X2 / y2 : 圓柱孔 (cylinder_hole)   400 張
-#   共 800 張，train:test = 8:2 → train 640, test 160 per type
-#   合計 train 1280, test 320
+#   X1 / y1 : 梯形孔 (trapezoid_hole)  800 張
+#   X2 / y2 : 圓柱孔 (cylinder_hole)   800 張
+#   共 1600 張，train:test = 8:2 → train 1280, test 320 per type
+#   合計 train 2560, test 640
+#   X（dilated）含水平條紋 artifact（50%）+ 高斯雜訊，GT 不含
 
 dilated_images_path_trap     = f'{OUTPUT_DIR}/dilated_trap_stack.npy'
 true_images_path_trap        = f'{OUTPUT_DIR}/true_trap_stack.npy'
