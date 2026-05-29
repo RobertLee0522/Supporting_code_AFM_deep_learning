@@ -301,7 +301,71 @@ def detect_features(scan, shape_type, pct_lo, pct_hi, mn=5, mx=65536):
         n, len(ids),
     )
 
-def reconstruct(scan, geom, shape_type, meta, ap):
+def compute_tip(avg, gt_p, shape_type, half, geom, px_nm, manual_offset=0.0):
+    """從已配準(recenter)的 avg patch 計算探針形狀。
+
+    manual_offset 為「深度縮放」的手動調整（nm），用來讓 AFM 曲線探底：
+      manual_offset < 0 → 加深：以表面為支點向下拉伸 AFM 曲線，使其底部
+                          逼近/超過真實底線，重建出的 tip 也隨之變深變大。
+      manual_offset > 0 → 變淺：反向壓縮深度。
+      manual_offset = 0 → 不縮放（維持量測到的深度，等同原始重建結果）。
+
+    註：單純的剛性上下平移在形態學腐蝕中是無效的（平移不變），
+        因此這裡採用「深度縮放」才能真正改變 tip 形狀並使其探底。
+
+    對齊方式：孔洞型把表面(rim)對齊到 GT 表面(0)、柱體型把基底對齊到 GT 基底，
+    如此縮放時可在截面圖看到底部/頂部相對「真實底線」上下移動。
+
+    回傳 (tip_sym, avg_aligned, rim, bottom_depth)
+      bottom_depth: 縮放後 avg 特徵相對表面的深度(nm，正值)
+    """
+    is_hole = shape_type in ('cylinder_hole', 'trapezoid_hole')
+
+    # ── 深度縮放（以表面/基底為支點拉伸特徵深度，達成探底）──────────
+    avg_s = avg.copy()
+    extra = -manual_offset          # 下(負 offset) → extra>0 → 加深
+    if is_hole:
+        surf      = avg_s.max()                 # 孔洞表面(rim)
+        cur_depth = surf - avg_s.min()          # 量測深度(正)
+        target    = max(1e-6, cur_depth + extra)
+        if cur_depth > 1e-6:
+            avg_s = surf + (avg_s - surf) * (target / cur_depth)
+        bottom_depth = surf - avg_s.min()
+    else:
+        base      = avg_s.min()                 # 柱體基底
+        cur_h     = avg_s.max() - base          # 量測高度(正)
+        target    = max(1e-6, cur_h + extra)
+        if cur_h > 1e-6:
+            avg_s = base + (avg_s - base) * (target / cur_h)
+        bottom_depth = avg_s.max() - base
+
+    # ── 表面/基底對齊到 GT（縮放後底部/頂部即相對真實底線浮動）──────
+    if is_hole:
+        align_offset = gt_p.max() - avg_s.max()   # rim 對齊到 GT 表面(0)
+    else:
+        align_offset = gt_p.min() - avg_s.min()   # 基底對齊到 GT 基底
+    avg_aligned = avg_s + align_offset
+
+    # ── 形態學腐蝕重建（Villarrubia 算法，使用對齊後的 avg）───────
+    tip_morph = reconstruct_morphological(avg_aligned, gt_p, shape_type)
+
+    # ── 四向對稱化（旋轉對稱約束）──────────────────────────────
+    tip_sym = (tip_morph
+               + tip_morph[::-1, :]
+               + tip_morph[:, ::-1]
+               + tip_morph[::-1, ::-1]) / 4.0
+    tip_sym -= tip_sym.max()
+
+    # ── 徑向平均：強制完全旋轉對稱，消除 XY 殘差 ────────────────
+    tip_sym = radial_average(tip_sym, half)
+
+    # ── Rim 分析（不依賴孔底，低進入率仍有效）─────────────────
+    rim = analyze_rim(avg_aligned, geom, shape_type, half, px_nm)
+
+    return tip_sym, avg_aligned, rim, bottom_depth
+
+
+def reconstruct(scan, geom, shape_type, meta, ap, manual_offset=0.0):
     half   = ap['half']
     max_sz = ap['max_sz']
     # [FIX-3] 改用 is not None 避免 pct=0 被誤判為 falsy
@@ -358,31 +422,14 @@ def reconstruct(scan, geom, shape_type, meta, ap):
     avg, reg_dy, reg_dx = recenter_avg(avg, gt_p, shape_type)
     info += f'\n  2D配準偏移: dy={reg_dy}px dx={reg_dx}px'
 
-    # ── 底部對齊：avg 最低點與 GT 最低點齊平 ─────────────────────
-    # 物理假設：探針確實到達孔底，深度差異來自截面位置偏移而非真實誤差
-    # 對齊後相減，tip 主要反映孔洞側壁的幾何差異（更準確）
-    if shape_type in ('cylinder_hole', 'trapezoid_hole'):
-        depth_offset = gt_p.min() - avg.min()   # 負值：avg 比 GT 淺，往下移
-    else:
-        depth_offset = gt_p.max() - avg.max()   # 正值：avg 比 GT 矮，往上移
-    avg_aligned = avg + depth_offset
-    info += f'\n  底部對齊偏移: {depth_offset:+.1f}nm'
+    # ── 表面對齊 + 探針重建（manual_offset 可手動縮放深度探底）──────
+    tip_sym, avg_aligned, rim, bottom_depth = compute_tip(
+        avg, gt_p, shape_type, half, geom, meta['px_nm'], manual_offset)
+    true_depth = abs(geom.get('height', 0.0))
+    info += f'\n  量測特徵深度: {bottom_depth:.1f}nm (真實: {true_depth:.1f}nm)'
+    if manual_offset:
+        info += f'  [手動縮放 {-manual_offset:+.1f}nm]'
 
-    # ── 形態學腐蝕重建（Villarrubia 算法，使用對齊後的 avg）───────
-    tip_morph = reconstruct_morphological(avg_aligned, gt_p, shape_type)
-
-    # ── 四向對稱化（旋轉對稱約束）──────────────────────────────
-    tip_sym = (tip_morph
-               + tip_morph[::-1, :]
-               + tip_morph[:, ::-1]
-               + tip_morph[::-1, ::-1]) / 4.0
-    tip_sym -= tip_sym.max()
-
-    # ── 徑向平均：強制完全旋轉對稱，消除 XY 殘差 ────────────────
-    tip_sym = radial_average(tip_sym, half)
-
-    # ── Rim 分析（不依賴孔底，低進入率仍有效）─────────────────
-    rim = analyze_rim(avg_aligned, geom, shape_type, half, meta['px_nm'])
     entry_pct = rim['entry_rate'] * 100
     info += (f'\n  進入率: {entry_pct:.1f}%  '
              f'Rim寬: {rim["rim_width_nm"]:.1f}nm  '
@@ -390,8 +437,8 @@ def reconstruct(scan, geom, shape_type, meta, ap):
     if entry_pct < 50:
         info += f'\n  ⚠ 進入率<50%，孔底資訊不可靠，rim分析更準確'
 
-    # avg_aligned 傳回給顯示（讓 cross-section 顯示對齊後的藍線）
-    return tip_sym, avg_aligned, gt_p, len(patches), gt_al, info, rim
+    # 回傳 avg(配準後、未做底部對齊) 供 GUI 手動調整時快速重算（免重新偵測）
+    return tip_sym, avg_aligned, gt_p, len(patches), gt_al, info, rim, avg
 
 # ══════════════════════════════════════════════════════════════════
 # 2D 影像配準：把 avg patch 的孔洞中心對齊到 GT 中心
@@ -621,6 +668,12 @@ class App(tk.Tk):
         self.tip_R_v   = tk.StringVar(value='2')
         self.tip_angle_v = tk.StringVar(value='25')
 
+        # 手動調整 AFM 曲線深度（探底）用
+        self.offset_var      = tk.DoubleVar(value=0.0)
+        self.recon_ctx       = None    # 儲存重建中間結果，供手動調整快速重算
+        self._offset_job     = None    # 防抖動 after job id
+        self._suppress_offset = False  # 程式設定 offset 時抑制重算
+
         for v in (self.d_bot, self.d_top, self.height):
             v.trace_add('write', lambda *_: self.after(80, self._update_info))
 
@@ -750,6 +803,40 @@ class App(tk.Tk):
         self.tip_info_lbl.pack(anchor='w', padx=14, pady=(2, 0))
         for v in (self.tip_R_v, self.tip_angle_v):
             v.trace_add('write', lambda *_: self.after(80, self._update_tip_spec))
+        ttk.Separator(sb).pack(fill='x', padx=14)
+
+        # ⑥ 手動調整 AFM 曲線深度（探底）
+        self._sec(sb, '⑥ 手動調整 AFM 曲線（探底）')
+        tk.Label(sb, text=('  針尖比孔洞小時，按「▼ 下」加深藍色 AFM\n'
+                           '  曲線，使其底部探到紅色真實底線並接近平行，\n'
+                           '  探針還原結果會即時跟著變深變大'),
+                 bg=C['panel'], fg=C['muted'], font=self.FT['tiny'],
+                 justify='left').pack(anchor='w', padx=14)
+
+        of = tk.Frame(sb, bg=C['panel'])
+        of.pack(fill='x', padx=14, pady=(4, 2))
+        of.columnconfigure(1, weight=1)
+        self._btn(of, '▼ 下', lambda: self._nudge_offset(-1), small=True
+                  ).grid(row=0, column=0)
+        self.offset_scale = tk.Scale(
+            of, variable=self.offset_var, from_=-200, to=200, resolution=1,
+            orient='horizontal', bg=C['panel'], fg=C['text'],
+            troughcolor=C['input_bg'], highlightthickness=0, showvalue=False,
+            sliderrelief='flat', bd=0,
+            command=lambda _=None: self._on_offset_change())
+        self.offset_scale.grid(row=0, column=1, sticky='ew', padx=4)
+        self._btn(of, '▲ 上', lambda: self._nudge_offset(+1), small=True
+                  ).grid(row=0, column=2)
+
+        orow = tk.Frame(sb, bg=C['panel'])
+        orow.pack(fill='x', padx=14, pady=(0, 4))
+        orow.columnconfigure(0, weight=1)
+        self.offset_lbl = tk.Label(orow, text='原始 0 nm', bg=C['panel'],
+                                   fg=C['accent'], font=self.FT['small'],
+                                   anchor='w')
+        self.offset_lbl.grid(row=0, column=0, sticky='w')
+        self._btn(orow, '歸零', self._reset_offset, small=True
+                  ).grid(row=0, column=1)
 
         tk.Frame(sb, bg=C['panel'], height=8).pack()
         self._btn(sb, '▶  執行重建', self.run, big=True
@@ -857,6 +944,91 @@ class App(tk.Tk):
                 self.tip_info_lbl.config(text='')
         except Exception:
             pass
+
+    # ── 手動調整 AFM 曲線深度（探底）────────────────────────────────
+    def _nudge_offset(self, direction):
+        """以一個 pixel(若已知)或 1nm 為步距上下微調 AFM 曲線。"""
+        step = 1.0
+        if self.recon_ctx:
+            step = max(1.0, round(self.recon_ctx['px']))
+        try:
+            cur = float(self.offset_var.get())
+        except (ValueError, tk.TclError):
+            cur = 0.0
+        self.offset_var.set(round(cur + direction * step, 1))
+        # set() 會觸發 Scale 的 command → _on_offset_change
+
+    def _reset_offset(self):
+        self.offset_var.set(0.0)
+
+    def _on_offset_change(self, *_):
+        """偏移改變：更新標籤並防抖動排程重算（避免拖曳時卡頓）。"""
+        if self._suppress_offset:
+            return
+        try:
+            v = float(self.offset_var.get())
+        except (ValueError, tk.TclError):
+            v = 0.0
+        if hasattr(self, 'offset_lbl'):
+            tag = ('加深' if v < 0 else '變淺' if v > 0 else '原始')
+            self.offset_lbl.config(text=f'{tag} {abs(v):.0f} nm')
+        if self.recon_ctx is None:
+            return
+        if self._offset_job is not None:
+            self.after_cancel(self._offset_job)
+        self._offset_job = self.after(180, self._recompute_tip)
+
+    def _sync_offset_range(self):
+        """重建完成後，依特徵高度設定滑桿範圍並把偏移歸零。"""
+        self._suppress_offset = True
+        try:
+            h = float(self.height.get() or 0)
+        except (ValueError, tk.TclError):
+            h = 0.0
+        if h > 0 and hasattr(self, 'offset_scale'):
+            rng = max(50, int(round(h * 1.5)))
+            self.offset_scale.config(from_=-rng, to=rng)
+        self.offset_var.set(0.0)
+        if hasattr(self, 'offset_lbl'):
+            self.offset_lbl.config(text='原始 0 nm')
+        self._suppress_offset = False
+
+    def _recompute_tip(self):
+        """手動偏移改變後，只重算探針（不重新偵測特徵），即時更新顯示。"""
+        self._offset_job = None
+        ctx = self.recon_ctx
+        if not ctx or ctx.get('avg') is None:
+            return
+        try:
+            offset = float(self.offset_var.get())
+        except (ValueError, tk.TclError):
+            return
+
+        def worker():
+            try:
+                tip, avg_aligned, rim, auto_off = compute_tip(
+                    ctx['avg'], ctx['gt_p'], ctx['shape'], ctx['half'],
+                    ctx['geom'], ctx['px'], manual_offset=offset)
+                half = ctx['half']; px = ctx['px']
+                tip1d  = tip[half, :]
+                beyond = np.where(tip1d < tip.min() * 0.1)[0]
+                r_est  = ((beyond[-1] - beyond[0]) * px / 2
+                          if len(beyond) > 1 else float('nan'))
+                self.tip      = tip
+                self.tip_half = half
+                self.after(0, lambda: self._draw_result(
+                    tip, avg_aligned, ctx['gt_p'], ctx['gt_al'],
+                    ctx['geom'], ctx['shape'], ctx['n'], r_est, half, px, rim))
+                tag = ('加深' if offset < 0 else '變淺' if offset > 0 else '原始')
+                msg = (f'  {tag} {abs(offset):.0f}nm → tip深度 {abs(tip.min()):.1f}nm  '
+                       f'進入率 {rim["entry_rate"]*100:.1f}%')
+                if not np.isnan(r_est):
+                    msg += f'  半徑 {r_est:.1f}nm'
+                self._log_safe(msg)
+            except Exception as e:
+                self._log_safe(f'✗ 重算失敗: {e}')
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _main_area(self):
         m = tk.Frame(self, bg=C['bg'])
@@ -1049,6 +1221,7 @@ class App(tk.Tk):
                 _result = reconstruct(self.scan, geom, s, self.meta, ap)
                 tip, avg, gt_p, n, gt_al, info = _result[:6]
                 rim = _result[6] if len(_result) > 6 else None
+                avg_rc = _result[7] if len(_result) > 7 else None
                 # [FIX-2] 所有 self.log() 改用 thread-safe 版本
                 self._log_safe(info)
                 if tip is None:
@@ -1076,8 +1249,15 @@ class App(tk.Tk):
                     f'✓ {n}個特徵平均 | 量測高度:{feat_h:.1f}nm (GT:{geom["height"]}nm)')
                 if not np.isnan(r_est):
                     self._log_safe(f'  估算探針半徑:{r_est:.1f}nm')
+                # 儲存中間結果，供「⑥ 手動調整」即時重算（免重新偵測）
+                self.recon_ctx = {
+                    'avg': avg_rc, 'gt_p': gt_p, 'gt_al': gt_al,
+                    'n': n, 'half': ap['half'], 'px': px,
+                    'geom': geom, 'shape': s,
+                }
+                self.after(0, self._sync_offset_range)
                 self.after(0, lambda: self._draw_result(
-                    tip, avg, gt_p, gt_al, geom, s, n, r_est, ap['half'], px))
+                    tip, avg, gt_p, gt_al, geom, s, n, r_est, ap['half'], px, rim))
                 self.after(0, lambda: self.stats['特徵數'].config(text=str(n)))
             except Exception as e:
                 self._log_safe(f'✗ {e}')
@@ -1138,10 +1318,27 @@ class App(tk.Tk):
         ax4.axhline(half, color='w', ls='--', lw=0.5, alpha=0.4)
         ax4.axvline(half, color='w', ls='--', lw=0.5, alpha=0.4)
 
-        ax5 = self.fig.add_subplot(gs[1, 1]); da(ax5, 'Cross-section Profile')
+        try:
+            cur_offset = float(self.offset_var.get())
+        except (ValueError, tk.TclError):
+            cur_offset = 0.0
+        depth_tag = (f'加深 {-cur_offset:.0f}nm' if cur_offset < 0 else
+                     f'變淺 {cur_offset:.0f}nm' if cur_offset > 0 else '原始深度')
+        ax5 = self.fig.add_subplot(gs[1, 1])
+        da(ax5, f'Cross-section  ({depth_tag})')
         x_nm = (np.arange(2 * half) - half) * px
-        ax5.plot(x_nm, avg_d[half, :], color='#4f9cf9', lw=1.8, label='AFM feature')
+        # 直接畫 avg(=avg_aligned，含手動偏移)，與 GT 同一深度座標，
+        # 讓使用者看見藍線隨上下調整移動、是否與真實底線平行/探底
+        ax5.plot(x_nm, avg[half, :], color='#4f9cf9', lw=1.8,
+                 label='AFM feature (可深度調整)')
         ax5.plot(x_nm, gt_p[half, :],  color='#ef4444', lw=1.5, ls='--', label='GT ideal')
+        # 真實底線/頂線，方便判斷藍線是否探底並與之平行
+        if shape in ('cylinder_hole', 'trapezoid_hole'):
+            ref_line, ref_lbl = gt_p.min(), '真實底線'
+        else:
+            ref_line, ref_lbl = gt_p.max(), '真實頂線'
+        ax5.axhline(ref_line, color='#ef4444', ls=':', lw=1, alpha=0.5,
+                    label=ref_lbl)
         ax5.plot(x_nm, tip[half, :],   color='#22c55e', lw=2,   label='Tip (reconstructed)')
         try:
             R  = float(self.tip_R_v.get() or 0)
@@ -1157,7 +1354,7 @@ class App(tk.Tk):
         ax5.axvline(0, color=C['border'], ls=':', lw=1)
         ax5.set_xlabel('nm', color=C['muted'], fontsize=7)
         ax5.set_ylabel('nm', color=C['muted'], fontsize=7)
-        leg = ax5.legend(fontsize=7, facecolor=C['panel'], edgecolor=C['border'])
+        leg = ax5.legend(fontsize=6, facecolor=C['panel'], edgecolor=C['border'])
         [t.set_color(C['text']) for t in leg.get_texts()]
         ax5.grid(color=C['border'], alpha=0.5)
 
