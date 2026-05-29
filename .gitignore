@@ -13,6 +13,7 @@
 !install_tf_gpu.bat
 
 # Optional text-based references that are still lightweight.
+!CLAUDE.md
 !README.md
 !DETECT_README.md
 !GPU_SETUP_GUIDE.md

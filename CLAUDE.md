@@ -1,0 +1,239 @@
+# CLAUDE.md
+
+本檔案是給 Claude Code（及任何協作者）閱讀的專案說明書，描述
+**AFM 探針去卷積（Tip Deconvolution）系統**的整體邏輯、程式架構、
+電腦視覺與 AFM 專業原理，以及本倉庫的開發規範。
+
+> ⚠️ **第一條鐵則**：每次更新程式碼或結構，**都必須同步修改本 `CLAUDE.md`**
+> （至少在文末「變更紀錄 Changelog」追加一筆）。詳見 [§7 倉庫規範](#7-倉庫規範-repository-rules)。
+
+---
+
+## 1. 專案總覽 (Overview)
+
+本專案結合 **電腦視覺 (Computer Vision)** 與 **掃描探針顯微鏡 (AFM)** 物理，
+用 **卷積自編碼器 (Convolutional Autoencoder)** 對 AFM 掃描影像做
+**探針去卷積**，還原凹洞型樣品（梯形孔、圓柱孔）的真實幾何形貌。
+
+核心物理：AFM 影像是「真實表面」與「探針形狀」的 **灰階膨脹 (grey dilation)**
+卷積結果。有限曲率半徑的探針無法完全探入窄／深的孔洞，導致孔洞在影像中
+**變淺、變窄**。本系統的任務即是學習其 **逆運算（去卷積 / 腐蝕）**。
+
+```
+真實表面 (Ground Truth)  ──grey_dilation(⊕ tip)──▶  AFM 掃描影像 (變淺變窄)
+                          ◀──── 模型去卷積 (學習逆映射) ────
+```
+
+關鍵設計決策：**只用孔洞 (pit/hole) 資料訓練**。凸起特徵 dilation 後變寬、
+凹洞 dilation 後變淺變窄，兩者方向相反，混合訓練會讓模型混淆；本專案樣品
+為孔洞，故訓練資料全為孔洞。
+
+---
+
+## 2. 端到端工作流程 (Pipeline)
+
+```
+輸入：std.004 (Nanoscope AFM 原始檔)  +  01-500k.tif (SEM 影像，量幾何)
+  │
+  ▼  Step 1  afm_gui.py ........... GUI 盲探針重建 (Villarrubia) → tip.mat
+  │
+  ▼  Step 2  tip_correction.py .... 探針方向/對稱/尺寸校正 (可選) → *_corrected.mat
+  │
+  ▼  Step 3  Supporting_code_AFM_deep_learning.py
+  │          合成孔洞資料生成 + grey dilation + 訓練自編碼器
+  │          → runs/train{N}/weights/AFM_MAE_autoencoder.keras
+  │
+  ▼  Step 4  detect.py / batch_detect.py ... 對真實 AFM 掃描去卷積推論
+  │          → runs/train{N}/predictions/predict{M}/*.{npy,mat,png}
+  │
+  ▼  輔助    evaluate.py ........... 測試集評估 (MAE/RMSE/PSNR/SSIM)
+             check_image.py ....... 推論前輸入格式檢查
+```
+
+各步驟詳細指令與參數見 `README.md`、`DETECT_README.md`、`GPU_SETUP_GUIDE.md`、
+`OPTIMIZATION_SUMMARY.md`。
+
+---
+
+## 3. 程式架構與模組 (Architecture)
+
+| 檔案 | 角色 | 輸入 | 輸出 |
+|------|------|------|------|
+| `afm_gui.py` | Step 1：Tkinter GUI 盲探針重建 | `.000`–`.009` Nanoscope + SEM 幾何 | `tip_estimated.mat` + 報告 PNG |
+| `tip_correction.py` | Step 2：探針校正（置中/徑向平均/縮放） | `tip_estimated.mat` | `*_corrected.mat/.npy` + 診斷圖 |
+| `Supporting_code_AFM_deep_learning.py` | Step 3：合成資料 + 訓練 | （自動生成合成資料） | `runs/train{N}/weights/*.keras`, `metrics.txt`, `config.txt` |
+| `detect.py` | Step 4：單張推論 | 真實 AFM 掃描 | 去卷積結果 `.npy/.mat/.png` |
+| `batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
+| `evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
+| `check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
+
+### 3.1 `afm_gui.py`（盲探針重建 GUI）
+- `parse_nanoscope()` / `read_channel()`：解析 Nanoscope 二進位標頭，
+  讀取高度通道，套用 Z-scale（`raw × z_lsb × z_sensitivity → nm`）。
+- `flatten_rows()`：逐列一階多項式去傾斜；孔洞型以 percentile(95) 為基線。
+- `make_gt()` / `make_gt_patch()`：依 SEM 幾何向量化生成理想孔洞 GT。
+- `reconstruct()`：偵測特徵 → 收集 patch → 平均 → 2D 配準 → 深度對齊 →
+  形態學腐蝕 (`compute_tip`)。
+- `compute_tip()`：**核心**。表面/基底對齊 GT 後做 Villarrubia 形態學腐蝕
+  (`grey_erosion`)，再四向對稱化 + 徑向平均強制旋轉對稱。支援
+  `manual_offset` 以 **深度縮放** 手動調整 AFM 曲線探底（見 Changelog）。
+- `reconstruct_morphological()`：`tip = scan ⊖ surface`（孔洞先反轉再腐蝕）。
+- `analyze_rim()`：從孔緣過渡帶估算探針有效半徑、錐角、進入率（進入率低時
+  比孔底資訊更可靠）。
+- `App`（Tkinter）：側欄參數輸入 + 6 格 matplotlib 結果圖（AFM/GT/平均特徵/
+  Tip 形狀/Cross-section/Rim 或 3D）。
+
+### 3.2 `Supporting_code_AFM_deep_learning.py`（訓練核心）
+- 合成 GT：`trapezoid_hole_creator/randomizer`（Chebyshev 距離梯形截錐孔）、
+  `cylinder_hole_creator/randomizer`（Euclidean 距離圓柱孔）。
+- 合成探針：`make_training_tip()` 拋物面 `z(r) = -r²/(2R)`，頂點=0。
+- 物理模擬：`scipy.ndimage.grey_dilation(surface, structure=tip)` 產生「膨脹影像」。
+- 真實感：`add_scan_line_artifacts()`（橫向掃描條紋）+ `add_gaussian_noise()`。
+- 正規化：全域 min/max（`NORM_MIN=-155`, `NORM_MAX=+105`）→ 背景 0nm 映射到
+  ~0.597（非零），避免模型學到「全輸出 0」的偷懶解。
+- 指標：`calculate_metrics()`（MAE/MSE/RMSE/PSNR/SSIM/像素準確率）。
+- `TrainingProgressCallback`：每 epoch loss/ETA 顯示。
+
+### 3.3 推論與評估
+- `detect.py`：支援 Nanoscope 原生格式與一般影像；resize 至 128×128、
+  正規化、推論、反正規化回 nm；Z-range 保護（超過訓練範圍 10× 自動縮放）；
+  YOLO 風格自動遞增輸出目錄。
+- `tip_correction.py`：`center_apex` → `radial_average` → `resize`（預設 55×55），
+  強制旋轉對稱並標準化頂點為 0。
+
+---
+
+## 4. 神經網路架構 (Model)
+
+卷積自編碼器（`keras.Sequential`），輸入/輸出皆 `(128, 128, 1)`：
+
+```
+Encoder:  Conv2D(4)  → MaxPool → Conv2D(8)  → MaxPool
+          → Conv2D(16) → MaxPool → Conv2D(32) → MaxPool      (3×3, ReLU, HeNormal, same)
+Decoder:  Conv2DT(32) → Conv2DT(16) → Conv2DT(8) → Conv2DT(4) (4×4, stride2, ReLU)
+          → Conv2DT(1, 3×3, Sigmoid)                          (輸出 [0,1])
+```
+
+| 超參數 | 值 | 理由 |
+|--------|----|----|
+| Optimizer | Adam(lr=3e-4) | 配合 [0,1] 正規化範圍，較預設 1e-3 穩定 |
+| Loss | MAE | 對離群值穩健，且 nm 誤差有直接物理意義 |
+| Epochs / Batch | 2000 / 32 | 收斂所需，監控 loss 曲線 |
+| 輸出激活 | Sigmoid | 對應 [0,1] 正規化輸出 |
+| 資料量 | 梯形孔+圓柱孔，train:test ≈ 8:2 | 幾何多樣性提升泛化 |
+
+---
+
+## 5. 電腦視覺 / AFM 專業要點 (CV & AFM Notes)
+
+- **Grey Dilation/Erosion 對偶**：AFM 成像 = 表面 ⊕ 探針（膨脹）；
+  盲探針重建 = 掃描 ⊖ 表面（腐蝕，Villarrubia 1997）。
+- **平移不變性陷阱**：形態學腐蝕對輸入的剛性垂直平移不變
+  （`output += c` 後正規化抵消），因此「上下平移曲線」不會改變還原的 tip
+  形狀；要改變 tip 必須改變曲線相對 GT 的 **形狀**（深度縮放）。
+- **進入率 (Entry Rate)**：探針進入孔洞的深度比例；< 50% 時孔底資訊不可靠，
+  改用 Rim 分析（孔緣過渡帶）。交叉驗證：`壁角 = arctan((開口-底部)/(2×深度))`。
+- **正規化避免退化解**：把「背景=0」這個特殊值消除，否則模型會輸出全零。
+- **旋轉對稱假設**：tip 校正以徑向平均強制旋轉對稱，屬有損處理；合成訓練
+  探針本就對稱故無影響。
+- **單位一致性**：訓練與推論的 `NORM_MIN/NORM_MAX`、px↔nm 換算必須一致，
+  否則預測尺度錯誤。
+- **評估指標解讀**：SSIM>0.85 良好、MAE<5nm 優秀；並檢查 dilation check 圖
+  確認孔洞在膨脹後確實變淺/變窄。
+
+---
+
+## 6. 環境與依賴 (Environment)
+
+```bash
+pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow scikit-image scikit-learn ...
+```
+- Python 3.8+（建議 3.9–3.10）；GPU 可選（見 `GPU_SETUP_GUIDE.md`）。
+- `afm_gui.py` 需 Tkinter（`matplotlib` 用 `TkAgg`）。
+- **無頭測試**：以 `matplotlib.use('Agg')` 在無顯示環境驗證數值與繪圖邏輯。
+
+---
+
+## 7. 倉庫規範 (Repository Rules)
+
+這些規則由 `.gitignore` 強制，協作時也務必遵守：
+
+1. **不提交照片／圖片**：`*.png/.jpg/.tif/.pdf` 等與 `img/`、`runs/`、`結果/`、
+   `分析/` 目錄一律 **不上傳**。只版控 **程式碼與輕量文字檔**
+   （`*.py`、`*.md`、`requirements.txt`、`*.bat`）。
+2. **不上傳大型檔案**：模型權重 `*.keras/.h5/.weights`、資料 `*.npy/.mat`、
+   `*.zip/.7z/.tar.gz`、`*.ipynb` 等大檔 **不上傳**。
+3. **不上傳產生物 / 暫存**：`__pycache__/`、`*.log/.tmp`、`.vscode/`、`.idea/`、
+   `.DS_Store` 等。
+4. **每次更新都要改本檔**：任何程式碼、架構、參數或行為變更，**必須**同步
+   更新本 `CLAUDE.md`（對應章節 + 文末 Changelog 追加一筆）。送交前自我檢查：
+   「這次改動是否已反映在 CLAUDE.md？」
+5. **內容專業性**：文件與註解須符合 **電腦視覺與 AFM 專業**，正確使用
+   dilation/erosion、去卷積、進入率、SSIM/PSNR 等術語。
+6. **新增需上傳的檔案類型**：若確有必要版控新類型（如某小型參數檔），
+   先在 `.gitignore` 以 `!pattern` 明確白名單，並於此說明。
+
+> 提交前快速檢查：`git status` 不應出現任何圖片／權重／資料大檔；
+> 若出現代表 `.gitignore` 需補規則。
+
+---
+
+## 8. 程式開發能力與規範 (Coding Skills & Conventions)
+
+> 本節整合「寫程式碼能力 (skill)」準則，並針對本 CV/AFM 倉庫特化。
+> 開發者與 Claude Code 在本專案改動程式碼時應遵循。
+
+### 8.1 通用工程準則
+- **融入既有風格**：新程式碼的命名、註解密度、慣用法要與周圍程式碼一致
+  （本倉庫慣用中文註解 + `[FIX-n]` 標記修正、區塊以 `── ... ──` 分隔）。
+- **最小且聚焦的改動**：只動需要動的部分；不順手大改無關區域。
+- **可逆與安全**：刪除／覆寫前先確認目標內容；破壞性或對外動作先確認。
+- **忠實回報**：測試失敗就說失敗並附輸出；跳過的步驟要講明。
+- **善用專用工具**：讀寫檔案用編輯工具而非 `cat/sed`；搜尋用對應工具。
+- **平行化**：彼此獨立的查詢／工具呼叫一次發出以加速。
+
+### 8.2 本專案特化準則
+- **NumPy 向量化**：避免雙層 Python 迴圈（如 `make_gt` 用 `np.indices` + modulo
+  向量化）；大卷積用 `fftconvolve` 取代 `correlate2d`。
+- **物理假設寫進註解**：對齊方式、基線百分位、正規化常數、px↔nm 換算等
+  都要註明來源與理由（如 SEM 量得、避免退化解）。
+- **保持單位一致**：任何涉及 `NORM_MIN/MAX`、`px_nm`、Z-sensitivity 的改動，
+  必須同步檢查訓練端與推論端，避免尺度不一致。
+- **形態學運算要小心平移不變性**：改動 tip 重建前，先想清楚運算對平移/縮放
+  的響應（見 §5）。
+- **無頭可測**：數值與繪圖邏輯應能以 `matplotlib.use('Agg')`（或 `xvfb-run`
+  跑 Tkinter）在無 GUI 環境驗證；提交前至少 `python -m py_compile` 與一次
+  端到端煙霧測試。
+- **GUI 執行緒安全**：Tkinter widget 只能在主執行緒操作；背景工作用
+  `self.after(...)` 排程回主執行緒（見 `_log_safe`、`_recompute_tip`）。
+- **輸出目錄慣例**：沿用 YOLO 風格 `runs/train{N}` / `predict{M}` 自動遞增，
+  不要覆寫既有結果。
+
+### 8.3 提交流程 (Definition of Done)
+1. `python -m py_compile <changed>.py` 通過。
+2. 影響數值/重建邏輯時，跑一次合成資料端到端驗證（如 `compute_tip`、
+   `reconstruct`）。
+3. **更新 `CLAUDE.md`**（章節 + Changelog）。
+4. `git status` 確認無圖片/權重/資料大檔被加入。
+5. commit 訊息清楚描述「動機 + 做法」；推送到指定分支。
+
+---
+
+## 9. 變更紀錄 (Changelog)
+
+> 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-05-29 — `afm_gui.py`：AFM 曲線手動深度調整（探底）**
+  - 在「還原 tip.mat」結果頁新增側欄「⑥ 手動調整 AFM 曲線（探底）」
+    滑桿 + 上下微調 + 歸零，可即時（防抖動 + 背景執行緒）重算並更新探針
+    還原結果，免重新偵測特徵。
+  - Cross-section 以真實深度座標繪製可調整的藍色 AFM 曲線，並加上紅色
+    「真實底線/頂線」參考，方便判斷是否探底並與底線平行。
+  - 因形態學腐蝕對剛性平移不變（§5），採 **深度縮放**：以表面為支點拉伸
+    AFM 曲線深度，使其底部逼近真實底線，重建 tip 才會真正變深變大、達成
+    探底。實作：抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()`
+    額外回傳配準後 avg 供快速重算；量測深度改以表面對齊回報。
+
+- **2026-05-29 — 新增本 `CLAUDE.md`**
+  - 建立專案邏輯敘述、程式架構、CV/AFM 專業要點、倉庫規範（不提交照片、
+    不上傳大檔、每次更新需改本檔）與程式開發能力規範（整合 skill 準則）。
