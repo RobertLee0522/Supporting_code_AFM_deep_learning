@@ -223,16 +223,22 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
-- **2026-05-29 — `afm_gui.py`：AFM 曲線手動深度調整（探底）**
-  - 在「還原 tip.mat」結果頁新增側欄「⑥ 手動調整 AFM 曲線（探底）」
-    滑桿 + 上下微調 + 歸零，可即時（防抖動 + 背景執行緒）重算並更新探針
-    還原結果，免重新偵測特徵。
-  - Cross-section 以真實深度座標繪製可調整的藍色 AFM 曲線，並加上紅色
-    「真實底線/頂線」參考，方便判斷是否探底並與底線平行。
-  - 因形態學腐蝕對剛性平移不變（§5），採 **深度縮放**：以表面為支點拉伸
-    AFM 曲線深度，使其底部逼近真實底線，重建 tip 才會真正變深變大、達成
-    探底。實作：抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()`
-    額外回傳配準後 avg 供快速重算；量測深度改以表面對齊回報。
+- **2026-06-01 — `afm_gui.py`：移除 AFM 曲線深度縮放前處理、修正中文顯示與按鈕**
+  - `compute_tip()` 移除深度縮放（`extra/target` 拉伸）與自動底部對齊前處理；
+    改為只做最小表面對齊（`gt_p.max() − avg.max()`，通常≈0），保留量測到的
+    真實深度，不再對 AFM feature 做任何形狀改變。
+  - `manual_offset` 改為純視覺平移（`avg_display = avg_aligned + offset`），
+    cross-section 藍線上下移動方便目視判斷進入率，tip 計算不受影響。
+  - 修正 Matplotlib CJK 字型：在 `matplotlib.use('TkAgg')` 後立即設定
+    `font.sans-serif` 候選清單（JhengHei / PingFang TC / Noto Sans CJK TC），
+    解決圖中中文顯示亂碼問題。
+  - 修正「▼ 下 / ▲ 上」按鈕無反應：`tk.Scale.set()` 不觸發 `command` callback，
+    改為在 `_nudge_offset()` 與 `_reset_offset()` 結尾明確呼叫 `_on_offset_change()`。
+
+- **2026-05-29 — `afm_gui.py`：AFM 曲線手動調整功能初版**
+  - 側欄新增「⑥ 手動調整 AFM 曲線」滑桿 + 上下微調 + 歸零；
+    抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()` 額外回傳
+    配準後 avg 供快速重算（免重新偵測特徵）。
 
 - **2026-05-29 — 新增本 `CLAUDE.md`**
   - 建立專案邏輯敘述、程式架構、CV/AFM 專業要點、倉庫規範（不提交照片、
