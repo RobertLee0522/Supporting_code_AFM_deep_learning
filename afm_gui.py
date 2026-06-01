@@ -832,6 +832,8 @@ class App(tk.Tk):
                   ).pack(fill='x', padx=14, pady=3)
         self._btn(sb, '💾  儲存 tip.mat', self.save, color=C['success']
                   ).pack(fill='x', padx=14, pady=3)
+        self._btn(sb, '🟠  儲存 Cone 為 tip.mat', self.save_cone, color=C['warn']
+                  ).pack(fill='x', padx=14, pady=3)
         self._btn(sb, '🖼  儲存圖片', self.save_figure, color=C['accent2']
                   ).pack(fill='x', padx=14, pady=3)
 
@@ -1450,6 +1452,72 @@ class App(tk.Tk):
             self.fig.savefig(png, dpi=150, facecolor=C['bg'], bbox_inches='tight')
             self.log(f'✓ {os.path.basename(p)} + report PNG')
             messagebox.showinfo('完成', f'已儲存：\n{p}\n\n報告：\n{png}')
+        except Exception as e:
+            messagebox.showerror('失敗', str(e))
+            self.log(f'✗ {e}')
+
+    # ── 廠商 cone 探針：用 ⑤ 的 R/θ 直接生成完整錐形探針並存成 tip.mat ──
+    def _current_cone_tip(self):
+        """依側欄 ⑤ 的 R/θ 生成 cone 探針陣列（頂點=0、旋轉對稱）。
+
+        回傳 (cone, half, px, R, theta)；R/θ 無效時回傳 (None, ...)。
+        cone 尺寸沿用重建時的 half（若尚未重建則用 auto_params 推算），
+        與重建 tip 同 px_nm、同陣列慣例，可直接餵給訓練 pipeline。
+        """
+        if self.meta is None:
+            return None, None, None, None, None
+        try:
+            R     = float(self.tip_R_v.get() or 0)
+            theta = float(self.tip_angle_v.get() or 0)
+        except ValueError:
+            return None, None, None, None, None
+        if R <= 0 or theta <= 0:
+            return None, None, None, None, None
+        px   = self.meta['px_nm']
+        half = self.tip_half
+        if half is None:                       # 尚未重建 → 用幾何自動推算 half
+            geom = self._get_geom()
+            half = auto_params(geom, self.shape_var.get(), self.meta)['half']
+        cone = make_cone_tip(half, px, R, theta)   # 頂點=0、向外為負、旋轉對稱
+        return cone, half, px, R, theta
+
+    def save_cone(self):
+        """把廠商 cone 模型存成 tip.mat（保留重建功能，另存一份 cone 探針）。"""
+        cone, half, px, R, theta = self._current_cone_tip()
+        if cone is None:
+            messagebox.showwarning(
+                '提示',
+                '請先載入 AFM 檔並在「⑤ 探針廠商規格」填入\n'
+                '有效的 尖端半徑 R 與 半錐角 θ（皆 > 0）')
+            return
+        p = filedialog.asksaveasfilename(
+            title='儲存 Cone tip.mat', defaultextension='.mat',
+            initialfile=f'tip_cone_R{R:.0f}_th{theta:.0f}.mat',
+            filetypes=[('MATLAB', '*.mat'), ('All', '*.*')])
+        if not p: return
+        try:
+            geom = self.geom if self.geom else self._get_geom()
+            savemat(p, {
+                'tip':          cone,
+                'px_nm':        px,
+                'tip_source':   'vendor_cone',
+                'cone_R_nm':    R,
+                'cone_theta_deg': theta,
+                'shape_type':   self.shape_type or self.shape_var.get(),
+                'd_bot_nm':     geom['d_bot'],
+                'd_top_nm':     geom['d_top'],
+                'height_nm':    geom['height'],
+                'pitch_nm':     geom['pitch'],
+                'scan_size_nm': self.meta['scan_nm'],
+                'n_px':         self.meta['n_px'],
+                'patch_half_px': half,
+            })
+            self.log(f'✓ Cone tip 已儲存：{os.path.basename(p)} '
+                     f'(R={R:.0f}nm θ={theta:.0f}° half={half}px)')
+            messagebox.showinfo(
+                '完成',
+                f'已儲存廠商 cone 探針：\n{p}\n\n'
+                f'R={R:.1f}nm  θ={theta:.1f}°  尺寸={2*half}×{2*half}px')
         except Exception as e:
             messagebox.showerror('失敗', str(e))
             self.log(f'✗ {e}')

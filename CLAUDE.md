@@ -223,6 +223,17 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-01 — `afm_gui.py`：新增「廠商 cone 當 tip」輸出（保留原重建功能）**
+  - 側欄新增「🟠 儲存 Cone 為 tip.mat」按鈕；用 ⑤ 的 R/θ 經 `make_cone_tip()`
+    生成完整錐形探針（球冠頂端 + 錐形側壁，頂點=0、旋轉對稱），存成 tip.mat。
+  - 新增 `_current_cone_tip()`（沿用重建 half，未重建時用 `auto_params` 推算）
+    與 `save_cone()`（含 `tip_source='vendor_cone'`、`cone_R_nm/θ` metadata），
+    格式與重建 tip 一致，可直接餵訓練 pipeline 的 `load_and_prepare_tip`。
+  - 動機（CV/AFM）：寬孔只能 characterize 探針「實際接觸」的頂端區段，無法
+    還原細長探針的完整深度（探針一插到底、側壁未碰孔壁）；若訓練需要一支
+    完整深長探針做 dilation，直接採用廠商 cone 規格較合適。重建 tip 與 cone
+    並存，使用者自行取捨。
+
 - **2026-06-01 — `afm_gui.py`：移除 AFM 曲線深度縮放前處理、修正中文顯示與按鈕**
   - `compute_tip()` 移除深度縮放（`extra/target` 拉伸）與自動底部對齊前處理；
     改為只做最小表面對齊（`gt_p.max() − avg.max()`，通常≈0），保留量測到的
