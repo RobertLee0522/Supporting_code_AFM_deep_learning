@@ -18,8 +18,31 @@ from scipy.ndimage import zoom
 
 # 設定參數
 OUTPUT_DIR = 'img'
-MODEL_PATH = os.path.join(OUTPUT_DIR, 'AFM_MAE_autoencoder.keras')
 TARGET_SIZE = (128, 128)
+
+
+def find_latest_model():
+    """
+    在 runs/train{N}/weights/ 中找到編號最大的已訓練模型。
+    找不到時回傳 None（交由 argparse 預設值處理）。
+    """
+    runs_dir = 'runs'
+    if not os.path.exists(runs_dir):
+        return None
+    best_idx, best_path = -1, None
+    for d in os.listdir(runs_dir):
+        m = re.match(r'^train(\d+)$', d)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        candidate = os.path.join(runs_dir, d, 'weights',
+                                 'AFM_MAE_autoencoder.keras')
+        if os.path.exists(candidate) and idx > best_idx:
+            best_idx, best_path = idx, candidate
+    return best_path
+
+
+MODEL_PATH = find_latest_model() or os.path.join(OUTPUT_DIR, 'AFM_MAE_autoencoder.keras')
 
 # ---- 全域正規化常數（必須與訓練時完全相同）-----------------------
 # 訓練腳本中設定：NORM_MIN=-155 nm, NORM_MAX=+105 nm

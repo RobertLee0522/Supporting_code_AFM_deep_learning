@@ -332,6 +332,86 @@ def load_and_prepare_tip(mat_path, key='tip', target_size=TARGET_TIP_SIZE):
     return tip_out
 
 
+def load_tip_for_training(mat_path, training_px_nm=SURFACE_SCALE_NM, max_tip_px=21):
+    """
+    tip.mat → 重採樣至訓練影像像素尺度 training_px_nm，供 grey_dilation 使用。
+
+    訓練影像尺度 (SURFACE_SCALE_NM=39.1 nm/px) 通常與 AFM 掃描尺度不同
+    （典型掃描：5000nm/256px ≈ 19.5 nm/px）。需先縮放使物理尺寸一致，
+    再裁剪至 max_tip_px 以兼顧效率。
+
+    Steps:
+      1. 頂端置中 + max=0
+      2. 徑向平均 → 旋轉對稱
+      3. zoom = tip_px_nm / training_px_nm（物理尺寸不變，像素數縮放）
+      4. 裁剪至 max_tip_px × max_tip_px（奇數）
+    """
+    mat = io.loadmat(mat_path)
+
+    # 讀取探針陣列（支援 'tip' 與 'tip_estimated' 兩種鍵名）
+    raw = None
+    for k in ('tip', 'tip_estimated'):
+        if k in mat:
+            raw = np.array(mat[k]).astype(np.float64)
+            break
+    if raw is None:
+        user_keys = [k for k in mat if not k.startswith('_')]
+        raise KeyError(f"tip.mat 中找不到 'tip'/'tip_estimated'，現有鍵：{user_keys}")
+
+    # 讀取來源像素尺度（afm_gui.py 儲存 tip 時會附帶 px_nm）
+    if 'px_nm' in mat:
+        tip_px_nm = float(np.array(mat['px_nm']).flat[0])
+    else:
+        tip_px_nm = 5000.0 / 256.0   # 預設：5000nm 掃描 / 256px ≈ 19.53 nm/px
+        print(f"  [tip] px_nm 未記錄，假設預設值 {tip_px_nm:.2f} nm/px")
+
+    # Step 1: 頂端置中
+    max_idx = np.unravel_index(raw.argmax(), raw.shape)
+    cy, cx  = raw.shape[0] // 2, raw.shape[1] // 2
+    centered = ndimage.shift(raw, [cy - max_idx[0], cx - max_idx[1]], mode='nearest')
+    centered -= centered.max()
+
+    # Step 2: 徑向平均 → 旋轉對稱
+    ny, nx = centered.shape
+    cy2, cx2 = ny // 2, nx // 2
+    y_idx, x_idx = np.indices((ny, nx))
+    r_map = np.round(np.sqrt((y_idx - cy2)**2 + (x_idx - cx2)**2)).astype(int)
+    radial = np.zeros_like(centered)
+    for ri in range(r_map.max() + 1):
+        mask = r_map == ri
+        if mask.any():
+            radial[mask] = centered[mask].mean()
+    radial -= radial.max()
+
+    # Step 3: 縮放至訓練像素尺度
+    #   zoom_factor = tip_px_nm / training_px_nm
+    #   物理尺寸保持不變；每 px 代表更大物理距離時陣列縮小
+    zoom_factor = tip_px_nm / training_px_nm
+    scaled = ndimage.zoom(radial, zoom_factor, order=3)
+    scaled -= scaled.max()
+
+    # Step 4: 裁剪至 max_tip_px（保持奇數、以頂端為中心）
+    h, w = scaled.shape
+    if h > max_tip_px or w > max_tip_px:
+        cy_s = scaled.shape[0] // 2
+        cx_s = scaled.shape[1] // 2
+        half  = max_tip_px // 2
+        scaled = scaled[cy_s - half : cy_s + half + 1,
+                        cx_s - half : cx_s + half + 1]
+        scaled -= scaled.max()
+
+    # 確保奇數尺寸（ndimage.zoom 可能產生偶數）
+    if scaled.shape[0] % 2 == 0:
+        scaled = scaled[:-1, :]
+    if scaled.shape[1] % 2 == 0:
+        scaled = scaled[:, :-1]
+
+    print(f"  [tip] 來源: {mat_path}  (tip_px_nm={tip_px_nm:.2f})")
+    print(f"  重採樣: {raw.shape} → {scaled.shape} @ {training_px_nm} nm/px")
+    print(f"  深度範圍: [{scaled.min():.1f}, {scaled.max():.1f}] nm")
+    return scaled
+
+
 # Custom callback for training progress bar and metrics display
 class TrainingProgressCallback(Callback):
     """Custom callback to display training progress bar and metrics per epoch."""
@@ -530,8 +610,8 @@ def add_gaussian_noise(img, sigma_nm=None):
     return img + np.random.normal(0, sigma_nm, img.shape).astype(np.float32)
 
 
-# ---- 圓柱孔 N=800 ---------------------------------------------------
-N = 800
+# ---- 圓柱孔 N=1200 --------------------------------------------------
+N = 1200
 list_cyl_hole_images = []
 
 print(f"Generating cylinder holes (r=1.5–8px={1.5*SURFACE_SCALE_NM:.0f}–{8*SURFACE_SCALE_NM:.0f}nm, "
@@ -569,7 +649,7 @@ save_plot('cylinder_hole_preview.png')
 
 list_trap_gndtruth_image = []
 
-N = 800
+N = 1200
 
 print(f"Generating trapezoidal holes "
       f"(open={TRAP_OPEN_NM}nm, bot={TRAP_BOT_NM}nm, "
@@ -606,13 +686,37 @@ save_plot('trapezoid_preview.png')
 #   這正確模擬 AFM 探針無法完全進入孔洞的物理現象
 # ============================================================
 
-print("建立訓練用合成探針（拋物線，R=73nm）...")
-tip_shape = make_training_tip()
+# 優先載入真實 tip.mat（探針形狀與實際掃描一致，去卷積更準確）
+# 若不存在則退回合成拋物線探針
+TIP_MAT_CANDIDATES = [
+    'tip.mat/tip_estimated_corrected.mat',   # 校正後（優先）
+    'tip.mat/tip_estimated.mat',             # 未校正
+    'tip.mat',                               # 通用名稱
+]
+tip_shape  = None
+tip_source = 'synthetic_paraboloid'
+for _tp in TIP_MAT_CANDIDATES:
+    if os.path.exists(_tp):
+        try:
+            tip_shape  = load_tip_for_training(_tp)
+            tip_source = _tp
+            print(f"  [探針] 使用真實探針：{_tp}  "
+                  f"({tip_shape.shape[0]}×{tip_shape.shape[1]} px)")
+            break
+        except Exception as _e:
+            print(f"  [警告] 載入 {_tp} 失敗：{_e}，嘗試下一候選")
+
+if tip_shape is None:
+    print("建立訓練用合成探針（拋物線，R=73nm）...")
+    tip_shape  = make_training_tip()
+    tip_source = 'synthetic_paraboloid'
+
+_tip_label = (os.path.basename(tip_source) if tip_source != 'synthetic_paraboloid'
+              else f'Paraboloid R={TIP_RADIUS_NM}nm')
 plt.figure()
 plt.imshow(tip_shape, cmap='viridis')
 plt.colorbar()
-plt.title(f"Training Tip — Paraboloid  R={TIP_RADIUS_NM} nm  "
-          f"{TIP_TRAIN_SIZE}×{TIP_TRAIN_SIZE} px")
+plt.title(f"Training Tip — {_tip_label}  {tip_shape.shape[0]}×{tip_shape.shape[1]} px")
 save_plot('tip_shape.png')
 
 # 載入兩種孔洞 ground-truth
@@ -670,10 +774,10 @@ save_plot('trap_dilation_check.png')
 # Load images and prepare training/testing datasets
 # ============================================================
 # 訓練資料全部為孔洞（凹洞）：
-#   X1 / y1 : 梯形孔 (trapezoid_hole)  800 張
-#   X2 / y2 : 圓柱孔 (cylinder_hole)   800 張
-#   共 1600 張，train:test = 8:2 → train 1280, test 320 per type
-#   合計 train 2560, test 640
+#   X1 / y1 : 梯形孔 (trapezoid_hole)  1200 張
+#   X2 / y2 : 圓柱孔 (cylinder_hole)   1200 張
+#   共 2400 張，train:test = 8:2 → 各 960 train / 240 test
+#   合計 train 1920, test 480
 #   X（dilated）含水平條紋 artifact（50%）+ 高斯雜訊，GT 不含
 
 dilated_images_path_trap     = f'{OUTPUT_DIR}/dilated_trap_stack.npy'
@@ -1132,19 +1236,26 @@ print(f"  [摘要] {metrics_path}")
 
 # config.txt  — 記錄探針與曲面設定
 config_path = os.path.join(RUN_DIR, 'config.txt')
-_edge_nm     = TIP_TRAIN_SIZE // 2 * SURFACE_SCALE_NM
-_edge_depth  = -(_edge_nm ** 2) / (2.0 * TIP_RADIUS_NM)
 with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"[訓練探針設定]\n")
-    f.write(f"  類型             : 合成拋物線探針 (Paraboloid)\n")
-    f.write(f"  TIP_RADIUS_NM    : {TIP_RADIUS_NM} nm\n")
-    f.write(f"  TIP_TRAIN_SIZE   : {TIP_TRAIN_SIZE} px\n")
-    f.write(f"  邊緣深度          : {_edge_depth:.1f} nm\n")
-    f.write(f"  粒子高度上限      : < {abs(_edge_depth):.0f} nm（不飽和條件）\n\n")
+    if tip_source == 'synthetic_paraboloid':
+        _edge_nm    = TIP_TRAIN_SIZE // 2 * SURFACE_SCALE_NM
+        _edge_depth = -(_edge_nm ** 2) / (2.0 * TIP_RADIUS_NM)
+        f.write(f"  類型             : 合成拋物線探針 (Paraboloid)\n")
+        f.write(f"  TIP_RADIUS_NM    : {TIP_RADIUS_NM} nm\n")
+        f.write(f"  TIP_TRAIN_SIZE   : {TIP_TRAIN_SIZE} px\n")
+        f.write(f"  邊緣深度          : {_edge_depth:.1f} nm\n")
+        f.write(f"  粒子高度上限      : < {abs(_edge_depth):.0f} nm（不飽和條件）\n\n")
+    else:
+        f.write(f"  類型             : 真實量測探針 (tip.mat)\n")
+        f.write(f"  來源檔案         : {tip_source}\n")
+        f.write(f"  訓練尺寸         : {tip_shape.shape[0]}×{tip_shape.shape[1]} px "
+                f"@ {SURFACE_SCALE_NM} nm/px\n")
+        f.write(f"  深度範圍         : [{tip_shape.min():.1f}, {tip_shape.max():.1f}] nm\n\n")
     f.write(f"[訓練策略]\n")
     f.write(f"  樣品類型         : 全凹洞（移除突起粒子，突起與孔洞物理行為相反）\n")
-    f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  400 張\n")
-    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   400 張\n")
+    f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  {N} 張\n")
+    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N} 張\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
     f.write(f"\n[梯形孔樣品設定（用戶真實樣品）]\n")
     f.write(f"  開口寬度  : {TRAP_OPEN_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")

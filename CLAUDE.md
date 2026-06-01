@@ -251,6 +251,20 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
     抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()` 額外回傳
     配準後 avg 供快速重算（免重新偵測特徵）。
 
+- **2026-06-01 — `Supporting_code_AFM_deep_learning.py` + `detect.py`：使用真實 tip.mat 訓練、增量資料、修正模型路徑自動偵測**
+  - **新增 `load_tip_for_training(mat_path, training_px_nm, max_tip_px=21)`**：載入
+    `tip.mat`（優先順序：`tip_estimated_corrected.mat` > `tip_estimated.mat` > `tip.mat`），
+    讀取 `px_nm` 元數據（`afm_gui.py` 儲存時附帶），以 `zoom_factor = tip_px_nm / training_px_nm`
+    重採樣使物理尺寸與訓練影像一致，裁剪至最大 21px（奇數、頂端對齊）後回傳。
+    無 tip.mat 時退回合成拋物線探針（`make_training_tip`）。
+  - **訓練探針選擇改為自動**：在 grey_dilation 前依優先順序嘗試 `TIP_MAT_CANDIDATES`，
+    載入失敗則自動退回合成探針；`tip_source` 字串記錄至 `config.txt`，便於追蹤。
+  - **訓練資料量 800 → 1200 張**（每種孔洞類型）：總資料 1600 → 2400；
+    train 1280→1920，test 320→480；`config.txt` 改用動態 `{N}` 避免數值不一致。
+  - **`detect.py` 新增 `find_latest_model()`**：掃描 `runs/train{N}/weights/` 找最大編號
+    的已訓練模型，自動設為預設 `MODEL_PATH`；原本預設路徑 `img/AFM_MAE_autoencoder.keras`
+    與訓練輸出路徑不符，導致無 `-m` 參數時靜默找不到模型——此為導致預測異常的主要 bug 之一。
+
 - **2026-05-29 — 新增本 `CLAUDE.md`**
   - 建立專案邏輯敘述、程式架構、CV/AFM 專業要點、倉庫規範（不提交照片、
     不上傳大檔、每次更新需改本檔）與程式開發能力規範（整合 skill 準則）。
