@@ -85,7 +85,9 @@
 
 ### 3.2 `Supporting_code_AFM_deep_learning.py`（訓練核心）
 - 合成 GT：`trapezoid_hole_creator/randomizer`（Chebyshev 距離梯形截錐孔）、
-  `cylinder_hole_creator/randomizer`（Euclidean 距離圓柱孔）。
+  `cylinder_hole_creator/randomizer`（Euclidean 距離圓柱孔，小+大混合尺度）、
+  `star_hole_creator/randomizer`（極座標 `r_bound(θ)=r_mid+amp·cos(n·(θ−θ0))`
+  生成 4/5/6 芒星形孔，非凸含尖角，提升形狀魯棒性）。
 - 合成探針：`make_training_tip()` 拋物面 `z(r) = -r²/(2R)`，頂點=0。
 - 物理模擬：`scipy.ndimage.grey_dilation(surface, structure=tip)` 產生「膨脹影像」。
 - 真實感：`add_scan_line_artifacts()`（橫向掃描條紋）+ `add_gaussian_noise()`。
@@ -250,6 +252,18 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
   - 側欄新增「⑥ 手動調整 AFM 曲線」滑桿 + 上下微調 + 歸零；
     抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()` 額外回傳
     配準後 avg 供快速重算（免重新偵測特徵）。
+
+- **2026-06-03 — `Supporting_code_AFM_deep_learning.py`：豐富資料集（大孔 + 星形孔）強化魯棒性**
+  - **圓柱孔尺度多樣化**：半徑由固定 1.5–8px 改為小孔（70%, 1.5–8px=59–313nm）
+    與大孔（30%, 8–24px=313–938nm）混合，避免模型只學到「小圓點」的尺度偏誤；
+    深度變異由 80–130nm 加寬至 60–145nm。
+  - **新增星形孔（star_hole）**：`star_hole_randomizer/creator` 生成 4/5/6 芒星，
+    邊界 `r_bound(θ)=r_mid+amp·cos(n·(θ−θ0))`，提供**非凸 + 含尖角**幾何，
+    強迫模型學習各方向去卷積，提升形狀魯棒性；隨機旋轉 θ0 避免方向偏誤。
+  - **訓練資料 2 類 → 3 類**：梯形孔 + 圓柱孔 + 星形孔，各 1200 張，
+    總計 3600 張（train 2880 / test 720）；三類各自 8:2 切分避免類別偏斜。
+  - 新增 `star_hole_preview.png`、`dilated_star_hole_stack.npy`；config.txt 記錄
+    三類來源與尺度/深度範圍。
 
 - **2026-06-01 — `Supporting_code_AFM_deep_learning.py` + `detect.py`：使用真實 tip.mat 訓練、增量資料、修正模型路徑自動偵測**
   - **新增 `load_tip_for_training(mat_path, training_px_nm, max_tip_px=21)`**：載入
