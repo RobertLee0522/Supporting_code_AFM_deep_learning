@@ -2,6 +2,12 @@
 """
 AFM 影像預測程式
 使用訓練好的 Autoencoder 模型對新的 AFM 影像進行去卷積預測
+
+# 自動以輸入檔名（std.000）當前綴
+python detect.py datafortip/forpredict/std.000 -m runs/train7/weights/AFM_MAE_autoencoder.keras
+
+# 自訂前綴
+python detect.py std.004 -m runs/train7/weights/AFM_MAE_autoencoder.keras -o exp1_std004
 """
 
 import os
