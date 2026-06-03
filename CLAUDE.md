@@ -107,22 +107,27 @@
 
 ## 4. 神經網路架構 (Model)
 
-卷積自編碼器（`keras.Sequential`），輸入/輸出皆 `(128, 128, 1)`：
+**U-Net with Skip Connections**（Keras Functional API），輸入/輸出皆 `(128, 128, 1)`：
 
 ```
-Encoder:  Conv2D(4)  → MaxPool → Conv2D(8)  → MaxPool
-          → Conv2D(16) → MaxPool → Conv2D(32) → MaxPool      (3×3, ReLU, HeNormal, same)
-Decoder:  Conv2DT(32) → Conv2DT(16) → Conv2DT(8) → Conv2DT(4) (4×4, stride2, ReLU)
-          → Conv2DT(1, 3×3, Sigmoid)                          (輸出 [0,1])
+Encoder:  conv_block(32) → MaxPool → conv_block(64) → MaxPool
+          → conv_block(128) → MaxPool          (128→64→32→16 px)
+Bottleneck: conv_block(256)                    (16×16×256 = 65536 值)
+Decoder:  UpConv(128)+concat(skip)+conv_block(128)  → 32×32
+          UpConv(64) +concat(skip)+conv_block(64)   → 64×64
+          UpConv(32) +concat(skip)+conv_block(32)   → 128×128
+Output:   Conv1×1 Sigmoid                      (輸出 [0,1])
+conv_block = Conv3×3 → BatchNorm → ReLU  ×2
 ```
 
 | 超參數 | 值 | 理由 |
 |--------|----|----|
-| Optimizer | Adam(lr=3e-4) | 配合 [0,1] 正規化範圍，較預設 1e-3 穩定 |
-| Loss | MAE | 對離群值穩健，且 nm 誤差有直接物理意義 |
-| Epochs / Batch | 2000 / 32 | 收斂所需，監控 loss 曲線 |
+| Optimizer | Adam(lr=3e-4) | 配合 [0,1] 正規化範圍 |
+| Loss | MAE | 對離群值穩健，nm 誤差有直接物理意義 |
+| Epochs (max) / Batch | 3000 / 32 | EarlyStopping(patience=400) 自動提前停止 |
+| LR schedule | ReduceLROnPlateau × 0.5 (patience=100) | 避免 loss plateau |
 | 輸出激活 | Sigmoid | 對應 [0,1] 正規化輸出 |
-| 資料量 | 梯形孔+圓柱孔，train:test ≈ 8:2 | 幾何多樣性提升泛化 |
+| 資料量 | 梯形孔+圓柱孔+星形孔，train:test ≈ 8:2 | 幾何多樣性提升泛化 |
 
 ---
 
@@ -252,6 +257,21 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
   - 側欄新增「⑥ 手動調整 AFM 曲線」滑桿 + 上下微調 + 歸零；
     抽出 `compute_tip()` 支援 `manual_offset`；`reconstruct()` 額外回傳
     配準後 avg 供快速重算（免重新偵測特徵）。
+
+- **2026-06-03 — `Supporting_code_AFM_deep_learning.py` + `detect.py`：U-Net 架構、正規化修正、訓練穩定化**
+  - **換用 U-Net（skip connection）取代 Autoencoder**：原架構 4 次 MaxPool 將空間
+    壓縮至 8×8（bottleneck 僅 2048 值），孔洞位置精度嚴重不足。U-Net 3 層編碼器
+    +bottleneck(16×16×256=65536值) + 對稱解碼器，每級有 skip connection 直接傳遞
+    精確空間特徵，從根本解決預測邊緣鋸齒與大小不一致問題。每卷積塊加入
+    BatchNormalization 穩定訓練。
+  - **NORM_MIN: -155 → -175 nm**（training + detect.py 同步）：真實 AFM 掃描輸入
+    可達 -160nm，加上 ±20nm 掃描條紋模擬後訓練輸入可達 -167nm；原 -155nm 邊界
+    導致輸入超出正規化分布，模型看到分布外數值。新值 -175nm 留足安全邊界；
+    背景 0nm 正規化值從 0.597 更新為 0.625。
+  - **掃描條紋振幅 8nm → 20nm**：真實 AFM 條紋明顯強於原模擬，提升訓練與真實
+    掃描的分布匹配度；max_band_px 3→4、n_events 最大 5→8。
+  - **新增 ReduceLROnPlateau + EarlyStopping**：val_loss 停滯 100 epoch lr×0.5；
+    停滯 400 epoch 自動停止並還原最佳權重；EPOCHS 2000→3000（通常不跑滿）。
 
 - **2026-06-03 — `Supporting_code_AFM_deep_learning.py`：豐富資料集（大孔 + 星形孔）強化魯棒性**
   - **圓柱孔尺度多樣化**：半徑由固定 1.5–8px 改為小孔（70%, 1.5–8px=59–313nm）

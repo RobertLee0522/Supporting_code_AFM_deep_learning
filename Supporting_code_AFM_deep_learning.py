@@ -51,7 +51,8 @@ from sklearn.model_selection import train_test_split
 import keras
 import tensorflow as tf
 from keras.models import Sequential, Model, load_model
-from keras.layers import Activation, Input, Convolution2D, MaxPooling2D, UpSampling2D, Conv2DTranspose
+from keras.layers import (Activation, Input, Convolution2D, MaxPooling2D,
+                           UpSampling2D, Conv2DTranspose, Concatenate)
 from keras.callbacks import Callback, History
 
 # Progress bar and metrics display
@@ -125,14 +126,14 @@ TRAP_VARIATION = 0.20   # 隨機變異範圍 ±20%
 
 # ---- 全域正規化常數（解決模型輸出全零的關鍵）---------------------
 # 訓練資料物理範圍：
-#   負值：梯形孔最深 = -125.8 × 1.2 ≈ -151 nm → 取 -155 nm（安全邊界）
-#   正值：cubic/cylinder 最高 = 20 px × 5 nm = 100 nm → 取 105 nm
+#   負值：孔洞最深 -145nm + 掃描條紋 ±20nm + 雜訊 ≈ -167nm
+#         → 取 -175 nm 留足夠安全邊界（避免真實掃描超出分布範圍）
+#   正值：表面最高 = 取 105 nm（含安全邊界）
 # 公式：x_norm = (x - NORM_MIN) / (NORM_MAX - NORM_MIN)  → [0, 1]
-# 效果：背景 0 nm 正規化後 = 0.597（不再是特殊零值）
-#       孔洞 -125 nm → 0.097，突起 100 nm → 0.984
-#       模型無法靠「全零輸出」最小化 loss，被迫真正學習
+# 效果：背景 0 nm 正規化後 = 0.625（不再是特殊零值）
+#       孔洞 -145 nm → 0.107；模型無法靠「全零輸出」最小化 loss
 # ---------------------------------------------------------------
-NORM_MIN = -155.0   # nm（含安全邊界）
+NORM_MIN = -175.0   # nm（含安全邊界；真實掃描最低可達 -160nm）
 NORM_MAX = +105.0   # nm（含安全邊界）
 
 
@@ -668,12 +669,13 @@ def star_hole_creator(centers_px, r_out_px, r_in_px, n_points,
 # 真實掃描 artifact 模擬（只加到 X/input，不加到 GT）
 # ============================================================
 
-def add_scan_line_artifacts(img, n_events=None, max_band_px=3,
-                             amplitude_nm=8.0):
+def add_scan_line_artifacts(img, n_events=None, max_band_px=4,
+                             amplitude_nm=20.0):
     """
     模擬 AFM 逐行掃描的水平條紋 Z 漂移 artifact。
     每個 event：隨機選 row，加上隨機正/負偏移，寬度 1–max_band_px 行。
 
+    振幅從 8nm 提升至 20nm，與真實 AFM 掃描的條紋強度一致。
     50% 機率完全不加（讓模型同時看過有/無 artifact 的樣本）。
     """
     if random.random() < 0.5:
@@ -681,7 +683,7 @@ def add_scan_line_artifacts(img, n_events=None, max_band_px=3,
     result = img.copy()
     h = img.shape[0]
     if n_events is None:
-        n_events = random.randint(1, 5)
+        n_events = random.randint(1, 8)
     for _ in range(n_events):
         row0  = random.randint(0, h - 1)
         width = random.randint(1, max_band_px)
@@ -1049,42 +1051,74 @@ save_plot('training_samples.png')
 
 
 # ============================================================
-# Neural Network Architecture (Convolutional Autoencoder)
+# Neural Network Architecture — U-Net with Skip Connections
+# ============================================================
+# 原 Autoencoder 問題：4 次 MaxPool 將空間壓縮至 8×8（bottleneck
+# 僅 2048 值），孔洞位置與形狀資訊大量丟失，導致預測邊緣鋸齒、
+# 大小不一致。
+#
+# U-Net 解法：Skip Connection 繞過 bottleneck 直接傳遞精確空間
+# 特徵，decoder 每級皆可參考對應解析度的 encoder 輸出。
+#
+#   Encoder  : 128→64→32→16 px（3×MaxPool），通道 32→64→128
+#   Bottleneck: 16×16×256（保留 65536 值，原為 2048，32×改善）
+#   Decoder  : 16→32→64→128 px（UpSampling + concat skip）
+#   每卷積塊  : Conv3×3 → BatchNorm → ReLU（×2）
+#   輸出      : Conv1×1 Sigmoid → [0,1]
+#
+#   背景 0 nm → 0.625（NORM_MIN=-175），模型無法偷懶全輸出常數
 # ============================================================
 
-autoencoder = Sequential()
 print(X_processed_train.shape[1:])
-
-# Define the initializer
 ini = tf.keras.initializers.HeNormal(1)
 
-# Encoder Layers
-autoencoder.add(Convolution2D(4,  (3, 3), kernel_initializer=ini, activation='relu',
-                              padding='same', input_shape=X_processed_train.shape[1:]))
-autoencoder.add(MaxPooling2D((2, 2), padding='same'))
-autoencoder.add(Convolution2D(8,  (3, 3), kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(MaxPooling2D((2, 2), padding='same'))
-autoencoder.add(Convolution2D(16, (3, 3), kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(MaxPooling2D((2, 2), padding='same'))
-autoencoder.add(Convolution2D(32, (3, 3), kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(MaxPooling2D((2, 2), padding='same'))
+def conv_block(x, filters):
+    """標準 U-Net 卷積塊：Conv→BN→ReLU ×2"""
+    x = Convolution2D(filters, (3, 3), padding='same',
+                      kernel_initializer=ini)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    x = Convolution2D(filters, (3, 3), padding='same',
+                      kernel_initializer=ini)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    return x
 
-# Decoder Layers
-autoencoder.add(Conv2DTranspose(32, (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(Conv2DTranspose(16, (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(Conv2DTranspose(8,  (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(Conv2DTranspose(4,  (4, 4), strides=2, kernel_initializer=ini, activation='relu', padding='same'))
-autoencoder.add(Conv2DTranspose(1,  (3, 3), kernel_initializer=ini,
-                               activation='sigmoid', padding='same'))
-# sigmoid 輸出恰好限制在 [0, 1]，與正規化資料範圍匹配
-# 防止模型輸出超出範圍的數值
+inp = Input(shape=X_processed_train.shape[1:])
 
-# List the training parameters and their information
+# ── Encoder ──────────────────────────────────────────────────
+c1 = conv_block(inp, 32)                      # 128×128×32
+p1 = MaxPooling2D((2, 2))(c1)                # 64×64
+
+c2 = conv_block(p1, 64)                       # 64×64×64
+p2 = MaxPooling2D((2, 2))(c2)                # 32×32
+
+c3 = conv_block(p2, 128)                      # 32×32×128
+p3 = MaxPooling2D((2, 2))(c3)                # 16×16
+
+# ── Bottleneck ───────────────────────────────────────────────
+c4 = conv_block(p3, 256)                      # 16×16×256
+
+# ── Decoder（UpSampling → concat skip → conv_block）─────────
+u5 = Conv2DTranspose(128, (2, 2), strides=2, padding='same')(c4)
+u5 = Concatenate()([u5, c3])                  # 32×32×256
+c5 = conv_block(u5, 128)
+
+u6 = Conv2DTranspose(64, (2, 2), strides=2, padding='same')(c5)
+u6 = Concatenate()([u6, c2])                  # 64×64×128
+c6 = conv_block(u6, 64)
+
+u7 = Conv2DTranspose(32, (2, 2), strides=2, padding='same')(c6)
+u7 = Concatenate()([u7, c1])                  # 128×128×64
+c7 = conv_block(u7, 32)
+
+# ── Output ───────────────────────────────────────────────────
+output = Convolution2D(1, (1, 1), activation='sigmoid',
+                       padding='same', kernel_initializer=ini)(c7)
+
+autoencoder = Model(inputs=inp, outputs=output)
 autoencoder.summary()
 
-# [Fix 7] 移除未使用的 input_img = Input(shape=(...))
-# Apply the optimizer with desired learning rate and loss function
-# learning_rate 從 0.001 → 0.0003：配合正規化後數值範圍較小，步進更穩定
 opt = tf.keras.optimizers.Adam(learning_rate=0.0003)
 autoencoder.compile(optimizer=opt, loss='MAE')
 
@@ -1093,13 +1127,22 @@ autoencoder.compile(optimizer=opt, loss='MAE')
 # Training
 # ============================================================
 
-EPOCHS = 2000
+EPOCHS = 3000      # EarlyStopping 會提前結束，不一定跑滿
 BATCH_SIZE = 32
 
 progress_callback = TrainingProgressCallback(epochs=EPOCHS)
 
+# ReduceLROnPlateau：val_loss 停滯 100 epoch → lr ×0.5（最低 1e-6）
+# EarlyStopping：val_loss 停滯 400 epoch → 停止並還原最佳權重
+reduce_lr  = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='val_loss', factor=0.5, patience=100,
+    min_lr=1e-6, verbose=1)
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', patience=400,
+    restore_best_weights=True, verbose=1)
+
 print(f"\n訓練參數:")
-print(f"  Epochs:             {EPOCHS}")
+print(f"  Epochs (max):       {EPOCHS}")
 print(f"  Batch Size:         {BATCH_SIZE}")
 print(f"  Training Samples:   {X_processed_train.shape[0]}")
 print(f"  Validation Samples: {X_processed_test.shape[0]}")
@@ -1110,7 +1153,7 @@ training_data = autoencoder.fit(
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
     validation_data=(X_processed_test, y_processed_test),
-    callbacks=[progress_callback],
+    callbacks=[progress_callback, reduce_lr, early_stop],
     verbose=0  # 使用自定義回調代替默認輸出
 )
 

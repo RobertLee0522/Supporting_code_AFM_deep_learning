@@ -54,7 +54,7 @@ MODEL_PATH = find_latest_model() or os.path.join(OUTPUT_DIR, 'AFM_MAE_autoencode
 # 訓練腳本中設定：NORM_MIN=-155 nm, NORM_MAX=+105 nm
 # detect.py 輸入影像須先以相同參數正規化後才能送入模型
 # 模型輸出 [0,1] → 反正規化 → nm
-NORM_MIN = -155.0   # nm
+NORM_MIN = -175.0   # nm（與訓練腳本一致；真實掃描最低可達 -160nm）
 NORM_MAX = +105.0   # nm
 
 
