@@ -230,6 +230,17 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-03 — `Supporting_code_AFM_deep_learning.py`：移除星形孔訓練資料、提高圓柱孔佔比**
+  - **移除星形孔訓練**：`grey_dilation` 是多對一映射——圓形、方形、星形孔洞膨脹後外觀相似，
+    混合訓練使模型對圓形輸入「猜測」尖角存在（角狀歧義）。樣品確認為圓形/平滑孔後，
+    移除星形孔資料可消除歧義，預測邊緣更圓滑。`star_hole_randomizer/creator` 函式保留
+    供未來非凸樣品使用，但不加入訓練迴圈。
+  - **N_CYL=1800、N_TRAP=600**（原各 1200）：圓柱孔佔比由 50% 提升至 75%，強化模型對
+    圓形/平滑孔的辨識能力；梯形孔縮減以降低方形角落特徵的影響。
+  - **總資料 3600→2400 張**（train 2880→1920 / test 720→480）；dilation 迴圈改為
+    梯形/圓柱分開兩段（各自長度不同），移除舊版假設三類資料量相同的 `n_data` 共用邏輯。
+  - config.txt 同步更新：星形孔來源行改為「已移除」說明，N 值改用 `N_TRAP/N_CYL` 變數。
+
 - **2026-06-01 — `afm_gui.py`：新增「廠商 cone 當 tip」輸出（保留原重建功能）**
   - 側欄新增「🟠 儲存 Cone 為 tip.mat」按鈕；用 ⑤ 的 R/θ 經 `make_cone_tip()`
     生成完整錐形探針（球冠頂端 + 錐形側壁，頂點=0、旋轉對稱），存成 tip.mat。

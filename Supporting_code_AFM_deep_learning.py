@@ -702,13 +702,13 @@ def add_gaussian_noise(img, sigma_nm=None):
     return img + np.random.normal(0, sigma_nm, img.shape).astype(np.float32)
 
 
-# ---- 圓柱孔 N=1200 --------------------------------------------------
-N = 1200
+# ---- 圓柱孔 N_CYL=1800（圓形樣品主要訓練形狀，佔比最大）-----------
+N_CYL = 1800
 list_cyl_hole_images = []
 
 print(f"Generating cylinder holes (r=1.5–24px={1.5*SURFACE_SCALE_NM:.0f}–{24*SURFACE_SCALE_NM:.0f}nm 小+大混合, "
-      f"depth=60–145nm, 1–6 holes/img, N={N})...")
-for i in tqdm(range(N), desc="Cylinder Holes", unit="img",
+      f"depth=60–145nm, 1–6 holes/img, N={N_CYL})...")
+for i in tqdm(range(N_CYL), desc="Cylinder Holes", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     ctrs, rads, deps = cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=size)
     if not ctrs:                        # 極少情況放不下任何孔，放一個在中心
@@ -741,12 +741,13 @@ save_plot('cylinder_hole_preview.png')
 
 list_trap_gndtruth_image = []
 
-N = 1200
+# 梯形孔：方形 Chebyshev 截面對圓形樣品會引入角狀歧義，適度減量
+N_TRAP = 600
 
 print(f"Generating trapezoidal holes "
       f"(open={TRAP_OPEN_NM}nm, bot={TRAP_BOT_NM}nm, "
-      f"depth={TRAP_DEPTH_NM}nm, ±{int(TRAP_VARIATION*100)}%, N={N})...")
-for i in tqdm(range(N), desc="Trapezoid", unit="img",
+      f"depth={TRAP_DEPTH_NM}nm, ±{int(TRAP_VARIATION*100)}%, N={N_TRAP})...")
+for i in tqdm(range(N_TRAP), desc="Trapezoid", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
     centers, h_opens, h_bots, depths = trapezoid_randomizer(
         px_nm=SURFACE_SCALE_NM, img_size=size)
@@ -770,45 +771,10 @@ plt.tight_layout()
 save_plot('trapezoid_preview.png')
 
 
-# ============================================================
-# Simulate star-shaped holes（星形孔洞）← 非凸 + 含尖角，提升形狀魯棒性
-#   4/5/6 芒星，外接半徑 313–782nm，深度 60–145nm，1–3 孔/張
-# ============================================================
-
-list_star_hole_images = []
-
-N = 1200
-
-print(f"Generating star holes "
-      f"(4/5/6-point, r_out=8–20px={8*SURFACE_SCALE_NM:.0f}–{20*SURFACE_SCALE_NM:.0f}nm, "
-      f"depth=60–145nm, N={N})...")
-for i in tqdm(range(N), desc="Star Holes", unit="img",
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    ctrs, r_out, r_in, npts, angs, deps = star_hole_randomizer(
-        px_nm=SURFACE_SCALE_NM, img_size=size)
-    if not ctrs:                        # 放不下時放一個置中 5 芒星
-        ctrs  = [(size//2, size//2)]
-        r_out = [15.0]
-        r_in  = [8.0]
-        npts  = [5]
-        angs  = [0.0]
-        deps  = [110.0]
-    surf = star_hole_creator(ctrs, r_out, r_in, npts, angs, deps, size)
-    list_star_hole_images.append(surf)
-
-true_star_hole_stack = np.stack(list_star_hole_images, axis=0)
-np.save(f'{OUTPUT_DIR}/true_star_hole_stack.npy', true_star_hole_stack)
-
-# Preview
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-for ax, idx in zip(axes, [0, 1, 2]):
-    im = ax.imshow(true_star_hole_stack[idx], cmap='viridis')
-    ax.set_title(f"Star Hole GT #{idx}  "
-                 f"(min={true_star_hole_stack[idx].min():.1f} nm)")
-    ax.axis('off')
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='nm')
-plt.tight_layout()
-save_plot('star_hole_preview.png')
+# 星形孔洞（star_hole_randomizer / star_hole_creator）已定義但不加入訓練：
+# 樣品確認為圓形/平滑孔，星形資料會造成模型對圓形輸入「猜測」尖角存在（角狀歧義）。
+# grey_dilation 是多對一映射：圓/方/星膨脹後外觀相似，混合訓練增加歧義。
+# 若未來樣品包含非凸形狀，取消下方注釋即可恢復。
 
 
 # ============================================================
@@ -852,49 +818,35 @@ plt.colorbar()
 plt.title(f"Training Tip — {_tip_label}  {tip_shape.shape[0]}×{tip_shape.shape[1]} px")
 save_plot('tip_shape.png')
 
-# 載入三種孔洞 ground-truth
+# 載入兩種孔洞 ground-truth（已移除星形：對圓形樣品會增加角狀歧義）
 true_trap_surf_stack     = np.load(f'{OUTPUT_DIR}/true_trap_stack.npy').astype('float32')
 true_cyl_hole_surf_stack = np.load(f'{OUTPUT_DIR}/true_cyl_hole_stack.npy').astype('float32')
-true_star_hole_stack     = np.load(f'{OUTPUT_DIR}/true_star_hole_stack.npy').astype('float32')
 
-list_trap_dilated_image     = []
-list_cyl_hole_dilated_image = []
-list_star_hole_dilated_image = []
-
-n_data = len(true_trap_surf_stack)   # 自動對齊實際生成數量
-print(f"Applying dilation + scan artifacts + noise to {n_data} images each (trap/cyl/star)...")
-for i in tqdm(range(n_data), desc="Dilation+Artifact", unit="img",
+# ── 梯形孔 dilation ──
+list_trap_dilated_image = []
+print(f"Dilation: {len(true_trap_surf_stack)} trapezoid images...")
+for i in tqdm(range(len(true_trap_surf_stack)), desc="Dilation(Trap)", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
-    true_trap_surf     = true_trap_surf_stack[i, :, :]
-    true_cyl_hole_surf = true_cyl_hole_surf_stack[i, :, :]
-    true_star_hole_surf = true_star_hole_stack[i, :, :]
+    surf = true_trap_surf_stack[i, :, :]
+    dilated = scipy.ndimage.grey_dilation(surf, structure=tip_shape)
+    dilated = add_scan_line_artifacts(dilated)
+    dilated = add_gaussian_noise(dilated)
+    list_trap_dilated_image.append(dilated)
+dilated_trap_surf_stack = np.stack(list_trap_dilated_image, axis=0)
+np.save(f'{OUTPUT_DIR}/dilated_trap_stack.npy', dilated_trap_surf_stack)
 
-    # Grey dilation（模擬 AFM 探針卷積）
-    dilated_trap_surf      = scipy.ndimage.grey_dilation(true_trap_surf,      structure=tip_shape)
-    dilated_cyl_hole_surf  = scipy.ndimage.grey_dilation(true_cyl_hole_surf,  structure=tip_shape)
-    dilated_star_hole_surf = scipy.ndimage.grey_dilation(true_star_hole_surf, structure=tip_shape)
-
-    # 加入真實掃描 artifact（只加到 X，GT 不變）
-    # ① 水平條紋（Z 漂移，50% 機率觸發）
-    dilated_trap_surf      = add_scan_line_artifacts(dilated_trap_surf)
-    dilated_cyl_hole_surf  = add_scan_line_artifacts(dilated_cyl_hole_surf)
-    dilated_star_hole_surf = add_scan_line_artifacts(dilated_star_hole_surf)
-    # ② 高斯雜訊（模擬熱雜訊 / 電子雜訊）
-    dilated_trap_surf      = add_gaussian_noise(dilated_trap_surf)
-    dilated_cyl_hole_surf  = add_gaussian_noise(dilated_cyl_hole_surf)
-    dilated_star_hole_surf = add_gaussian_noise(dilated_star_hole_surf)
-
-    list_trap_dilated_image.append(dilated_trap_surf)
-    list_cyl_hole_dilated_image.append(dilated_cyl_hole_surf)
-    list_star_hole_dilated_image.append(dilated_star_hole_surf)
-
-dilated_trap_surf_stack      = np.stack(list_trap_dilated_image,      axis=0)
-dilated_cyl_hole_surf_stack  = np.stack(list_cyl_hole_dilated_image,  axis=0)
-dilated_star_hole_surf_stack = np.stack(list_star_hole_dilated_image, axis=0)
-
-np.save(f'{OUTPUT_DIR}/dilated_trap_stack.npy',      dilated_trap_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_cyl_hole_stack.npy',  dilated_cyl_hole_surf_stack)
-np.save(f'{OUTPUT_DIR}/dilated_star_hole_stack.npy', dilated_star_hole_surf_stack)
+# ── 圓柱孔 dilation ──
+list_cyl_hole_dilated_image = []
+print(f"Dilation: {len(true_cyl_hole_surf_stack)} cylinder images...")
+for i in tqdm(range(len(true_cyl_hole_surf_stack)), desc="Dilation(Cyl)", unit="img",
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
+    surf = true_cyl_hole_surf_stack[i, :, :]
+    dilated = scipy.ndimage.grey_dilation(surf, structure=tip_shape)
+    dilated = add_scan_line_artifacts(dilated)
+    dilated = add_gaussian_noise(dilated)
+    list_cyl_hole_dilated_image.append(dilated)
+dilated_cyl_hole_surf_stack = np.stack(list_cyl_hole_dilated_image, axis=0)
+np.save(f'{OUTPUT_DIR}/dilated_cyl_hole_stack.npy', dilated_cyl_hole_surf_stack)
 
 # 快速視覺驗證（確認孔洞在 dilation 後變淺/變窄，符合 AFM 物理）
 fig, axes = plt.subplots(2, 4, figsize=(20, 8))
@@ -916,44 +868,39 @@ save_plot('trap_dilation_check.png')
 # Load images and prepare training/testing datasets
 # ============================================================
 # 訓練資料全部為孔洞（凹洞）：
-#   X1 / y1 : 梯形孔 (trapezoid_hole)  1200 張
-#   X2 / y2 : 圓柱孔 (cylinder_hole)   1200 張（小+大混合尺度）
-#   X3 / y3 : 星形孔 (star_hole)       1200 張（4/5/6 芒，非凸含尖角）
-#   共 3600 張，train:test = 8:2 → 各 960 train / 240 test
-#   合計 train 2880, test 720
+#   X1 / y1 : 梯形孔 (trapezoid_hole)  N_TRAP=600  張
+#   X2 / y2 : 圓柱孔 (cylinder_hole)   N_CYL=1800  張（小+大混合尺度，圓形樣品主形狀）
+#   共 2400 張，train:test = 8:2 → train 1920 / test 480
 #   X（dilated）含水平條紋 artifact（50%）+ 高斯雜訊，GT 不含
+#   星形孔已移除：grey dilation 使圓/方/星膨脹後形狀相近，
+#   訓練含星形會令模型對圓形輸入猜測尖角（角狀歧義）。
 
 dilated_images_path_trap     = f'{OUTPUT_DIR}/dilated_trap_stack.npy'
 true_images_path_trap        = f'{OUTPUT_DIR}/true_trap_stack.npy'
 dilated_images_path_cyl_hole = f'{OUTPUT_DIR}/dilated_cyl_hole_stack.npy'
 true_images_path_cyl_hole    = f'{OUTPUT_DIR}/true_cyl_hole_stack.npy'
-dilated_images_path_star     = f'{OUTPUT_DIR}/dilated_star_hole_stack.npy'
-true_images_path_star        = f'{OUTPUT_DIR}/true_star_hole_stack.npy'
 
 X1 = np.load(dilated_images_path_trap).astype('float32')
 y1 = np.load(true_images_path_trap).astype('float32')
 X2 = np.load(dilated_images_path_cyl_hole).astype('float32')
 y2 = np.load(true_images_path_cyl_hole).astype('float32')
-X3 = np.load(dilated_images_path_star).astype('float32')
-y3 = np.load(true_images_path_star).astype('float32')
 
-# Split（三類各自 8:2，避免某類別只落在 train 或 test）
+# Split（兩類各自 8:2，避免某類別只落在 train 或 test）
 X_1_train, X_1_test, y_1_train, y_1_test = train_test_split(X1, y1, test_size=0.2, random_state=42)
 X_2_train, X_2_test, y_2_train, y_2_test = train_test_split(X2, y2, test_size=0.2, random_state=42)
-X_3_train, X_3_test, y_3_train, y_3_test = train_test_split(X3, y3, test_size=0.2, random_state=42)
 
-X_merged_train = np.concatenate((X_1_train, X_2_train, X_3_train), axis=0)
-y_merged_train = np.concatenate((y_1_train, y_2_train, y_3_train), axis=0)
+X_merged_train = np.concatenate((X_1_train, X_2_train), axis=0)
+y_merged_train = np.concatenate((y_1_train, y_2_train), axis=0)
 
 X_merged_train, y_merged_train = shuffle(X_merged_train, y_merged_train)
 
-X_merged_test = np.concatenate((X_1_test, X_2_test, X_3_test), axis=0)
-y_merged_test = np.concatenate((y_1_test, y_2_test, y_3_test), axis=0)
+X_merged_test = np.concatenate((X_1_test, X_2_test), axis=0)
+y_merged_test = np.concatenate((y_1_test, y_2_test), axis=0)
 
 print("Training data loaded.",
-      f"\n  ✓ Trapezoid holes : {X1.shape[0]} imgs",
-      f"\n  ✓ Cylinder  holes : {X2.shape[0]} imgs（小+大混合尺度）",
-      f"\n  ✓ Star      holes : {X3.shape[0]} imgs（4/5/6 芒，非凸）",
+      f"\n  ✓ Trapezoid holes : {X1.shape[0]} imgs（N_TRAP={N_TRAP}）",
+      f"\n  ✓ Cylinder  holes : {X2.shape[0]} imgs（N_CYL={N_CYL}，小+大混合尺度）",
+      f"\n  ✗ Star holes      : 已移除（對圓形樣品增加角狀歧義）",
       f"\n  ✗ Sphere/Cubic/Poly: 已移除（突起資料，物理行為相反）",
       f"\n  Train total: {X_merged_train.shape[0]}",
       f"\n  Test  total: {X_merged_test.shape[0]}",
@@ -1444,9 +1391,9 @@ with open(config_path, 'w', encoding='utf-8') as f:
         f.write(f"  深度範圍         : [{tip_shape.min():.1f}, {tip_shape.max():.1f}] nm\n\n")
     f.write(f"[訓練策略]\n")
     f.write(f"  樣品類型         : 全凹洞（移除突起粒子，突起與孔洞物理行為相反）\n")
-    f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  {N} 張\n")
-    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N} 張（小+大混合尺度）\n")
-    f.write(f"  資料來源 3       : 星形孔 (star_hole)       {N} 張（4/5/6 芒，非凸含尖角）\n")
+    f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  {N_TRAP} 張\n")
+    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N_CYL} 張（小+大混合尺度，圓形主形狀）\n")
+    f.write(f"  星形孔           : 已移除（對圓形樣品增加角狀歧義，grey dilation 使形狀難區分）\n")
     f.write(f"  圓柱孔半徑       : 1.5–24 px（小孔 70% / 大孔 30%）\n")
     f.write(f"  深度範圍         : 60–145 nm\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
