@@ -230,6 +230,18 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-15 — `detect.py`：新增輸入去尖刺（despike），根治「孔洞預測超大」**
+  - **根因**：真實掃描 `std.000` 含非物理尖刺（單張 Z 範圍達 6216nm，min≈-5404nm），
+    觸發舊版 `×0.045` 全圖 Z 縮放保護 → 真實 ~150nm 孔洞被壓成 ~7nm（近乎消失），
+    模型只看得到被放大的尖刺，輸出巨大假孔洞。尖刺可能與部分掃描（Height Sensor
+    只讀到 208/256 行）邊界壞值有關。
+  - **新增 `despike_image()`**：3×3 中值濾波估計局部基準，殘差超過
+    `max(300nm, 8×穩健標準差)` 的孤立像素以局部中值取代。真實深孔/壞線因鄰域同樣
+    偏移、殘差小而被保留；只移除非物理尖刺。`load_nanoscope()` 在 `flatten_rows_holes`
+    前呼叫，使 Z 範圍回到正常、不再觸發全圖縮放。
+  - **修正圖表中文亂碼**：`visualize_results()` suptitle 改用英文，避免無 CJK 字型
+    環境（如使用者 Windows + DejaVu Sans）大量 glyph-missing 警告與方框。
+
 - **2026-06-15 — `detect.py`：修正「孔洞預測超大」視覺誤判 + 橫向尺度診斷 + Z 範圍雙層保護**
   - **視覺化共用色階**：`visualize_results()` 改為左右兩圖使用相同 `vmin/vmax`（取輸入/預測聯集範圍），
     並新增第三格差值圖（`predicted - input`，RdBu_r 色彩），讓孔洞深淺校正量一目了然。

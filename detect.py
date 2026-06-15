@@ -159,6 +159,37 @@ def read_nanoscope_channel(fp, meta, ch_idx=None):
     return img * nm_per_lsb
 
 
+def despike_image(img, win=3, abs_thresh_nm=300.0, n_sigma=8.0):
+    """
+    去除 AFM 掃描尖刺（spike）與孤立壞線。
+
+    原理：真實表面形貌在空間上連續——孤立像素若與「局部中位數」差距
+    過大，多為探針碰撞、回授失鎖或通道資料錯位造成的非物理尖刺。以 3×3 中值
+    濾波估計局部基準，殘差超過門檻者以局部中值取代。
+
+    為何不會誤刪真實深孔：深孔/壞線的鄰域同樣偏移，中值也跟著偏移 → 殘差小，
+    不會被標記；只有「孤立且與鄰域差距巨大」的尖刺才被移除。
+
+    門檻 = max(abs_thresh_nm, n_sigma × 穩健標準差)。abs_thresh_nm 來自物理上限：
+    本樣品孔洞深度 < ~300nm，單像素偏離局部中位數 >300nm 必為尖刺（如 -5400nm）。
+    """
+    from scipy.ndimage import median_filter
+    med   = median_filter(img, size=win)
+    resid = img - med
+    mad   = np.median(np.abs(resid - np.median(resid)))
+    robust_sigma = 1.4826 * mad
+    thresh = max(abs_thresh_nm, n_sigma * robust_sigma)
+    mask   = np.abs(resid) > thresh
+    n_spike = int(mask.sum())
+    if n_spike > 0:
+        img = img.copy()
+        img[mask] = med[mask]
+        print(f"  [去尖刺] 移除 {n_spike} 個尖刺像素"
+              f"（門檻 {thresh:.0f} nm，以局部中值取代）"
+              f" → 範圍 [{img.min():.1f}, {img.max():.1f}] nm")
+    return img
+
+
 def flatten_rows_holes(img):
     """
     逐行線性基線校正，適用於孔洞型樣品（表面是高值）。
@@ -186,6 +217,7 @@ def load_nanoscope(filepath):
     print(f"  可用通道：{[ch['name'] for ch in meta['channels']]}")
 
     img_nm = read_nanoscope_channel(filepath, meta)
+    img_nm = despike_image(img_nm)      # 先去尖刺：避免少數壞值觸發 Z 全圖縮放、毀掉真實訊號
     img_nm = flatten_rows_holes(img_nm)
     print(f"  基線校正後範圍：[{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
 
@@ -427,7 +459,9 @@ def visualize_results(input_image, predicted_image, output_prefix,
     axes[2].axis('off')
     plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
 
-    plt.suptitle('AFM 去卷積結果（左右色階相同，才能正確比較）', fontsize=11)
+    # 用英文標題避免無 CJK 字型環境的 glyph-missing 警告與方框亂碼
+    plt.suptitle('AFM Deconvolution (shared color scale for valid comparison)',
+                 fontsize=11)
     plt.tight_layout()
 
     save_path = os.path.join(predict_dir, f'{output_prefix}_comparison.png')
