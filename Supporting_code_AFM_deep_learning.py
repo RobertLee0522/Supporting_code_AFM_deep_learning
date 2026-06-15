@@ -109,13 +109,15 @@ TARGET_TIP_SIZE  = 55    # 將估算探針 resize 至此尺寸 (px)（供 tip_co
 # ---- 訓練用合成探針設定 ----------------------------------------
 # ROC 從 tip_estimated0526.mat 量得：R ≈ 73 nm
 #
-# TIP_TRAIN_SIZE = 9 px（at 39.1 nm/px）：
-#   有效探針半徑 = 73 nm / 39.1 nm/px ≈ 1.87 px
-#   偏移 3px：深度 = -(3×39.1)²/(2×73) = -94 nm（超過最深孔洞 →不影響）
-#   故 9px（半徑 4px）已足夠完整捕捉 dilation 物理效應
+# TIP_TRAIN_SIZE = 5 px（at 39.1 nm/px）：
+#   有效探針半徑 = 46.9 nm（afm_gui 量得）/ 39.1 nm/px ≈ 1.2 px
+#   有效填滿半徑 = sqrt(2 × 46.9 × 125) / 39.1 ≈ 2.77 px（對 125 nm 深孔）
+#   真實孔洞半徑 ≈ 2.93 px → 兩者相近，孔洞在訓練中不應被 100% 填平
+#   舊版使用 73nm/9px，tip 半寬 3px × 39.1 = 117nm > 孔洞半徑 114nm →完全填平 → 過度去卷積
+#   修正後：tip 半寬 2px × 39.1 = 78nm < 孔洞半徑 114nm → 孔洞在訓練中可見
 # ---------------------------------------------------------------
-TIP_RADIUS_NM  = 73.0   # 從 tip_estimated0526.mat 量得的真實探針 ROC (nm)
-TIP_TRAIN_SIZE = 9      # 合成探針尺寸 (px)，奇數；9px × 39.1nm = ±156nm 物理範圍
+TIP_RADIUS_NM  = 46.9   # afm_gui 量得真實探針 ROC (nm)；比舊值 73.0 更尖
+TIP_TRAIN_SIZE = 5      # 合成探針尺寸 (px)；縮小至 5px 避免訓練時孔洞被完全填平
 
 # ---- 梯形孔樣品標稱參數（用於訓練資料生成）--------------------
 # 來源：用戶實際掃描的校正樣品
@@ -797,7 +799,11 @@ tip_source = 'synthetic_paraboloid'
 for _tp in TIP_MAT_CANDIDATES:
     if os.path.exists(_tp):
         try:
-            tip_shape  = load_tip_for_training(_tp)
+            # max_tip_px=5 → 5×5 px = ±2 px = ±78 nm 有效半徑；
+            # 比舊版 21 px 縮小，使訓練探針（半寬 78 nm）接近真實 ROC=46.9 nm
+            # 的有效影響範圍（sqrt(2×46.9×125)/39.1 ≈ 2.77 px），
+            # 防止小孔在 dilation 時被完全填平導致模型過度去卷積。
+            tip_shape  = load_tip_for_training(_tp, max_tip_px=5)
             tip_source = _tp
             print(f"  [探針] 使用真實探針：{_tp}  "
                   f"({tip_shape.shape[0]}×{tip_shape.shape[1]} px)")

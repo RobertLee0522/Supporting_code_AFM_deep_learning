@@ -230,6 +230,18 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-15 — `Supporting_code_AFM_deep_learning.py`：縮小訓練探針，修正過度去卷積**
+  - **根因**：訓練 tip.mat 被 `load_tip_for_training` 重採樣後為 7×7 px（半寬 3 px = 117 nm），
+    而真實孔洞半徑僅 2.93 px（228.8 nm / 2 / 39.1 nm/px）。有效填滿半徑
+    `sqrt(2 × R_tip × D) / px_nm = sqrt(2×46.9×125)/39.1 ≈ 2.77 px ≈ 孔洞半徑`，導致
+    訓練時孔洞被 100% 填平；模型學到「完全平坦 → 輸出大圓洞」，套到真實 AFM（孔洞可見）時
+    過度放大 2–3 倍。
+  - **修正 `load_tip_for_training` 呼叫**：加入 `max_tip_px=5` 參數，將訓練探針限制為
+    5×5 px（半寬 2 px = 78 nm < 孔洞半徑 114 nm），使小孔在 dilation 後仍有可見訊號。
+  - **修正 `TIP_RADIUS_NM`**：73.0 → 46.9 nm（afm_gui 量得真實 ROC），同步更新 fallback 合成探針。
+  - **修正 `TIP_TRAIN_SIZE`**：9 px → 5 px，與新 ROC 和 max_tip_px=5 一致。
+  - **需重新訓練**：上述三項改動需重跑 `Supporting_code_AFM_deep_learning.py` 才生效。
+
 - **2026-06-15 — `detect.py`：修正 depth_ratio ✓ 判斷邏輯**
   - 舊條件 `0.8 < depth_ratio < 3.0` 對負數有歧義：當 in_min 與 pr_min 皆為負值時，
     ratio = 0.81 表示 |predicted| < |input|（預測孔洞**更淺**），不是更深，舊版卻印 ✓。
