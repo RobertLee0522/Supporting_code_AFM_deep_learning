@@ -190,6 +190,30 @@ def despike_image(img, win=3, abs_thresh_nm=300.0, n_sigma=8.0):
     return img
 
 
+def clip_physical_range(img, max_depth_nm=300.0, max_height_nm=60.0):
+    """
+    將孔洞型 AFM 影像裁切到物理合理的 Z 窗（相對表面中位數）。
+
+    用途：處理「連續壞區」——3×3 中值濾波去尖刺無法移除的大面積非物理區塊，
+    例如部分掃描（行數不足）、回授失鎖或通道資料錯位造成的數 µm 假台階。
+    若不裁切，這類壞區會污染 flatten 的 percentile(95) 基準，並觸發 Z 全圖縮放、
+    把真實孔洞壓扁。
+
+    物理假設：孔洞樣品的表面是高基準（≈中位數），真實特徵向下凹；故高側收緊
+    （表面之上幾乎無真實結構，只有 ±20nm 掃描條紋雜訊），低側放寬以保留深孔。
+    壞區被夾到表面附近 → 視為平坦表面（無意義但無害），真實孔洞完整保留。
+    """
+    ref = float(np.median(img))
+    lo, hi = ref - max_depth_nm, ref + max_height_nm
+    n_clip = int(np.sum((img < lo) | (img > hi)))
+    if n_clip > 0:
+        img = np.clip(img, lo, hi)
+        print(f"  [物理裁切] 表面中位數基準 {ref:.1f} nm；裁切 {n_clip} 個越界像素"
+              f"至 [{lo:.0f}, {hi:.0f}] nm（移除連續壞區/大台階）"
+              f" → 範圍 [{img.min():.1f}, {img.max():.1f}] nm")
+    return img
+
+
 def flatten_rows_holes(img):
     """
     逐行線性基線校正，適用於孔洞型樣品（表面是高值）。
@@ -217,7 +241,8 @@ def load_nanoscope(filepath):
     print(f"  可用通道：{[ch['name'] for ch in meta['channels']]}")
 
     img_nm = read_nanoscope_channel(filepath, meta)
-    img_nm = despike_image(img_nm)      # 先去尖刺：避免少數壞值觸發 Z 全圖縮放、毀掉真實訊號
+    img_nm = despike_image(img_nm)        # ① 去孤立尖刺（中值濾波殘差門檻）
+    img_nm = clip_physical_range(img_nm)  # ② 裁切連續壞區/大台階（中值無法移除者）
     img_nm = flatten_rows_holes(img_nm)
     print(f"  基線校正後範圍：[{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
 
