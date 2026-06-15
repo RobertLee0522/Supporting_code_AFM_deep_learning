@@ -194,15 +194,41 @@ def load_nanoscope(filepath):
     if (h, w) != (128, 128):
         img_nm = zoom(img_nm, (128 / h, 128 / w), order=3)
 
-    # Z 範圍保護：若超出訓練正規化範圍 10 倍以上，自動縮放至合理範圍
-    z_range = img_nm.max() - img_nm.min()
-    train_range = NORM_MAX - NORM_MIN  # 260 nm
+    # ── 橫向尺度診斷 ──────────────────────────────────────────────
+    # 訓練假設：每 px = SURFACE_SCALE_NM = 39.1 nm（5000nm 掃描 / 128px）
+    # 若真實掃描範圍不同，resize 後每 px 物理距離會偏移，導致孔洞被模型誤判尺寸
+    SURFACE_SCALE_NM = 39.1   # 訓練時的基準（nm/px）
+    actual_px_nm = meta['scan_nm'] / 128.0
+    scale_ratio  = actual_px_nm / SURFACE_SCALE_NM
+    print(f"\n  ── 橫向尺度檢查 ──")
+    print(f"  掃描範圍     : {meta['scan_nm']:.1f} nm")
+    print(f"  實際 px_nm   : {actual_px_nm:.2f} nm/px  (resize 至 128×128 後)")
+    print(f"  訓練 px_nm   : {SURFACE_SCALE_NM:.2f} nm/px  (5000nm / 128px)")
+    if abs(scale_ratio - 1.0) > 0.15:
+        print(f"  ⚠ 尺度偏差 {(scale_ratio-1)*100:+.1f}%：孔洞在像素空間偏大/偏小 {scale_ratio:.2f}×")
+        print(f"    → 建議將掃描範圍調整為 5000nm，或重新訓練匹配當前掃描尺度")
+    else:
+        print(f"  ✓ 尺度相符（偏差 {(scale_ratio-1)*100:+.1f}%）")
+
+    # ── Z 範圍保護（兩段：嚴重異常縮放 + 超出分布軟性警告）────────
+    z_range    = img_nm.max() - img_nm.min()
+    train_range = NORM_MAX - NORM_MIN      # 280 nm
+    print(f"\n  ── Z 範圍檢查 ──")
+    print(f"  輸入 Z 範圍  : [{img_nm.min():.1f}, {img_nm.max():.1f}] nm  (總跨度 {z_range:.1f} nm)")
+    print(f"  訓練分布範圍 : [{NORM_MIN:.1f}, {NORM_MAX:.1f}] nm")
+
     if z_range > train_range * 10:
         scale = train_range / z_range
         img_nm = img_nm * scale
-        print(f"  [Z保護] 偵測到異常 Z 範圍 {z_range:.1f} nm，"
-              f"已縮放 ×{scale:.4f} → 新範圍 [{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
-        print(f"  ※ 建議檢查 Z 靈敏度設定（見上方 [Z校正] 輸出）")
+        print(f"  ⚠ Z 保護觸發：異常範圍 {z_range:.1f} nm，縮放 ×{scale:.4f} → "
+              f"[{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
+        print(f"    建議檢查 Z 靈敏度（見上方 [Z校正] 輸出）")
+    elif img_nm.min() < NORM_MIN or img_nm.max() > NORM_MAX:
+        print(f"  ⚠ 部分 Z 值超出訓練分布！超出範圍的像素數："
+              f"  低端={np.sum(img_nm < NORM_MIN)}  高端={np.sum(img_nm > NORM_MAX)}")
+        print(f"    → 預測結果可能不穩定，建議確認 Z 靈敏度設定")
+    else:
+        print(f"  ✓ Z 範圍在訓練分布內")
 
     return img_nm.astype(np.float32)
 
@@ -355,22 +381,53 @@ def visualize_results(input_image, predicted_image, output_prefix,
                       predict_dir, no_display=False):
     """
     視覺化預測結果並儲存至 predict_dir。
+    左右兩張使用相同色階（vmin/vmax），才能正確比較孔洞深淺變化。
     """
     input_2d     = denormalize_output(input_image)[0, :, :, 0]   # nm
     predicted_2d = predicted_image[0, :, :, 0]                   # nm
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    # ── 統計資訊（判斷去卷積是否合理）─────────────────────────────
+    in_min,  in_max  = input_2d.min(),  input_2d.max()
+    pr_min,  pr_max  = predicted_2d.min(), predicted_2d.max()
+    print(f"\n  ── 去卷積結果比較 ──")
+    print(f"  輸入孔洞深度  (min nm) : {in_min:.1f} nm")
+    print(f"  預測孔洞深度  (min nm) : {pr_min:.1f} nm")
+    depth_ratio = pr_min / in_min if in_min != 0 else float('inf')
+    if 0.8 < depth_ratio < 3.0:
+        print(f"  ✓ 深度比 {depth_ratio:.2f}×（預測比輸入深，符合去卷積物理）")
+    elif depth_ratio >= 3.0:
+        print(f"  ⚠ 深度比 {depth_ratio:.2f}× 偏大，可能過度去卷積")
+        print(f"    常見原因：① 掃描範圍不是 5000nm → 尺度偏移 ② Z靈敏度錯誤 ③ 訓練探針與實際不符")
+    else:
+        print(f"  ⚠ 深度比 {depth_ratio:.2f}× 偏小，去卷積效果不足")
 
-    im1 = axes[0].imshow(input_2d, cmap='viridis')
-    axes[0].set_title('Input (Dilated Image)  [nm]')
+    # ── 共用色階（防止視覺誤判）─────────────────────────────────
+    # 使用兩張圖的聯集範圍，確保顏色對比有意義
+    vmin = min(in_min, pr_min)
+    vmax = max(in_max, pr_max)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    im1 = axes[0].imshow(input_2d, cmap='viridis', vmin=vmin, vmax=vmax)
+    axes[0].set_title(f'Input (AFM scan)  [nm]\nmin={in_min:.1f}  max={in_max:.1f}')
     axes[0].axis('off')
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
-    im2 = axes[1].imshow(predicted_2d, cmap='viridis')
-    axes[1].set_title('Predicted (Deconvolved)  [nm]')
+    im2 = axes[1].imshow(predicted_2d, cmap='viridis', vmin=vmin, vmax=vmax)
+    axes[1].set_title(f'Predicted (Deconvolved)  [nm]\nmin={pr_min:.1f}  max={pr_max:.1f}')
     axes[1].axis('off')
     plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
+    # 差值圖（顯示模型做了多少校正）
+    diff = predicted_2d - input_2d
+    im3 = axes[2].imshow(diff, cmap='RdBu_r',
+                         vmin=-abs(diff).max(), vmax=abs(diff).max())
+    axes[2].set_title(f'Correction (Predicted - Input)  [nm]\n'
+                      f'max correction = {diff.min():.1f} nm')
+    axes[2].axis('off')
+    plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.suptitle('AFM 去卷積結果（左右色階相同，才能正確比較）', fontsize=11)
     plt.tight_layout()
 
     save_path = os.path.join(predict_dir, f'{output_prefix}_comparison.png')

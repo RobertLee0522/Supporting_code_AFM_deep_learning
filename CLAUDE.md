@@ -230,6 +230,18 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-15 — `detect.py`：修正「孔洞預測超大」視覺誤判 + 橫向尺度診斷 + Z 範圍雙層保護**
+  - **視覺化共用色階**：`visualize_results()` 改為左右兩圖使用相同 `vmin/vmax`（取輸入/預測聯集範圍），
+    並新增第三格差值圖（`predicted - input`，RdBu_r 色彩），讓孔洞深淺校正量一目了然。
+    原本各圖獨立 auto-scale 會使淺孔（input）與深孔（predicted）顯示出相同大小的色塊，
+    造成「孔洞變超大」的視覺誤判。
+  - **新增深度比警告**：`depth_ratio = pr_min / in_min`；≥ 3.0× 時印出過度去卷積警告及三項常見根因（掃描範圍/Z靈敏度/訓練探針不符）。
+  - **橫向尺度診斷**：`load_nanoscope()` 計算 `actual_px_nm = scan_nm / 128` 與訓練基準
+    `SURFACE_SCALE_NM = 39.1 nm/px`（5000nm/128px）之比率；偏差 >15% 時印出警告與建議動作
+    （調整掃描範圍至 5000nm 或重新訓練）。偏差過大時孔洞在像素空間尺寸偏移，模型過補/欠補。
+  - **Z 範圍雙層保護**：原有一層（z_range > 10× 訓練範圍才縮放）保持；新增軟性第二層（部分值
+    超出 `[NORM_MIN, NORM_MAX]` 時僅警告，不強制縮放，避免正常訊號被意外抑制）。
+
 - **2026-06-03 — `Supporting_code_AFM_deep_learning.py`：移除星形孔訓練資料、提高圓柱孔佔比**
   - **移除星形孔訓練**：`grey_dilation` 是多對一映射——圓形、方形、星形孔洞膨脹後外觀相似，
     混合訓練使模型對圓形輸入「猜測」尖角存在（角狀歧義）。樣品確認為圓形/平滑孔後，
