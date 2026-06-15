@@ -449,14 +449,21 @@ def visualize_results(input_image, predicted_image, output_prefix,
     print(f"\n  ── 去卷積結果比較 ──")
     print(f"  輸入孔洞深度  (min nm) : {in_min:.1f} nm")
     print(f"  預測孔洞深度  (min nm) : {pr_min:.1f} nm")
+    # depth_ratio = pr_min / in_min（兩值均為負數時）
+    # 兩者皆負：ratio > 1.0 → |pr| > |in| → 預測更深（去卷積正確方向）
+    #           ratio < 1.0 → |pr| < |in| → 預測更淺（方向錯誤 / 輸入資料髒）
+    #           ratio > 3.0 → 過度去卷積
     depth_ratio = pr_min / in_min if in_min != 0 else float('inf')
-    if 0.8 < depth_ratio < 3.0:
-        print(f"  ✓ 深度比 {depth_ratio:.2f}×（預測比輸入深，符合去卷積物理）")
+    if 1.0 <= depth_ratio < 3.0:
+        print(f"  ✓ 深度比 {depth_ratio:.2f}×（|預測| > |輸入|，孔洞加深，符合去卷積物理）")
     elif depth_ratio >= 3.0:
         print(f"  ⚠ 深度比 {depth_ratio:.2f}× 偏大，可能過度去卷積")
-        print(f"    常見原因：① 掃描範圍不是 5000nm → 尺度偏移 ② Z靈敏度錯誤 ③ 訓練探針與實際不符")
+        print(f"    常見原因：① 掃描範圍不是 5000nm ② Z靈敏度錯誤 ③ 訓練探針與實際不符")
+    elif depth_ratio > 0.0:
+        print(f"  ⚠ 深度比 {depth_ratio:.2f}× < 1（|預測| < |輸入|，孔洞被做淺）")
+        print(f"    常見原因：① 輸入含大片壞區使模型判斷背景錯誤 ② 輸入 Z 超出訓練分布")
     else:
-        print(f"  ⚠ 深度比 {depth_ratio:.2f}× 偏小，去卷積效果不足")
+        print(f"  ⚠ 深度比 {depth_ratio:.2f}×，方向異常（預測與輸入同號或 in_min 近零）")
 
     # ── 共用色階（防止視覺誤判）─────────────────────────────────
     # 使用兩張圖的聯集範圍，確保顏色對比有意義

@@ -230,6 +230,12 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-15 — `detect.py`：修正 depth_ratio ✓ 判斷邏輯**
+  - 舊條件 `0.8 < depth_ratio < 3.0` 對負數有歧義：當 in_min 與 pr_min 皆為負值時，
+    ratio = 0.81 表示 |predicted| < |input|（預測孔洞**更淺**），不是更深，舊版卻印 ✓。
+  - 修正：`ratio ≥ 1.0`（|預測| > |輸入|）才算正確去卷積方向；`ratio < 1.0` 改印 ⚠，
+    並提示常見原因（輸入含大片壞區、Z 超出訓練分布）。同時補充 ratio 物理意義的程式碼註解。
+
 - **2026-06-15 — `detect.py`：新增連續壞區物理裁切（接續去尖刺）**
   - **發現**：`std.000` 去尖刺後仍殘留 +5526nm 的**連續壞區**（中值濾波移不掉，因鄰域
     同樣是壞值），且該區污染 `flatten_rows_holes` 的 percentile(95) 基準，仍觸發 Z 全圖
