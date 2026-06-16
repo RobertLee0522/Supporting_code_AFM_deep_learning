@@ -74,9 +74,11 @@ def denormalize_output(data_01):
 # ══════════════════════════════════════════════════════════════
 
 def is_nanoscope_file(filepath):
-    """判斷是否為 Nanoscope 原始掃描檔（副檔名為 3 位數字）。"""
+    """判斷是否為 Nanoscope 原始掃描檔（副檔名以 3 位數字開頭，
+    如 .000、.004；亦容許後接描述文字，如 .000-after_flatten，
+    方便使用者手動標記處理過的檔案而不改變底層二進位格式）。"""
     ext = os.path.splitext(filepath)[1]
-    return bool(re.match(r'^\.\d{3}$', ext))
+    return bool(re.match(r'^\.\d{3}', ext))
 
 
 def parse_nanoscope_header(fp):

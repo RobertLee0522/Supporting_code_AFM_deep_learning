@@ -230,6 +230,14 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-16 — `detect.py`：放寬 Nanoscope 副檔名偵測，支援描述性字尾**
+  - **問題**：使用者將 `std.000` 手動標記為 `std.000-after flatten`（內容仍是原始 Nanoscope
+    二進位格式，僅檔名加註處理階段），但 `is_nanoscope_file()` 舊版用 `^\.\d{3}$`（嚴格匹配
+    3 位數字結尾）判斷，`.000-after flatten` 不符合 → 誤判為一般圖片，PIL 開檔失敗
+    (`UnidentifiedImageError`)。
+  - **修正**：正規表達式改為 `^\.\d{3}`（只要求以 3 位數字開頭，不要求結尾），允許
+    `.000`、`.004` 等標準副檔名後接任意描述文字，使用者可自由標記處理階段而不必每次重新命名。
+
 - **2026-06-16 — `Supporting_code_AFM_deep_learning.py` + `afm_gui.py`：最小孔洞半徑修正、訓練物理說明、GUI 分隔符**
   - **`cylinder_hole_randomizer` 最小半徑 1.5 px → 3 px**：舊值 1.5px（59nm）小於探針填充極限半徑
     2.77px（@深度125nm），導致小孔在 dilation 後幾乎完全填平，訓練 Input 趨近全平坦。
