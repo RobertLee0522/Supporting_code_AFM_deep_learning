@@ -505,6 +505,35 @@ else:
 print("="*70 + "\n")
 
 # ============================================================
+# 訓練資料集物理說明（讀懂這裡才能正確設定資料集方向）
+# ============================================================
+print("="*70)
+print("  AFM 去卷積訓練資料集物理原理")
+print("="*70)
+print("""
+【AFM 灰階膨脹（Grey Dilation）物理】
+  真實表面（孔洞大且深） ⊕ 探針形狀 → AFM 掃描影像（孔洞變小變淺）
+
+  AFM 探針有有限曲率半徑，無法完全探入窄/深孔洞。
+  孔洞在掃描影像中「變淺、變窄」，這就是 grey dilation 的效果。
+
+【訓練資料對（Pair）的方向】
+  X（輸入）= dilated 影像 = 模擬 AFM 掃描 ← 孔洞看起來小且淺
+  y（標籤）= 真實表面   = Ground Truth    ← 孔洞真實大小（大且深）
+
+  ✓ 正確去卷積：模型學習 "小洞/淺洞（X）→ 大洞/深洞（y）"
+  ✗ 錯誤方向：若 X 是大洞、y 是小洞，模型會學到「加入探針失真」，
+               這是正向過程，不是去卷積！
+
+【孔洞可見性條件（有效填充半徑公式）】
+  探針可完全填充孔洞的條件：r_hole < sqrt(2 × R_tip × D) / px_nm
+  其中 R_tip=46.9nm（探針曲率半徑），D=深度（nm），px_nm=39.1nm/px
+  → 深度 125nm 時：極限半徑 ≈ sqrt(2×46.9×125)/39.1 ≈ 2.77 px
+  → 訓練最小半徑設為 3 px（>2.77 px），確保 dilated 影像有可見孔洞訊號
+""")
+print("="*70 + "\n")
+
+# ============================================================
 # 孔洞樣品模擬（全部為凹洞，與真實 AFM 掃描一致）
 # 移除：球形/方形/圓柱突起粒子（物理行為與孔洞完全相反，不應混訓）
 # 保留：梯形孔（trapezoid_hole）+ 新增圓柱孔（cylinder_hole）
@@ -538,7 +567,9 @@ def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
         if random.random() < 0.30:
             r_px = random.uniform(8.0, 24.0)     # 大孔 313–938 nm
         else:
-            r_px = random.uniform(1.5, 8.0)      # 小孔 59–313 nm
+            # 最小 3 px（117nm） > 探針填充極限半徑（2.77px@125nm 深）
+            # 確保 dilated 訓練影像有可見孔洞訊號，不被探針完全填平
+            r_px = random.uniform(3.0, 8.0)      # 小孔 117–313 nm
         depth   = random.uniform(60.0, 145.0)   # 深度 60–145 nm（加寬變異）
         margin  = r_px + 3
         min_pos = margin
@@ -708,7 +739,7 @@ def add_gaussian_noise(img, sigma_nm=None):
 N_CYL = 1800
 list_cyl_hole_images = []
 
-print(f"Generating cylinder holes (r=1.5–24px={1.5*SURFACE_SCALE_NM:.0f}–{24*SURFACE_SCALE_NM:.0f}nm 小+大混合, "
+print(f"Generating cylinder holes (r=3–24px={3.0*SURFACE_SCALE_NM:.0f}–{24*SURFACE_SCALE_NM:.0f}nm 小+大混合, "
       f"depth=60–145nm, 1–6 holes/img, N={N_CYL})...")
 for i in tqdm(range(N_CYL), desc="Cylinder Holes", unit="img",
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
@@ -1400,7 +1431,8 @@ with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  {N_TRAP} 張\n")
     f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N_CYL} 張（小+大混合尺度，圓形主形狀）\n")
     f.write(f"  星形孔           : 已移除（對圓形樣品增加角狀歧義，grey dilation 使形狀難區分）\n")
-    f.write(f"  圓柱孔半徑       : 1.5–24 px（小孔 70% / 大孔 30%）\n")
+    f.write(f"  圓柱孔半徑       : 3–24 px（小孔 70%: 3–8px≥117nm / 大孔 30%: 8–24px）\n")
+    f.write(f"  最小半徑說明     : 3px（117nm）> 探針填充極限2.77px@深度125nm，確保dilated有訊號\n")
     f.write(f"  深度範圍         : 60–145 nm\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
     f.write(f"\n[梯形孔樣品設定（用戶真實樣品）]\n")

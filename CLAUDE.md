@@ -230,6 +230,15 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-16 — `Supporting_code_AFM_deep_learning.py` + `afm_gui.py`：最小孔洞半徑修正、訓練物理說明、GUI 分隔符**
+  - **`cylinder_hole_randomizer` 最小半徑 1.5 px → 3 px**：舊值 1.5px（59nm）小於探針填充極限半徑
+    2.77px（@深度125nm），導致小孔在 dilation 後幾乎完全填平，訓練 Input 趨近全平坦。
+    新值 3px（117nm）> 填充極限，確保 dilated 訓練影像有可見孔洞訊號，模型能學到有意義的逆映射。
+  - **新增訓練資料物理說明 log**：訓練開始時列印 grey dilation 方向說明（X=dilated 小洞 → y=GT 大洞）、
+    有效填充半徑公式與計算範例，方便調整資料集設定時確認物理方向正確。
+  - **`afm_gui.py` 重建結果後加分隔符**：每次重建（含失敗）末尾 `_log_safe('='×52)` 使
+    log 區中每次執行的結果清楚分隔，不與上一次混在一起。
+
 - **2026-06-15 — `Supporting_code_AFM_deep_learning.py`：縮小訓練探針，修正過度去卷積**
   - **根因**：訓練 tip.mat 被 `load_tip_for_training` 重採樣後為 7×7 px（半寬 3 px = 117 nm），
     而真實孔洞半徑僅 2.93 px（228.8 nm / 2 / 39.1 nm/px）。有效填滿半徑

@@ -1252,8 +1252,10 @@ class App(tk.Tk):
                 self.after(0, lambda: self._draw_result(
                     tip, avg, gt_p, gt_al, geom, s, n, r_est, ap['half'], px, rim))
                 self.after(0, lambda: self.stats['特徵數'].config(text=str(n)))
+                self._log_safe('=' * 52)
             except Exception as e:
                 self._log_safe(f'✗ {e}')
+                self._log_safe('=' * 52)
                 import traceback; traceback.print_exc()
 
         threading.Thread(target=worker, daemon=True).start()
