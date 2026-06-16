@@ -103,16 +103,21 @@ def parse_nanoscope_header(fp):
         if not blk.strip(): continue
         off = re.search(r'\\Data offset:\s*(\d+)', blk)
         bpp = re.search(r'\\Bytes/pixel:\s*(\d+)', blk)
+        dln = re.search(r'\\Data length:\s*(\d+)', blk)
         nm  = re.search(r'@2:Image Data:\s*S\s*\[([^\]]+)\].*?"([^"]+)"', blk)
         zsc = re.search(r'@2:Z scale:\s*V \[Sens\.\s*(\w+)\]\s*\(([\d.e+-]+)', blk)
         if off and nm:
             chs.append({
-                'offset': int(off.group(1)),
-                'bpp':    int(bpp.group(1)) if bpp else 2,
-                'key':    nm.group(1).strip(),
-                'name':   nm.group(2).strip(),
-                'z_key':  zsc.group(1) if zsc else 'ZsensSens',
-                'z_lsb':  float(zsc.group(2)) if zsc else 0.000375,
+                'offset':      int(off.group(1)),
+                'bpp':         int(bpp.group(1)) if bpp else 2,
+                # 部分掃描（中斷/未跑滿）時，channel 的實際有效資料量
+                # 會小於 n_px×n_lines×bpp；務必以此欄位為界，避免讀到
+                # 下一個 channel 的資料區（見 detect.py changelog 2026-06-16）
+                'data_length': int(dln.group(1)) if dln else None,
+                'key':         nm.group(1).strip(),
+                'name':        nm.group(2).strip(),
+                'z_key':       zsc.group(1) if zsc else 'ZsensSens',
+                'z_lsb':       float(zsc.group(2)) if zsc else 0.000375,
             })
     return {
         'n_px': n_px, 'n_lines': n_ln, 'scan_nm': scan, 'px_nm': scan / n_px,
@@ -136,12 +141,19 @@ def read_nanoscope_channel(fp, meta, ch_idx=None):
     ch  = meta['channels'][ch_idx]
     n   = meta['n_px'] * meta['n_lines']
     dt  = np.int16 if ch['bpp'] == 2 else np.int32
+    read_bytes = n * ch['bpp']
+    # 部分掃描（中斷/未跑滿）時，channel 宣告的 Data length 會小於
+    # n_px×n_lines×bpp；務必以此為界，否則會讀到下一個 channel 的資料區
+    # （曾發生 Height Sensor 因此混入 DMTModulus/Adhesion 等通道數值，
+    #   造成 std 異常大、看似雜訊但實為跨通道污染）
+    if ch.get('data_length'):
+        read_bytes = min(read_bytes, ch['data_length'])
     with open(fp, 'rb') as f:
         f.seek(ch['offset'])
-        raw = np.frombuffer(f.read(n * ch['bpp']), dtype=dt)
+        raw = np.frombuffer(f.read(read_bytes), dtype=dt)
 
-    # 實際讀到的元素可能少於 n_px*n_lines（多通道檔案各通道行數可能不同）
-    # → 從資料長度反推實際行數，zoom 會統一縮放至 128×128
+    # 實際讀到的元素可能少於 n_px*n_lines（多通道檔案各通道行數可能不同，
+    # 或整次掃描中途中斷）→ 從資料長度反推實際行數，zoom 會統一縮放至 128×128
     actual_lines = len(raw) // meta['n_px']
     if actual_lines == 0:
         raise ValueError(

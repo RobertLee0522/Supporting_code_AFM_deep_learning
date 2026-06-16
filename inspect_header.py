@@ -70,7 +70,8 @@ def main():
         else:
             print(f"  ⚠ 目前 regex 無法解析此行（z_key/z_lsb 將使用預設值）")
 
-        # 讀取該 channel 原始整數資料統計
+        # 讀取該 channel 原始整數資料統計（未限制 data_length，舊版行為，
+        # 可能讀到下一個 channel 的資料區）
         if off and bpp:
             offset_v = int(off.group(1))
             bpp_v    = int(bpp.group(1))
@@ -80,12 +81,25 @@ def main():
                 f.seek(offset_v)
                 raw_data = np.frombuffer(f.read(n * bpp_v), dtype=dt)
             if raw_data.size > 0:
-                print(f"  讀到元素數   : {raw_data.size}  dtype={dt.__name__}")
-                print(f"  raw min/max  : {raw_data.min()} / {raw_data.max()}")
-                print(f"  raw std      : {raw_data.astype(np.float64).std():.2f}")
-                print(f"  raw 全距(峰峰): {int(raw_data.max()) - int(raw_data.min())}")
+                print(f"  [未限制長度] 讀到元素數: {raw_data.size}  dtype={dt.__name__}")
+                print(f"  [未限制長度] raw min/max: {raw_data.min()} / {raw_data.max()}"
+                      f"  std={raw_data.astype(np.float64).std():.2f}")
             else:
                 print(f"  ⚠ 讀不到任何資料（offset/bpp 可能有誤）")
+
+            # 修正後：以 Data length 為界，避免跨 channel 污染
+            if ln:
+                bound_bytes = int(ln.group(1))
+                with open(fp, 'rb') as f:
+                    f.seek(offset_v)
+                    raw_bound = np.frombuffer(f.read(bound_bytes), dtype=dt)
+                actual_lines = raw_bound.size // n_px
+                print(f"  [Data length限制] 讀到元素數: {raw_bound.size}  "
+                      f"→ {actual_lines}/{n_ln} 行有效")
+                if raw_bound.size > 0:
+                    print(f"  [Data length限制] raw min/max: "
+                          f"{raw_bound.min()} / {raw_bound.max()}"
+                          f"  std={raw_bound.astype(np.float64).std():.2f}")
         print()
 
 

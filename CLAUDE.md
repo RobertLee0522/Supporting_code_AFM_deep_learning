@@ -230,6 +230,25 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-06-16 — `detect.py`：修正 channel 讀取越界（跨 channel 資料污染），新增 `inspect_header.py`**
+  - **根因**：`read_nanoscope_channel()` 舊版永遠按 `n_px×n_lines×bpp`（假設跑滿全幅）
+    讀取每個 channel 的位元組數，忽略標頭中該 channel 自己宣告的 `Data length` 欄位。
+    當掃描中途中斷（如本例 49/256 行即停止）時，每個 channel 實際只有 49 行有效資料，
+    但程式仍嘗試讀 256 行的位元組數，導致讀取範圍跨越到下一個 channel 的資料區
+    （甚至更後面的 channel），把不相干數值（如 DMTModulus、Adhesion）混入
+    `Height Sensor` 影像，造成 std 異常大（6830）、看似雜訊但實為跨通道污染——
+    這也是先前 std.001 推論出現「121.5× 過度去卷積」假警報的根本原因
+    （輸入經污染後基線校正範圍仍接近 0，模型任何微小輸出都被無限放大解讀）。
+  - **修正**：`parse_nanoscope_header()` 新增解析 `Data length` 欄位（`chs[].data_length`）；
+    `read_nanoscope_channel()` 讀取時以 `min(n_px×n_lines×bpp, data_length)` 為界，
+    不再越界讀到下一個 channel。既有的 `actual_lines` 部分掃描處理邏輯（zoom 縮放至
+    128×128）可正確接手，但需注意：若有效行數遠少於宣告行數（如本例僅 19%），
+    縮放後的幾何形狀會嚴重失真，建議使用者確認該掃描是否需要重新量測。
+  - **新增 `inspect_header.py`**：診斷工具，印出各 channel 的 `Data offset/Bytes per
+    pixel/Data length/Z scale` 原始文字與解析結果，並比較「未限制長度」vs
+    「以 Data length 為界」兩種讀法的 raw min/max/std，方便日後排查類似的
+    部分掃描或 channel 邊界問題。
+
 - **2026-06-16 — `detect.py`：放寬 Nanoscope 副檔名偵測，支援描述性字尾**
   - **問題**：使用者將 `std.000` 手動標記為 `std.000-after flatten`（內容仍是原始 Nanoscope
     二進位格式，僅檔名加註處理階段），但 `is_nanoscope_file()` 舊版用 `^\.\d{3}$`（嚴格匹配
