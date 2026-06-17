@@ -19,6 +19,11 @@
 !GPU_SETUP_GUIDE.md
 !OPTIMIZATION_SUMMARY.md
 
+# 電子研究紀錄簿（lab_notebook/）：輕量文字檔，記錄每次調查/修正的
+# 研究過程與結論，版控以利追蹤決策脈絡。
+!lab_notebook/
+!lab_notebook/*.md
+
 # runs/ 目錄：完全不追蹤（權重 / 圖片 / log 均不上傳）
 runs/
 

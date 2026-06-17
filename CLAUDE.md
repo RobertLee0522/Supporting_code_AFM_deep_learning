@@ -179,6 +179,8 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
    dilation/erosion、去卷積、進入率、SSIM/PSNR 等術語。
 6. **新增需上傳的檔案類型**：若確有必要版控新類型（如某小型參數檔），
    先在 `.gitignore` 以 `!pattern` 明確白名單，並於此說明。
+   - `lab_notebook/*.md`（2026-06-16 新增白名單）：電子研究紀錄簿，
+     每篇記錄一次調查/修正的目的、過程、數據與結論，輕量文字檔。
 
 > 提交前快速檢查：`git status` 不應出現任何圖片／權重／資料大檔；
 > 若出現代表 `.gitignore` 需補規則。
