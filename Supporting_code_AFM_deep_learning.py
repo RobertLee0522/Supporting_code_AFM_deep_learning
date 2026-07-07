@@ -119,6 +119,17 @@ TARGET_TIP_SIZE  = 55    # 將估算探針 resize 至此尺寸 (px)（供 tip_co
 TIP_RADIUS_NM  = 46.9   # afm_gui 量得真實探針 ROC (nm)；比舊值 73.0 更尖
 TIP_TRAIN_SIZE = 5      # 合成探針尺寸 (px)；縮小至 5px 避免訓練時孔洞被完全填平
 
+# ---- 廠商 cone 探針（取代盲重建鈍探針，修正過度去卷積）----------------
+# [FIX] 盲重建/拋物線探針對「孔比探針寬」的樣品會把訓練 dilated 孔填太窄
+#   （訓練 input ~88nm vs 真實掃描 input ~253nm@-20nm），模型學到過大放大率，
+#   對真實掃描預測過度放大（train15 量得預測孔徑 ~388nm vs SEM 真實 228.8nm）。
+#   改用廠商規格的尖 cone：dilation 幾乎不 narrow（dilated≈GT），訓練 input 才對得上
+#   真實掃描 input → 模型不再過度去卷積。R/θ 請填你探針的 datasheet 規格。
+USE_CONE_TIP   = True    # True: dilation 用廠商 cone（推薦）；False: 用 tip.mat/拋物線
+CONE_R_NM      = 2.0     # 廠商尖端球形半徑 (nm)
+CONE_THETA_DEG = 25.0    # 廠商半錐角 (°，從探針軸量起)
+CONE_MAX_PX    = 9       # cone footprint (px，奇數)
+
 # ---- 梯形孔樣品標稱參數（用於訓練資料生成）--------------------
 # 來源：用戶實際掃描的校正樣品
 TRAP_OPEN_NM  = 228.8   # 開口寬度 (nm)
@@ -180,6 +191,45 @@ def make_training_tip(size=TIP_TRAIN_SIZE, radius_nm=TIP_RADIUS_NM,
     print(f"  邊緣深度 = {edge_depth:.1f} nm  "
           f"（粒子高度需 < {abs(edge_depth):.0f} nm 才不飽和）")
     return tip_2d
+
+
+def make_cone_training_tip(R_nm=CONE_R_NM, theta_deg=CONE_THETA_DEG,
+                           max_px=CONE_MAX_PX, px_nm=SURFACE_SCALE_NM):
+    """建立廠商規格的「球冠頂端 + 直線錐壁」探針（apex=0、向外為負、旋轉對稱）。
+
+    與 afm_gui.make_cone_tip 同公式。用於 grey_dilation 模擬 AFM 掃描：
+    尖 cone 對「孔比探針寬」的樣品幾乎不 narrow（dilated≈GT），使訓練 input
+    對得上真實掃描 input，避免鈍探針造成的過度去卷積。
+
+    Args:
+        R_nm      : 尖端球形半徑 (nm)
+        theta_deg : 半錐角 (°，從探針軸量起；越小越尖)
+        max_px    : footprint 邊長 (px，奇數)
+        px_nm     : 每像素 nm（須與 SURFACE_SCALE_NM 一致）
+    Returns:
+        tip_2d : ndarray (max_px, max_px)，中心=0、向外為負
+    """
+    if max_px % 2 == 0:
+        max_px += 1
+    c = max_px // 2
+    yi, xi = np.indices((max_px, max_px))
+    r_nm   = np.sqrt((yi - c) ** 2 + (xi - c) ** 2) * px_nm
+
+    theta   = np.radians(theta_deg)
+    r_trans = R_nm * np.sin(theta)
+    tip     = np.zeros((max_px, max_px))
+
+    sphere = r_nm <= r_trans
+    tip[sphere] = -(R_nm - np.sqrt(np.maximum(R_nm ** 2 - r_nm[sphere] ** 2, 0)))
+
+    z_trans = -(R_nm - np.sqrt(max(R_nm ** 2 - r_trans ** 2, 0.0)))
+    cone = r_nm > r_trans
+    tip[cone] = z_trans - (r_nm[cone] - r_trans) / np.tan(theta)
+
+    tip -= tip.max()   # apex = 0
+    print(f"  [訓練探針] 廠商 cone: R={R_nm} nm, θ={theta_deg}°, "
+          f"{max_px}×{max_px} px @ {px_nm:.2f} nm/px  邊緣深度={tip.min():.0f} nm")
+    return tip
 
 
 # ============================================================
@@ -560,17 +610,23 @@ def cylinder_hole_randomizer(px_nm=SURFACE_SCALE_NM, img_size=128,
     centers_px, radii_px, depths_nm = [], [], []
 
     for _ in range(n_holes):
-        # ── 尺度多樣性（at 39.1 nm/px）：混合小孔與大孔豐富資料集 ──────
-        #   70% 小孔 (1.5–8px = 59–313nm)：訓練極小/一般孔的去卷積
-        #   30% 大孔 (8–24px = 313–938nm)：訓練大尺度孔洞、提升泛化
-        # 大孔讓模型不會只學到「小圓點」的偏誤，增強尺度魯棒性
-        if random.random() < 0.30:
-            r_px = random.uniform(8.0, 24.0)     # 大孔 313–938 nm
+        # ── 尺寸對齊真實樣品（修正過度去卷積）─────────────────────────
+        #   [FIX] 真實孔開口 228.8 nm = 半徑 2.93 px @39.1nm/px（SEM 量得）。
+        #   舊版 3–24px（70% 3–8px、30% 8–24px）幾乎全部大於真實孔，模型
+        #   學到「小孔→放大成大孔」的尺寸偏誤，對真實掃描預測過度放大約
+        #   1.45×（量得預測孔徑 ~8.5px vs 真實 5.9px；見 changelog）。
+        #   改為以真實半徑為中心的窄分佈，移除 8–24px 巨孔群、僅保留小幅
+        #   上緣供尺度泛化：
+        #     主群 80%：2.9–3.8px（≈227–297nm 開口，涵蓋真實開口 ±30%）
+        #     上緣 20%：3.8–6.0px（≈297–469nm，輕度泛化，無巨孔偏誤）
+        #   下限 2.9px > 探針填充極限 2.77px@125nm，確保 dilated 仍有可見
+        #   孔洞訊號；若低於填充極限，孔在膨脹後完全消失 → 模型學到
+        #   「全平表面→生出孔洞」退化解，正是過度去卷積的來源。
+        if random.random() < 0.20:
+            r_px = random.uniform(3.8, 6.0)      # 上緣中孔 297–469 nm
         else:
-            # 最小 3 px（117nm） > 探針填充極限半徑（2.77px@125nm 深）
-            # 確保 dilated 訓練影像有可見孔洞訊號，不被探針完全填平
-            r_px = random.uniform(3.0, 8.0)      # 小孔 117–313 nm
-        depth   = random.uniform(60.0, 145.0)   # 深度 60–145 nm（加寬變異）
+            r_px = random.uniform(2.9, 3.8)      # 主群 ~真實開口 227–297 nm
+        depth   = random.uniform(60.0, 145.0)   # 深度 60–145 nm（涵蓋真實 125.8）
         margin  = r_px + 3
         min_pos = margin
         max_pos = img_size - margin
@@ -818,8 +874,8 @@ save_plot('trapezoid_preview.png')
 #   這正確模擬 AFM 探針無法完全進入孔洞的物理現象
 # ============================================================
 
-# 優先載入真實 tip.mat（探針形狀與實際掃描一致，去卷積更準確）
-# 若不存在則退回合成拋物線探針
+# [FIX] 優先用廠商 cone（USE_CONE_TIP=True）；盲重建/拋物線鈍探針會把訓練孔
+# 填太窄 → 模型過度去卷積（見上方 CONE_* 常數說明）。關閉時才退回 tip.mat。
 TIP_MAT_CANDIDATES = [
     'tip.mat/tip_estimated_corrected.mat',   # 校正後（優先）
     'tip.mat/tip_estimated.mat',             # 未校正
@@ -827,7 +883,16 @@ TIP_MAT_CANDIDATES = [
 ]
 tip_shape  = None
 tip_source = 'synthetic_paraboloid'
+
+if USE_CONE_TIP:
+    tip_shape  = make_cone_training_tip()
+    tip_source = f'vendor_cone_R{CONE_R_NM}_th{CONE_THETA_DEG}'
+    print(f"  [探針] 使用廠商 cone（USE_CONE_TIP=True）："
+          f"R={CONE_R_NM}nm θ={CONE_THETA_DEG}°")
+
 for _tp in TIP_MAT_CANDIDATES:
+    if tip_shape is not None:
+        break
     if os.path.exists(_tp):
         try:
             # max_tip_px=5 → 5×5 px = ±2 px = ±78 nm 有效半徑；
@@ -1412,7 +1477,14 @@ print(f"  [摘要] {metrics_path}")
 config_path = os.path.join(RUN_DIR, 'config.txt')
 with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"[訓練探針設定]\n")
-    if tip_source == 'synthetic_paraboloid':
+    if tip_source.startswith('vendor_cone'):
+        f.write(f"  類型             : 廠商 cone（球冠+直線錐壁，USE_CONE_TIP=True）\n")
+        f.write(f"  規格             : R={CONE_R_NM} nm, θ={CONE_THETA_DEG}°（半錐角）\n")
+        f.write(f"  訓練尺寸         : {tip_shape.shape[0]}×{tip_shape.shape[1]} px "
+                f"@ {SURFACE_SCALE_NM} nm/px  邊緣深度={tip_shape.min():.0f} nm\n")
+        f.write(f"  動機             : 尖 cone 幾乎不 narrow（dilated≈GT），訓練 input 對齊"
+                f"真實掃描 input，修正過度去卷積（取代鈍探針把孔填太窄）\n\n")
+    elif tip_source == 'synthetic_paraboloid':
         _edge_nm    = TIP_TRAIN_SIZE // 2 * SURFACE_SCALE_NM
         _edge_depth = -(_edge_nm ** 2) / (2.0 * TIP_RADIUS_NM)
         f.write(f"  類型             : 合成拋物線探針 (Paraboloid)\n")
@@ -1429,11 +1501,11 @@ with open(config_path, 'w', encoding='utf-8') as f:
     f.write(f"[訓練策略]\n")
     f.write(f"  樣品類型         : 全凹洞（移除突起粒子，突起與孔洞物理行為相反）\n")
     f.write(f"  資料來源 1       : 梯形孔 (trapezoid_hole)  {N_TRAP} 張\n")
-    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N_CYL} 張（小+大混合尺度，圓形主形狀）\n")
+    f.write(f"  資料來源 2       : 圓柱孔 (cylinder_hole)   {N_CYL} 張（對齊真實孔徑，圓形主形狀）\n")
     f.write(f"  星形孔           : 已移除（對圓形樣品增加角狀歧義，grey dilation 使形狀難區分）\n")
-    f.write(f"  圓柱孔半徑       : 3–24 px（小孔 70%: 3–8px≥117nm / 大孔 30%: 8–24px）\n")
-    f.write(f"  最小半徑說明     : 3px（117nm）> 探針填充極限2.77px@深度125nm，確保dilated有訊號\n")
-    f.write(f"  深度範圍         : 60–145 nm\n")
+    f.write(f"  圓柱孔半徑       : 主群80% 2.9–3.8px（227–297nm，對齊SEM開口228.8nm）/ 上緣20% 3.8–6.0px\n")
+    f.write(f"  半徑修正說明     : 移除舊版8–24px巨孔群（造成預測過度放大~1.45×）；下限2.9px>填充極限2.77px@125nm\n")
+    f.write(f"  深度範圍         : 60–145 nm（涵蓋真實 125.8）\n")
     f.write(f"  SURFACE_SCALE_NM : {SURFACE_SCALE_NM} nm/unit\n")
     f.write(f"\n[梯形孔樣品設定（用戶真實樣品）]\n")
     f.write(f"  開口寬度  : {TRAP_OPEN_NM} nm  (±{int(TRAP_VARIATION*100)}%)\n")

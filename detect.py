@@ -260,26 +260,36 @@ def load_nanoscope(filepath):
     img_nm = flatten_rows_holes(img_nm)
     print(f"  基線校正後範圍：[{img_nm.min():.1f}, {img_nm.max():.1f}] nm")
 
-    # Resize to 128×128（分別指定行、列縮放倍率，避免非正方形影像變形）
+    # ── 尺度正規化：重採樣到訓練的 39.1 nm/px，再補/裁到 128×128 ──────
+    # 訓練影像 = 5000nm/128px = 39.1 nm/px；模型只認得這個物理尺度下的孔洞
+    # 像素大小。舊作法直接把任意掃描硬塞成 128，孔洞像素尺寸會偏移 → 模型
+    # 過補/欠補（如 std.004 666nm 硬塞 128，孔變 7.5× 大 → 預測碎裂成假孔）。
+    # 正規化後「像素大小 = 物理大小」，同一模型可處理任意掃描範圍。
+    SURFACE_SCALE_NM = 39.1
     h, w = img_nm.shape
-    if (h, w) != (128, 128):
-        img_nm = zoom(img_nm, (128 / h, 128 / w), order=3)
-
-    # ── 橫向尺度診斷 ──────────────────────────────────────────────
-    # 訓練假設：每 px = SURFACE_SCALE_NM = 39.1 nm（5000nm 掃描 / 128px）
-    # 若真實掃描範圍不同，resize 後每 px 物理距離會偏移，導致孔洞被模型誤判尺寸
-    SURFACE_SCALE_NM = 39.1   # 訓練時的基準（nm/px）
-    actual_px_nm = meta['scan_nm'] / 128.0
-    scale_ratio  = actual_px_nm / SURFACE_SCALE_NM
-    print(f"\n  ── 橫向尺度檢查 ──")
-    print(f"  掃描範圍     : {meta['scan_nm']:.1f} nm")
-    print(f"  實際 px_nm   : {actual_px_nm:.2f} nm/px  (resize 至 128×128 後)")
-    print(f"  訓練 px_nm   : {SURFACE_SCALE_NM:.2f} nm/px  (5000nm / 128px)")
-    if abs(scale_ratio - 1.0) > 0.15:
-        print(f"  ⚠ 尺度偏差 {(scale_ratio-1)*100:+.1f}%：孔洞在像素空間偏大/偏小 {scale_ratio:.2f}×")
-        print(f"    → 建議將掃描範圍調整為 5000nm，或重新訓練匹配當前掃描尺度")
+    target_px = max(1, int(round(meta['scan_nm'] / SURFACE_SCALE_NM)))
+    print(f"\n  ── 尺度正規化（目標 {SURFACE_SCALE_NM} nm/px）──")
+    print(f"  掃描範圍 {meta['scan_nm']:.1f} nm → 訓練尺度下應為 {target_px}×{target_px} px")
+    if target_px <= 128:
+        zf  = target_px / h
+        src = img_nm
+        if zf < 0.5:                       # 大幅下採樣前先高斯抗鋸齒
+            from scipy.ndimage import gaussian_filter
+            src = gaussian_filter(img_nm, sigma=0.5 / zf)
+        resamp = zoom(src, (target_px / h, target_px / w), order=3)
+        pad_t  = (128 - target_px) // 2
+        pad_b  = 128 - target_px - pad_t
+        # 以表面(基線=0)補滿四周，模型看到「孔洞處於正確尺寸的平坦表面」
+        img_nm = np.pad(resamp, ((pad_t, pad_b), (pad_t, pad_b)),
+                        mode='constant', constant_values=0.0)
+        print(f"  重採樣至 {target_px}px（保持 39.1 nm/px）→ 置中、以表面補滿至 128"
+              f"（補 {pad_t}+{pad_b} px 背景）")
     else:
-        print(f"  ✓ 尺度相符（偏差 {(scale_ratio-1)*100:+.1f}%）")
+        # 掃描範圍 > 5000nm：視野大於訓練，直接縮到 128（孔洞會略小於訓練尺寸）
+        img_nm = zoom(img_nm, (128 / h, 128 / w), order=3)
+        print(f"  ⚠ 掃描範圍 > 5000nm（{target_px}px>128）：欄位大於訓練視野，"
+              f"直接縮放至 128（孔洞略偏小，建議掃 ≤5000nm）")
+    print(f"  ✓ 正規化完成：每 px = {SURFACE_SCALE_NM} nm（與訓練一致）")
 
     # ── Z 範圍保護（兩段：嚴重異常縮放 + 超出分布軟性警告）────────
     z_range    = img_nm.max() - img_nm.min()
@@ -448,6 +458,57 @@ def save_results(input_image, predicted_image, output_prefix, predict_dir):
     print(f"  - {output_prefix}_predicted.npy/.mat/.png")
 
 
+def measure_hole_geometry(img_2d, px_nm=39.1):
+    """逐孔量測孔洞 上寬 / 下寬 / 深度，取多顆完整孔的 mean±std。
+
+    正規化後全圖為 39.1 nm/px。以表面 percentile(95) 為基線，
+    **對每顆孔各自量測**（避免被單一離群孔/尖刺誤導；舊版取全域最深點當
+    深度會高估）：
+      上寬 = 該孔近表面（自身 15% 深度）等效孔徑
+      下寬 = 該孔近孔底（自身 85% 深度）等效孔徑
+      深度 = 該孔最深 nm
+    自動跳過：碰到影像邊緣的殘缺孔、面積過小（<3px）/過淺（<20nm）的雜訊。
+    回傳統計 dict（各參數 mean/std + 採用孔數 n_holes + 跳過邊緣數 n_edge）；
+    無有效孔回傳 None。
+    """
+    from scipy.ndimage import label as _label
+    base  = np.percentile(img_2d, 95)
+    depth = base - img_2d
+    gmax  = float(depth.max())
+    if gmax < 10:
+        return None
+
+    lbl, n = _label(depth > 0.20 * gmax)     # 以全域 20% 門檻分出各孔
+    H, W = img_2d.shape
+    tops, bots, deps = [], [], []
+    n_edge = 0
+    for k in range(1, n + 1):
+        m = lbl == k
+        if m.sum() < 3:
+            continue                          # 太小：雜訊點
+        ys, xs = np.where(m)
+        if ys.min() == 0 or xs.min() == 0 or ys.max() == H - 1 or xs.max() == W - 1:
+            n_edge += 1                        # 碰邊緣的殘缺孔：跳過
+            continue
+        d_k = float(depth[m].max())
+        if d_k < 20:
+            continue                          # 太淺：跳過
+        sub = depth * m
+        top = 2 * np.sqrt((sub > 0.15 * d_k).sum() / np.pi) * px_nm
+        bot = 2 * np.sqrt((sub > 0.85 * d_k).sum() / np.pi) * px_nm
+        tops.append(top); bots.append(bot); deps.append(d_k)
+
+    if len(tops) == 0:
+        return None
+    t = np.array(tops); b = np.array(bots); d = np.array(deps)
+    return {
+        'top_nm':   float(t.mean()), 'top_std':   float(t.std()),
+        'bot_nm':   float(b.mean()), 'bot_std':   float(b.std()),
+        'depth_nm': float(d.mean()), 'depth_std': float(d.std()),
+        'n_holes':  int(t.size),     'n_edge':    int(n_edge),
+    }
+
+
 def visualize_results(input_image, predicted_image, output_prefix,
                       predict_dir, no_display=False):
     """
@@ -479,6 +540,24 @@ def visualize_results(input_image, predicted_image, output_prefix,
     else:
         print(f"  ⚠ 深度比 {depth_ratio:.2f}×，方向異常（預測與輸入同號或 in_min 近零）")
 
+    # ── 孔洞幾何量測：逐孔 mean±std 上寬 / 下寬 / 深度（仿 NanoScope Section）──
+    geo_in = measure_hole_geometry(input_2d)
+    geo_pr = measure_hole_geometry(predicted_2d)
+    print(f"\n  ── 孔洞幾何（逐孔 mean±std，正規化後 39.1 nm/px）──")
+    print(f"  {'':<5}{'上寬(nm)':>13}{'下寬(nm)':>13}{'深度(nm)':>13}{'孔數':>6}")
+    for tag, g in [('輸入', geo_in), ('預測', geo_pr)]:
+        if g:
+            print(f"  {tag:<5}"
+                  f"{g['top_nm']:>6.0f}±{g['top_std']:<5.0f}"
+                  f"{g['bot_nm']:>6.0f}±{g['bot_std']:<5.0f}"
+                  f"{g['depth_nm']:>6.0f}±{g['depth_std']:<5.0f}"
+                  f"{g['n_holes']:>5}")
+        else:
+            print(f"  {tag:<5}（未偵測到有效孔洞）")
+    _edge = (geo_pr or geo_in or {}).get('n_edge', 0)
+    if _edge:
+        print(f"  （已自動跳過 {_edge} 顆碰邊緣的殘缺孔）")
+
     # ── 共用色階（防止視覺誤判）─────────────────────────────────
     # 使用兩張圖的聯集範圍，確保顏色對比有意義
     vmin = min(in_min, pr_min)
@@ -487,12 +566,20 @@ def visualize_results(input_image, predicted_image, output_prefix,
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     im1 = axes[0].imshow(input_2d, cmap='viridis', vmin=vmin, vmax=vmax)
-    axes[0].set_title(f'Input (AFM scan)  [nm]\nmin={in_min:.1f}  max={in_max:.1f}')
+    geo_i = (f'\ntop={geo_in["top_nm"]:.0f}  bot={geo_in["bot_nm"]:.0f}  '
+             f'depth={geo_in["depth_nm"]:.0f} nm  (mean, n={geo_in["n_holes"]})'
+             if geo_in else '')
+    axes[0].set_title(f'Input (AFM scan)  [nm]\n'
+                      f'min={in_min:.1f}  max={in_max:.1f}{geo_i}')
     axes[0].axis('off')
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
     im2 = axes[1].imshow(predicted_2d, cmap='viridis', vmin=vmin, vmax=vmax)
-    axes[1].set_title(f'Predicted (Deconvolved)  [nm]\nmin={pr_min:.1f}  max={pr_max:.1f}')
+    geo_p = (f'\ntop={geo_pr["top_nm"]:.0f}  bot={geo_pr["bot_nm"]:.0f}  '
+             f'depth={geo_pr["depth_nm"]:.0f} nm  (mean, n={geo_pr["n_holes"]})'
+             if geo_pr else '')
+    axes[1].set_title(f'Predicted (Deconvolved)  [nm]\n'
+                      f'min={pr_min:.1f}  max={pr_max:.1f}{geo_p}')
     axes[1].axis('off')
     plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 

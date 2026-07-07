@@ -66,6 +66,8 @@
 | `batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
 | `evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
 | `check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
+| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學） | 影像 .npy + 已知探針 | 還原表面 + certainty map |
+| `reconstruct_lines_3d.py` | 凸起樣品逐線 1D 去卷積 + 3D 重建（給定 R, θ） | Nanoscope .000 + 探針 R/θ | 還原高度圖 .npy + 3D 渲染 PNG |
 
 ### 3.1 `afm_gui.py`（盲探針重建 GUI）
 - `parse_nanoscope()` / `read_channel()`：解析 Nanoscope 二進位標頭，
@@ -75,8 +77,13 @@
 - `reconstruct()`：偵測特徵 → 收集 patch → 平均 → 2D 配準 → 深度對齊 →
   形態學腐蝕 (`compute_tip`)。
 - `compute_tip()`：**核心**。表面/基底對齊 GT 後做 Villarrubia 形態學腐蝕
-  (`grey_erosion`)，再四向對稱化 + 徑向平均強制旋轉對稱。支援
-  `manual_offset` 以 **深度縮放** 手動調整 AFM 曲線探底（見 Changelog）。
+  (`grey_erosion`)，再四向對稱化 + 徑向平均強制旋轉對稱，最後 `extend_tip_cone()`
+  錐壁延伸。`manual_offset` 純視覺平移（見 Changelog）。
+- `extend_tip_cone()`：**[FIX-11]** 把盲重建探針外緣「攤平的裙邊」沿錐壁斜率
+  直線外推成 cone。盲重建只能還原探針實際接觸孔壁的頂端，接觸區外 `grey_erosion`
+  的 min 飽和 → 側壁攤平變鈍；本函式量測接觸區錐壁斜率並直線延伸至邊緣（含角落），
+  還原錐形側壁。下游效益：較尖錐探針 dilation 的 narrow 量正常，避免鈍探針把訓練孔
+  填太窄導致模型過度去卷積。
 - `reconstruct_morphological()`：`tip = scan ⊖ surface`（孔洞先反轉再腐蝕）。
 - `analyze_rim()`：從孔緣過渡帶估算探針有效半徑、錐角、進入率（進入率低時
   比孔底資訊更可靠）。
@@ -88,7 +95,9 @@
   `cylinder_hole_creator/randomizer`（Euclidean 距離圓柱孔，小+大混合尺度）、
   `star_hole_creator/randomizer`（極座標 `r_bound(θ)=r_mid+amp·cos(n·(θ−θ0))`
   生成 4/5/6 芒星形孔，非凸含尖角，提升形狀魯棒性）。
-- 合成探針：`make_training_tip()` 拋物面 `z(r) = -r²/(2R)`，頂點=0。
+- 合成探針：**`make_cone_training_tip()`（廠商 cone：球冠+直線錐壁，預設 R=2nm θ=25°，
+  `USE_CONE_TIP=True` 時採用）** 或 `make_training_tip()`（拋物面 `z(r)=-r²/(2R)`）或 tip.mat。
+  尖 cone 對寬孔幾乎不 narrow，使訓練 input 對齊真實掃描 input（修正過度去卷積，見 Changelog）。
 - 物理模擬：`scipy.ndimage.grey_dilation(surface, structure=tip)` 產生「膨脹影像」。
 - 真實感：`add_scan_line_artifacts()`（橫向掃描條紋）+ `add_gaussian_noise()`。
 - 正規化：全域 min/max（`NORM_MIN=-155`, `NORM_MAX=+105`）→ 背景 0nm 映射到
@@ -231,6 +240,95 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ## 9. 變更紀錄 (Changelog)
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-06-25 — 新增 `reconstruct_lines_3d.py`：凸起樣品探針去卷積 + 3D 重建（2D/逐線1D）**
+  - **需求**：給定探針 R(球冠半徑 nm)/θ(半錐角 °)，對 Nanoscope `.000` 凸起樣品掃描去卷積、
+    堆疊成面、輸出 3D 渲染圖。
+  - **凸起 vs 凹孔**：凸起頂端被探針準確爬過、只有側壁被撐寬(tip broadening)→ erosion
+    可良好還原（凹孔則底部資訊物理遺失，救不回）。erosion 對兩者皆成立，凸起結果更佳。
+  - **三種模式（`--mode`）**：
+    - `2d`（**預設、推薦**）：`reconstruct_2d()` 用完整 2D 探針 grey_erosion，**X/Y 同時等向還原**。
+    - `line`：`reconstruct_per_line()` 逐行 1D erosion——**只修 X(快軸)、Y(慢軸)不動** →
+      被等向撐大的圓會還原成**橢圓**（X 收窄、Y 不變）。屬近似，僅供比較。
+    - `both`：兩者並排比較。
+    - **驗證（圓盤凸起）**：真實 41×41 → 探針撐大 63×63 → 1D 還原 43×63（橢圓！）、
+      2D 還原 43×43（圓 ✓）。確認逐線 1D 的非等向缺陷，**正解為 2D**。
+  - **作法**：沿用 detect.py 的 Nanoscope 解析/Z 校正（Data length 上界、跨通道保護）；
+    `flatten_rows_bumps()` 凸起版基線（低百分位為表面、特徵向上）；`make_cone_tip_2d()`/
+    `make_cone_profile_1d()` 生成探針；`auto_tip_half()` 依凸起高度自動估視窗。3D 用 plot_surface
+    輸出輸入 vs 還原並排圖。所有模式 `s_r ≤ i` 恆成立=不過度去卷積。TF-free。
+
+- **2026-06-25 — 新增 `blind_deconvolution.py`：通用 certainty 去卷積引擎（零訓練）**
+  - **動機**：DL 路線（train14–16）是「為單一探針+單一樣品」訓練，無法當通用產品；
+    且診斷顯示對本樣品 DL 幾乎無加值（尖探針失真小、平底資訊物理遺失、且會過度去卷積）。
+    通用產品該走 Villarrubia (1997) 形態學：成像 `i=s⊕t`、還原 `s_r=i⊖t`（grey erosion）。
+  - **核心（已驗證正確）**：`reconstruct_surface()` 用已知探針對影像做 grey_erosion，
+    嚴格滿足 `s ≤ s_r ≤ i`（demo 驗證 True）→ **數學保證不會過度去卷積**（只給確定下界）。
+    `surface_certainty()` 標出探針『實際接觸過』的表面點，其餘（如寬孔平底）標為 uncertain
+    （demo：孔底 95% 被標不可信）→ 誠實標出物理死角、不腦補。
+  - **探針來源**：吃『已知探針』——(A) 廠商 cone（`make_cone_tip(R,θ)`，推薦）或
+    (B) Gwyddion `itip_estimate` 跑尖刺校正光柵匯出的 tip.npy。**本檔不自實作 blind 盲估**
+    （Villarrubia 迭代易錯，交給 Gwyddion 成熟實作較可靠誠實）。
+  - **CLI**：`--demo`（合成驗證）/ `scan.npy --tip tip.npy` / `scan.npy --cone-R 2 --cone-theta 25`。
+    在真實 std.002 上用尖 cone 還原=掃描（99.9% certain）—— 誠實回報「尖探針沒失真、無需修正」，
+    對比 DL 同案例過度放大到 388nm。給較鈍的真實探針則會修更多並標更多 uncertain。
+  - **定位**：此為通用引擎雛形，與 DL pipeline 並存；要打包給所有 AFM 商做影像還原，
+    應以此為核心（探針當執行時輸入、certainty 誠實回報），而非為每支探針重訓 DL 模型。
+
+- **2026-06-22 — `Supporting_code_AFM_deep_learning.py`：dilation 改用廠商 cone 探針，根治過度去卷積（input 分布不匹配）**
+  - **根因（接續 train15 仍過放大的診斷）**：用絕對深度門檻量測發現，**真正的不匹配在 input 端**——
+    訓練 dilated 孔（模型 input）只有 ~88nm@-20nm，但真實掃描 input 孔達 ~253nm@-20nm。模型學到
+    「窄 input → 寬 GT」的大放大率，套到本來就寬的真實 input → 外插成 ~388nm（vs SEM 真實 228.8nm）。
+    input 太窄是因為 dilation 用的探針（盲重建 46.9nm 鈍探針 / 拋物線）對「孔比探針寬」的樣品
+    narrow 過頭（GT 220 → dilated 88）。**先前改 GT 孔大小是改錯層級，故 train15 無改善。**
+  - **新增 `make_cone_training_tip(R_nm, theta_deg, max_px, px_nm)`** 與常數
+    `USE_CONE_TIP/CONE_R_NM/CONE_THETA_DEG/CONE_MAX_PX`：以廠商規格的「球冠+直線錐壁」尖 cone
+    取代鈍探針做 grey_dilation。尖 cone 對寬孔幾乎不 narrow（模擬 dilated 220/202/202 ≈ 真實
+    input 253/216/165；舊鈍探針為 132/132/99），訓練 input 終於對得上真實掃描 input。
+    `USE_CONE_TIP=True` 時跳過 tip.mat 載入；R/θ 預設 2nm/25°（請依探針 datasheet 調整）。
+  - **為何不用盲重建 tip**：本樣品孔寬於探針，盲重建物理上只能 characterize 探針頂端、測不到
+    完整錐壁（且唯一可用檔 std.004 資料壞——量測深度 raw 164.7nm>真實、flatten 後又=0，見 afm_gui
+    [FIX-12]）。直接用 datasheet cone 最穩健，不需 GUI 重建、不需 tip.mat。
+  - **需重新訓練**：改動 dilation 探針，需重跑產生新 `runs/train{N}`；預期預測孔徑收斂到 ~220-260nm。
+
+- **2026-06-22 — `afm_gui.py`：新增 `extend_tip_cone()` 錐壁延伸，修正重建探針外緣攤平變鈍 [FIX-11]**
+  - **問題**：重建出的 tip 曲線兩側「趨於平緩（攤平裙邊）」而非錐狀。根因為盲重建
+    （`grey_erosion`）只能還原探針**實際接觸孔壁的頂端區段**；接觸區以外 min 運算飽和，
+    側壁攤平、探針看起來變鈍。對寬孔（如 std.004 視野內僅 0.7 個特徵、進入率 121.5%）尤其明顯。
+  - **新增 `extend_tip_cone(tip, half, px_nm)`**：量測接觸區錐壁斜率（取最陡 30% 為「可靠錐壁」），
+    沿該斜率把側壁**直線外推到邊緣（含角落）**，取代攤平裙邊，還原直線錐形側壁。
+    在 `compute_tip()` 的 `radial_average` 之後呼叫；ax4(2D)/ax5(cross-section 綠線) 直接反映。
+  - **下游效益**：此修正讓重建探針變尖（真正的 cone），存成 tip.mat 餵
+    `Supporting_code_AFM_deep_learning.py` 做 dilation 時 narrow 量恢復正常。先前診斷出
+    train15 仍過度去卷積（預測孔徑 ~388nm vs SEM 228.8nm），根因正是 dilation 探針太鈍
+    （訓練 input 孔 ~88nm 遠窄於真實掃描 input ~253nm@-20nm，模型學到過大放大率）。
+    錐壁延伸後的尖探針可改善此 input 分布不匹配，**需以新 tip.mat 重新訓練才生效**。
+  - 單元測試：對「球冠+攤平裙邊」鈍探針，修正後外緣斜率持續為負（直線錐壁）、不再攤平，
+    探針頂點到邊緣加深（更尖）。
+  - **[FIX-12] 物理健全性警告**：`reconstruct()` 新增檢查——孔洞經探針掃描只會變淺，
+    量測深度不可能 > 真實深度。若 `meas_depth > true_depth×1.05`（如 `std.004` 量到
+    164.7 > 125.8nm）→ 印 ⛔ 警告：高度資料含尖刺/壞值、重建探針無效（會得到中心反而最低
+    的顛倒形狀，`extend_tip_cone` 偵測不到向下錐壁而保險跳出），建議換乾淨檔或改用廠商 cone。
+  - **適用性結論**：本樣品孔洞「寬於探針」，盲重建物理上只能 characterize 探針頂端、
+    無法還原完整錐形側壁；要完整尖探針應直接用 🟠 vendor cone（`make_cone_tip`）存 tip.mat。
+    判斷檔案是否可用於重建：量測深度需 < 真實深度（進入率 <100%）。
+
+- **2026-06-18 — `Supporting_code_AFM_deep_learning.py`：圓柱孔尺寸對齊真實樣品，修正橫向過度去卷積（~1.45×）**
+  - **根因**：對 5000nm 完整掃描（`std.002`，橫向尺度 39.06 nm/px ≈ 訓練 39.1，**尺度本身相符**）
+    推論時，預測孔徑量得約 **8.5 px（~332 nm）**，比 SEM 量得真實開口 **228.8 nm（半徑 2.93 px）大約 1.45×**
+    （預測孔洞像素佔比 7.6% vs 輸入 1.0%）。深度則正確（預測 122 nm ≈ 真實 125.8 nm）。
+    追根究柢為**訓練圓柱孔的半徑分佈整體偏大**：舊版 `cylinder_hole_randomizer` 半徑 3–24 px
+    （70% 3–8px、30% 8–24px），**加權平均半徑 8.65 px（≈676 nm 開口）≈ 真實孔的 3 倍**。
+    模型看慣大孔，遇到真實小孔便「腦補」成熟悉的大尺寸 → 系統性橫向過度放大。此為先前多次
+    「過度去卷積」紀錄（縮小探針後）仍殘留的最後一塊：探針已修，但孔洞尺寸先驗仍偏大。
+  - **修正 `cylinder_hole_randomizer`**：半徑分佈改為以真實孔徑為中心的窄分佈——
+    主群 80% `U[2.9, 3.8]`px（227–297 nm，涵蓋真實開口 ±30%）、上緣 20% `U[3.8, 6.0]`px
+    （297–469 nm，輕度尺度泛化），**完全移除 8–24px 巨孔群**。新分佈加權平均半徑降為
+    3.66 px（≈286 nm），貼近真實 228.8 nm。下限 2.9 px 仍 > 探針填充極限 2.77px@125nm，
+    經 grey_dilation 驗證各半徑孔洞膨脹後仍保有可見訊號（minZ≈−125.8 nm），不致退化成
+    「全平→生孔」解。`config.txt` 同步更新半徑與深度說明文字。
+  - **需重新訓練**：此為訓練資料改動，需重跑 `Supporting_code_AFM_deep_learning.py` 產生新
+    `runs/train{N}` 後才生效；舊 train14 權重仍會過度放大。
 
 - **2026-06-16 — `detect.py`：修正 channel 讀取越界（跨 channel 資料污染），新增 `inspect_header.py`**
   - **根因**：`read_nanoscope_channel()` 舊版永遠按 `n_px×n_lines×bpp`（假設跑滿全幅）

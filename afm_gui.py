@@ -347,6 +347,9 @@ def compute_tip(avg, gt_p, shape_type, half, geom, px_nm, manual_offset=0.0):
     # ── 徑向平均：強制完全旋轉對稱，消除 XY 殘差 ────────────────
     tip_sym = radial_average(tip_sym, half)
 
+    # ── [FIX-11] 錐壁延伸：把外緣攤平裙邊還原成直線錐壁（避免探針變鈍）──
+    tip_sym = extend_tip_cone(tip_sym, half, px_nm)
+
     # ── Rim 分析（不依賴孔底，低進入率仍有效）─────────────────
     rim = analyze_rim(avg_aligned, geom, shape_type, half, px_nm)
 
@@ -418,6 +421,21 @@ def reconstruct(scan, geom, shape_type, meta, ap, manual_offset=0.0):
         avg, gt_p, shape_type, half, geom, meta['px_nm'], manual_offset)
     true_depth = abs(geom.get('height', 0.0))
     info += f'\n  量測特徵深度: {meas_depth:.1f}nm (GT真實: {true_depth:.1f}nm)'
+
+    # [FIX-12] 物理健全性檢查：孔洞經探針掃描只會變淺，量測深度不可能 > 真實深度。
+    # 若量測 > 真實（如 std.004 量到 164.7 > 125.8），代表高度資料含尖刺/壞值，
+    # 重建會得到顛倒/無效的探針（中心反而最低），此檔不適合用於探針重建。
+    is_hole = shape_type in ('cylinder_hole', 'trapezoid_hole')
+    if is_hole and true_depth > 0 and meas_depth > true_depth * 1.05:
+        info += (f'\n  ⛔ 量測深度({meas_depth:.1f}) > 真實深度({true_depth:.1f})：'
+                 f'物理上不可能（探針只會把孔掃淺）→ 此檔高度資料疑似含尖刺/壞值，'
+                 f'\n     重建探針無效，請換用乾淨檔（量測深度應 < 真實深度）或改用廠商 cone。')
+    elif is_hole and true_depth > 0 and meas_depth < true_depth * 0.10:
+        # 量測深度≈0：取到的 patch 是平坦表面（特徵在畫面邊緣/偵測落空），
+        # 沒有捕捉到孔洞 → 重建無意義（如 std.004 視野內僅 0.7 個特徵時）。
+        info += (f'\n  ⛔ 量測深度≈0（{meas_depth:.1f}nm）：取到的 patch 幾乎全平、未捕捉到孔洞'
+                 f'\n     → 特徵可能在畫面邊緣或偵測落空；此檔/此次重建無效，請換用'
+                 f'特徵完整、視野內有多個孔的乾淨檔，或改用廠商 cone。')
 
     entry_pct = rim['entry_rate'] * 100
     info += (f'\n  進入率: {entry_pct:.1f}%  '
@@ -491,6 +509,64 @@ def radial_average(tip, half):
 
     tip_radial -= tip_radial.max()  # 尖端歸零
     return tip_radial
+
+
+# ══════════════════════════════════════════════════════════════════
+# [FIX-11] 錐壁延伸：把重建探針外緣「攤平的裙邊」還原成直線錐壁
+# ══════════════════════════════════════════════════════════════════
+def extend_tip_cone(tip, half, px_nm, min_wall_px=2):
+    """把盲重建探針外緣攤平的裙邊，沿錐壁斜率直線外推成 cone。
+
+    物理背景：盲重建（grey_erosion）只能還原探針「實際接觸孔壁」的頂端
+    區段；接觸區以外 min 運算飽和 → 側壁攤平、探針看起來變鈍（兩側趨於
+    水平）。但真實探針側壁應為直線錐壁。本函式量測接觸區的錐壁斜率，沿
+    該斜率把側壁直線延伸到邊緣（含角落），消除攤平裙邊。
+
+    下游影響：較尖的錐形探針 dilation 時 narrow 量正常（鈍探針會把訓練
+    孔填太窄，導致模型過度去卷積，見 Supporting_code changelog）。
+
+    參數：
+      tip         : 旋轉對稱後的 2D 探針（頂點≈0、向外為負，nm）
+      min_wall_px : 錐壁區至少需這麼多 px 才視為可靠，否則原樣返回
+    回傳：錐壁延伸後的 2D 探針（頂點=0）
+    """
+    size = 2 * half
+    # radial_average 後沿中心列即代表整個旋轉對稱形狀；r=0..half
+    prof = tip[half, half:].astype(np.float64).copy()
+    prof -= prof.max()                       # 頂點=0
+    n = prof.size
+    if n < 3:
+        return tip
+
+    d = np.diff(prof)                        # 逐 px 斜率（nm/px，往外應為負）
+    if d.size == 0 or d.min() >= -1e-6:
+        return tip                           # 幾乎無錐壁（全平）→ 不處理
+
+    s_max = d.min()                          # 最陡（最負）斜率
+    # 錐壁區：斜率仍 ≤ 30% 最陡者視為仍在側壁；之後（趨近 0）視為攤平裙邊
+    wall = np.where(d <= 0.30 * s_max)[0]
+    if wall.size < min_wall_px:
+        return tip                           # 可靠錐壁太短，不足以外推
+
+    r_rel      = int(wall[-1] + 1)           # 可靠錐壁最外半徑(px)
+    wall_slope = float(np.median(d[wall]))   # 錐壁斜率（nm/px，負）
+    if r_rel >= n - 1:
+        return tip                           # 沒有攤平段需要修正
+
+    # 以可靠錐壁斜率，從 r_rel 直線外推到角落最大半徑
+    r_far     = int(np.ceil(np.sqrt(2) * half)) + 1
+    prof_full = np.empty(r_far + 1, dtype=np.float64)
+    prof_full[:r_rel + 1] = prof[:r_rel + 1]              # 頂端可靠段保留
+    for r in range(r_rel + 1, r_far + 1):
+        prof_full[r] = prof_full[r_rel] + wall_slope * (r - r_rel)
+
+    # 用延伸後的 1D profile 重建 2D（含角落，不再有平裙邊）
+    yi, xi = np.indices((size, size))
+    r_int  = np.clip(np.round(np.sqrt((xi - half)**2 + (yi - half)**2)).astype(int),
+                     0, r_far)
+    tip_cone = prof_full[r_int]
+    tip_cone -= tip_cone.max()
+    return tip_cone
 
 
 # ══════════════════════════════════════════════════════════════════
