@@ -61,7 +61,7 @@ matplotlib.rcParams['font.sans-serif'] = [
 ] + matplotlib.rcParams.get('font.sans-serif', [])
 matplotlib.rcParams['axes.unicode_minus'] = False  # 負號不用方塊替代
 import matplotlib.pyplot as plt
-from scipy.ndimage import grey_dilation, grey_erosion, median_filter
+from scipy.ndimage import grey_dilation, grey_erosion, median_filter, label
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -202,6 +202,70 @@ def auto_tip_half(surface, px_nm, R_nm, theta_deg, sample='hole', cap=60):
     return int(min(cap, max(3, np.ceil(r_nm / px_nm) + 1)))
 
 
+# ──────────────────────────────────────────────────────────────────
+# 特徵寬度量測（還原表面 vs 影像對照）
+# ──────────────────────────────────────────────────────────────────
+def _half_span_bounds(line, i0, thr):
+    """回傳門檻 thr 在極值索引 i0 兩側的『亞像素』跨越邊界 (left, right, width_px)。
+
+    自 i0 向左/右擴張到低於 thr 的相鄰點，再對跨越邊做線性內插取亞像素位置。
+    """
+    n = len(line)
+    if line[i0] < thr:
+        return float(i0), float(i0), 0.0
+    L = i0
+    while L > 0 and line[L - 1] >= thr:
+        L -= 1
+    if L > 0 and line[L] != line[L - 1]:
+        left = (L - 1) + (thr - line[L - 1]) / (line[L] - line[L - 1])
+    else:
+        left = float(L)
+    R = i0
+    while R < n - 1 and line[R + 1] >= thr:
+        R += 1
+    if R < n - 1 and line[R] != line[R + 1]:
+        right = R + (line[R] - thr) / (line[R] - line[R + 1])
+    else:
+        right = float(R)
+    return left, right, max(0.0, right - left)
+
+
+def measure_feature_width(surface, px_nm, sample='hole', frac=0.5):
+    """量測表面『主特徵』的寬度。
+
+    步驟：以表面基線為 0 把特徵轉成正向振幅（孔洞=深度、凸起=高度）→ 找最深/最高
+    的極值點 → 沿該點 X、Y 剖面量在 `frac×振幅` 門檻的連續跨距（FWHM，亞像素內插）
+    → 另以門檻連通區面積算等效直徑 ⌀=2√(A/π)。回傳 nm 單位 dict；無特徵回 None。
+
+    frac=0.5 即半深/半高全寬（FWHM，AFM 常用）；可調 0.05–0.95。
+    """
+    surf = np.asarray(surface, dtype=float)
+    if sample == 'bump':                          # 凸起：表面低值、特徵向上
+        feat = surf - np.percentile(surf, 10)
+    else:                                         # 孔洞：表面高值，轉成深度為正
+        feat = np.percentile(surf, 95) - surf
+    amp = float(feat.max())
+    if amp <= 1e-9:
+        return None
+    thr = frac * amp
+    # 取『含最深/最高點』的連通區為主特徵，量測經其『形心』的 X/Y 剖面
+    # （直接用 argmax 會落在平底特徵的邊角，剖面量到短弦 → 錯誤，故改用形心）
+    lbl, n = label(feat >= thr)
+    if n == 0:
+        return None
+    gy, gx = np.unravel_index(int(np.argmax(feat)), feat.shape)
+    comp = lbl == lbl[gy, gx]
+    ys, xs = np.where(comp)
+    cy, cx = int(round(ys.mean())), int(round(xs.mean()))
+    x0, x1, wx = _half_span_bounds(feat[cy, :], cx, thr)
+    y0, y1, wy = _half_span_bounds(feat[:, cx], cy, thr)
+    area_px = int(comp.sum())
+    return {'cx': cx, 'cy': cy, 'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1,
+            'width_x_nm': wx * px_nm, 'width_y_nm': wy * px_nm,
+            'equiv_diam_nm': 2.0 * np.sqrt(area_px / np.pi) * px_nm,
+            'amp_nm': amp, 'frac': frac}
+
+
 def make_hole_surface(N=128, px_nm=39.1, open_nm=228.8, bot_nm=183.5, depth=125.8):
     """寬孔梯形樣品（本專案樣品）。回傳真實表面（供 demo 對照）。"""
     yy, xx = np.indices((N, N))
@@ -331,7 +395,20 @@ def load_nanoscope_surface(fp, sample='hole'):
 # ──────────────────────────────────────────────────────────────────
 # 視覺化
 # ──────────────────────────────────────────────────────────────────
-def save_panels(image, recon, certain, tip, certain_frac, out_path, title=''):
+def _draw_width(ax, meas):
+    """在給定 axes 上畫寬度量測：X/Y 跨距紅線 + 極值點 + 數值標註。"""
+    m = meas
+    ax.plot([m['x0'], m['x1']], [m['cy'], m['cy']], '-', color='red', lw=1.6)
+    ax.plot([m['cx'], m['cx']], [m['y0'], m['y1']], '-', color='red', lw=1.6)
+    ax.plot(m['cx'], m['cy'], '+', color='red', ms=9, mew=1.6)
+    ax.text(0.02, 0.98,
+            f"W@{int(m['frac']*100)}%\nX={m['width_x_nm']:.1f}nm\n"
+            f"Y={m['width_y_nm']:.1f}nm\nD={m['equiv_diam_nm']:.1f}nm",
+            transform=ax.transAxes, va='top', ha='left', fontsize=8, color='white',
+            bbox=dict(boxstyle='round', fc='red', ec='none', alpha=0.65))
+
+
+def save_panels(image, recon, certain, tip, certain_frac, out_path, title='', meas=None):
     fig, ax = plt.subplots(1, 4, figsize=(20, 5))
     vmin = min(image.min(), recon.min())
     vmax = max(image.max(), recon.max())
@@ -344,6 +421,8 @@ def save_panels(image, recon, certain, tip, certain_frac, out_path, title=''):
     ax[1].set_title(f'Reconstructed surface (erosion)\n'
                     f'min={recon.min():.1f} (certain lower bound)')
     plt.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+    if meas:                                            # 疊上寬度量測線與數值
+        _draw_width(ax[1], meas)
 
     ax[2].imshow(recon, cmap='gray', vmin=vmin, vmax=vmax)
     overlay = np.zeros((*certain.shape, 4))
@@ -437,6 +516,7 @@ def launch_gui():
             self.recon = None
             self.certain = None
             self.frac = None
+            self.meas = None           # 還原表面寬度量測結果
             self._build_ui()
 
         # ── 版面 ──────────────────────────────────────────────
@@ -548,8 +628,17 @@ def launch_gui():
             s5 = step('⑤ 結果')
             g = ttk.Frame(s5); g.pack(fill='x')
             self.lbl_cert = self._stat(g, '可信像素 certain', 0)
-            self.lbl_din = self._stat(g, '影像孔深', 1)
-            self.lbl_dre = self._stat(g, '還原孔深（下界）', 2)
+            self.lbl_din = self._stat(g, '影像起伏', 1)
+            self.lbl_dre = self._stat(g, '還原起伏（下界）', 2)
+            self.lbl_win = self._stat(g, '影像寬度 ⌀', 3)
+            self.lbl_wre = self._stat(g, '還原寬度', 4)
+            # 寬度量測控制
+            mrow = ttk.Frame(s5); mrow.pack(fill='x', pady=(4, 0))
+            ttk.Label(mrow, text='半深比例 ').pack(side='left')
+            self.var_wfrac = tk.StringVar(value='0.5')
+            ttk.Entry(mrow, textvariable=self.var_wfrac, width=5).pack(side='left')
+            ttk.Button(mrow, text='📏 量測寬度',
+                       command=self._measure).pack(side='left', padx=(6, 0))
 
             # ⑥ 儲存
             s6 = step('⑥ 儲存')
@@ -644,7 +733,7 @@ def launch_gui():
                                      f'需要 2D 陣列，讀到 shape={arr.shape}')
                 return
             self.image, self.image_path = arr, p
-            self.recon = self.certain = self.frac = None
+            self.recon = self.certain = self.frac = self.meas = None
             self.lbl_img.config(text=src)
             self._log(f'載入 {os.path.basename(p)} {arr.shape} '
                       f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
@@ -724,9 +813,35 @@ def launch_gui():
             # 下界性質檢查（誠實回報）
             ok = bool(np.all(self.recon <= self.image + 1e-6))
             self._log(f'完成：certain={self.frac*100:.1f}%  '
-                      f'還原孔深={depth_of(self.recon):.1f}nm  '
-                      f'下界 s_r≤i={ok}')
+                      f'還原起伏={depth_of(self.recon):.1f}nm  下界 s_r≤i={ok}')
             self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
+            self._measure()                    # 去卷積後自動量測寬度並繪圖
+
+        # ── ⑤ 量測還原表面主特徵寬度（FWHM）──────────────────
+        def _measure(self):
+            if self.recon is None:
+                messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
+            try:
+                frac = min(0.95, max(0.05, float(self.var_wfrac.get())))
+            except ValueError:
+                frac = 0.5
+            px_nm = float(self.var_px.get())
+            sample = self.var_sample.get()
+            self.meas = measure_feature_width(self.recon, px_nm, sample, frac)
+            m_in = measure_feature_width(self.image, px_nm, sample, frac)
+            if self.meas:
+                self.lbl_wre.config(
+                    text=f"{self.meas['width_x_nm']:.1f}×{self.meas['width_y_nm']:.1f}"
+                         f" nm ⌀{self.meas['equiv_diam_nm']:.1f}")
+            else:
+                self.lbl_wre.config(text='（無明顯特徵）')
+            if m_in:
+                self.lbl_win.config(text=f"{m_in['equiv_diam_nm']:.1f} nm")
+            if self.meas and m_in:
+                self._log(f"寬度@{int(frac*100)}%：還原 "
+                          f"{self.meas['width_x_nm']:.1f}×{self.meas['width_y_nm']:.1f}nm "
+                          f"⌀{self.meas['equiv_diam_nm']:.1f}；"
+                          f"影像 ⌀{m_in['equiv_diam_nm']:.1f}nm")
             self._refresh()
 
         # ── ⑥ 儲存 ───────────────────────────────────────────
@@ -742,7 +857,7 @@ def launch_gui():
             np.save(os.path.join(d, f'{stem}_certain.npy'), self.certain)
             png = os.path.join(d, f'{stem}_blind_deconv.png')
             save_panels(self.image, self.recon, self.certain, self.tip, self.frac,
-                        png, title=f'Certainty deconvolution — {stem}')
+                        png, title=f'Certainty deconvolution — {stem}', meas=self.meas)
             self._log(f'已儲存至 {d}')
             messagebox.showinfo('完成', f'結果已存至：\n{d}')
 
@@ -774,6 +889,8 @@ def launch_gui():
                 axs[0, 1].set_title(f'還原表面（erosion）\n'
                                     f'min={self.recon.min():.1f} nm 確定下界',
                                     fontsize=9)
+                if self.meas:                          # 疊上寬度量測線與數值
+                    _draw_width(axs[0, 1], self.meas)
                 axs[0, 2].imshow(self.recon, cmap='gray', vmin=vmin, vmax=vmax)
                 ov = np.zeros((*self.certain.shape, 4))
                 ov[~self.certain] = [1, 0, 0, 0.40]
@@ -873,17 +990,24 @@ def main():
     res = deconvolve(image, tip)
     recon = res['recon']
     print(f"\n去卷積結果：")
-    print(f"  影像孔深 = {depth_of(image):.1f} nm")
-    print(f"  還原孔深 = {depth_of(recon):.1f} nm  (確定下界，不會過度去卷積)")
+    print(f"  影像起伏 = {depth_of(image):.1f} nm")
+    print(f"  還原起伏 = {depth_of(recon):.1f} nm  (確定下界，不會過度去卷積)")
     print(f"  可信像素 certain = {res['certain_frac']*100:.1f}%"
           f"（其餘為探針碰不到的死角，僅下界）")
+
+    # 特徵寬度量測（還原 vs 影像對照）
+    meas = measure_feature_width(recon, args.px_nm, args.sample)
+    m_in = measure_feature_width(image, args.px_nm, args.sample)
+    if meas and m_in:
+        print(f"  還原寬度@50% = {meas['width_x_nm']:.1f}×{meas['width_y_nm']:.1f} nm "
+              f"(⌀{meas['equiv_diam_nm']:.1f})  ← 影像 ⌀{m_in['equiv_diam_nm']:.1f} nm")
 
     stem = os.path.splitext(os.path.basename(args.image))[0]
     np.save(os.path.join(args.out, f'{stem}_reconstructed.npy'), recon)
     np.save(os.path.join(args.out, f'{stem}_certain.npy'), res['certain'])
     save_panels(image, recon, res['certain'], tip, res['certain_frac'],
                 os.path.join(args.out, f'{stem}_blind_deconv.png'),
-                title=f'Certainty deconvolution — {stem}')
+                title=f'Certainty deconvolution — {stem}', meas=meas)
     print(f"\n完成。結果存於：{args.out}/")
 
 
