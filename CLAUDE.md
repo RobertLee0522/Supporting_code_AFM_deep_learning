@@ -241,6 +241,18 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-07 — `blind_deconvolution.py`：自動換算探針視窗半徑（依載入孔深 + R/θ）**
+  - **需求**：使用者不想手動換算視窗半徑，希望載入 .000 + 填探針 R/θ 後自動決定。
+  - **新增 `auto_tip_half(surface, px_nm, R, θ, sample, cap=60)`**：以物理公式
+    `側向延伸 ≈ R·sinθ + D·tanθ` → `半徑px = ceil(側向/px_nm)+1`。其中 `px_nm` 與特徵起伏 D
+    兩個樣品相關量從 .000 取得（Scan Size、高度資料；孔洞用 pct95−min、凸起用 pct99.5−pct10），
+    R/θ 為探針規格由使用者提供。θ 定義為**半錐角**（全開角需先除以 2）；非對稱取較大一軸角度。
+  - **GUI**：「視窗半徑」旁新增「☑ 自動」核取方塊（預設開）；勾選時鎖住手動欄，
+    載入影像 / 改 R,θ,px_nm,樣品 時即時重算並填入（trace + self.after）。取消勾選可手動輸入。
+  - **CLI**：`--tip-half` 改為可接 `auto`（預設）或整數；auto 時依 `--sample` 起伏 + R/θ 換算。
+  - **驗證**：`30nm.003`（256², px_nm=1.17, R=8nm, θ=20.7°, bump）CLI/GUI 皆自動得視窗半徑 5px，
+    端到端跑通（certain 49.5%）；GUI 測試確認自動填值、手動欄鎖定/解鎖、切樣品重算皆正確。
+
 - **2026-07-07 — `blind_deconvolution.py`：GUI/CLI 可直接開 Nanoscope `.000` 原始檔回推**
   - **需求**：使用者要在 GUI 直接載入 `.000` 掃描檔做去卷積回推，不必先用 detect.py 轉 `.npy`。
   - **新增 TF-free Nanoscope 載入器**（沿用 detect.py / reconstruct_lines_3d 邏輯）：

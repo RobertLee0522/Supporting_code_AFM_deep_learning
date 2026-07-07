@@ -183,6 +183,25 @@ def make_paraboloid_tip(half_px, px_nm, R_nm=46.9):
     return tip
 
 
+def auto_tip_half(surface, px_nm, R_nm, theta_deg, sample='hole', cap=60):
+    """依『載入影像量得的特徵起伏』+ 探針 R/θ 自動換算視窗半徑（px）。
+
+    物理：深度 D 的孔（或高 h 的凸起）被半錐角 θ、球冠 R 的探針掃過時，
+    接觸點側向延伸 ≈ R·sinθ + D·tanθ（nm）。視窗需 ≥ 此側向延伸再留 1px 邊界。
+      • px_nm、D 兩個跟樣品有關的量 → 從 .000 檔（Scan Size、高度資料）取得；
+      • R、θ 為探針物理規格 → 檔案裡沒有，需由 datasheet 提供。
+    θ 為『半錐角(half cone angle)』；若手上是全開角(total angle)請先除以 2。
+    非對稱探針請以較大的一軸角度傳入（涵蓋較寬方向）。
+    """
+    if sample == 'bump':                         # 凸起：表面為低值、特徵向上
+        amp = float(np.percentile(surface, 99.5) - np.percentile(surface, 10))
+    else:                                        # 孔洞：表面為高值、特徵向下
+        amp = float(np.percentile(surface, 95) - surface.min())
+    th = np.radians(theta_deg)
+    r_nm = R_nm * np.sin(th) + max(amp, 0.0) * np.tan(th)
+    return int(min(cap, max(3, np.ceil(r_nm / px_nm) + 1)))
+
+
 def make_hole_surface(N=128, px_nm=39.1, open_nm=228.8, bot_nm=183.5, depth=125.8):
     """寬孔梯形樣品（本專案樣品）。回傳真實表面（供 demo 對照）。"""
     yy, xx = np.indices((N, N))
@@ -480,8 +499,13 @@ def launch_gui():
             r2 = ttk.Frame(cone); r2.pack(fill='x')
             ttk.Label(r2, text='視窗半徑 = ').pack(side='left')
             self.var_half = tk.StringVar(value='5')
-            self.e_half = ttk.Entry(r2, textvariable=self.var_half, width=7)
+            self.e_half = ttk.Entry(r2, textvariable=self.var_half, width=6)
             self.e_half.pack(side='left'); ttk.Label(r2, text=' px').pack(side='left')
+            self.var_autohalf = tk.BooleanVar(value=True)
+            ttk.Checkbutton(r2, text='自動', variable=self.var_autohalf,
+                            command=self._update_tip_mode).pack(side='left', padx=(6, 0))
+            ttk.Label(cone, text='（自動 = 依載入孔深 + R/θ 換算；θ 為半錐角）',
+                      foreground='#999', font=('', 8)).pack(anchor='w')
 
             # 對稱 / 非對稱
             self.var_asym = tk.BooleanVar(value=False)
@@ -540,6 +564,10 @@ def launch_gui():
             self.fig = Figure(figsize=(8.5, 7.4))
             self.canvas = FigureCanvasTkAgg(self.fig, master=right)
             self.canvas.get_tk_widget().pack(fill='both', expand=True)
+            # 探針 R/θ/尺度/樣品變動時，若「自動」開啟則重算視窗半徑
+            for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
+                      self.var_px, self.var_sample):
+                v.trace_add('write', lambda *_: self.after(60, self._refresh_auto_half))
             self._refresh()
             self._update_tip_mode()
 
@@ -555,10 +583,31 @@ def launch_gui():
             asym = self.var_asym.get()
 
             def en(w, on): w.config(state=('normal' if on else 'disabled'))
-            en(self.e_R, cone); en(self.e_half, cone); en(self.chk_asym, cone)
+            en(self.e_R, cone); en(self.chk_asym, cone)
+            en(self.e_half, cone and not self.var_autohalf.get())   # 自動時鎖住手動欄
             en(self.e_th, cone and not asym)
             en(self.e_thx, cone and asym); en(self.e_thy, cone and asym)
             en(self.btn_tipnpy, not cone)
+            self._refresh_auto_half()
+
+        # ── 自動視窗半徑（依載入孔深 + R/θ）───────────────────
+        def _auto_half(self):
+            if self.image is None:
+                return None
+            try:
+                R = float(self.var_R.get())
+                th = (max(float(self.var_thx.get()), float(self.var_thy.get()))
+                      if self.var_asym.get() else float(self.var_th.get()))
+                px_nm = float(self.var_px.get())
+            except (ValueError, tk.TclError):
+                return None
+            return auto_tip_half(self.image, px_nm, R, th, self.var_sample.get())
+
+        def _refresh_auto_half(self):
+            if self.var_source.get() == 'cone' and self.var_autohalf.get():
+                h = self._auto_half()
+                if h is not None and self.var_half.get() != str(h):
+                    self.var_half.set(str(h))
 
         # ── log（主執行緒安全）────────────────────────────────
         def _log(self, msg):
@@ -599,6 +648,9 @@ def launch_gui():
             self.lbl_img.config(text=src)
             self._log(f'載入 {os.path.basename(p)} {arr.shape} '
                       f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
+            self._refresh_auto_half()          # 依新影像孔深自動更新視窗半徑
+            if self.var_autohalf.get():
+                self._log(f'自動視窗半徑 = {self.var_half.get()} px')
             self._refresh()
 
         # ── ③ 載入探針檔 ──────────────────────────────────────
@@ -773,7 +825,8 @@ def main():
     ap.add_argument('--tip', help='已知探針 .npy（apex 置中=0，向外為負）')
     ap.add_argument('--cone-R', type=float, help='改用廠商 cone：尖端球半徑 R (nm)')
     ap.add_argument('--cone-theta', type=float, default=25.0, help='cone 半錐角 θ (°)')
-    ap.add_argument('--tip-half', type=int, default=5, help='cone 視窗半徑 px')
+    ap.add_argument('--tip-half', default='auto',
+                    help='cone 視窗半徑 px；或 auto（依載入孔深+R/θ 自動換算，預設）')
     ap.add_argument('--px-nm', type=float, default=39.1, help='影像每 px nm（預設 39.1）')
     ap.add_argument('--out', default='blind_out', help='輸出資料夾')
     ap.add_argument('--demo', action='store_true', help='跑合成資料驗證 + 教學圖')
@@ -802,7 +855,14 @@ def main():
         tip = np.load(args.tip).astype(np.float64); tip -= tip.max()
         print(f"探針：載入 {args.tip}  shape={tip.shape}")
     elif args.cone_R is not None:
-        tip = make_cone_tip(args.tip_half, args.px_nm, args.cone_R, args.cone_theta)
+        if str(args.tip_half).lower() == 'auto':
+            half = auto_tip_half(image, args.px_nm, args.cone_R,
+                                 args.cone_theta, args.sample)
+            print(f"探針視窗半徑：auto → {half}px "
+                  f"（依 {args.sample} 起伏 + R={args.cone_R}nm θ={args.cone_theta}°）")
+        else:
+            half = int(args.tip_half)
+        tip = make_cone_tip(half, args.px_nm, args.cone_R, args.cone_theta)
         print(f"探針：廠商 cone R={args.cone_R}nm θ={args.cone_theta}° "
               f"({tip.shape[0]}px @ {args.px_nm}nm/px)")
     else:
