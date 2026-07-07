@@ -66,7 +66,7 @@
 | `batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
 | `evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
 | `check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
-| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學）+ **步驟式 GUI** | 影像 .npy + 已知探針（對稱/**非對稱** cone 或 tip.npy） | 還原表面 + certainty map |
+| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學）+ **步驟式 GUI** | Nanoscope `.000` 或影像 .npy + 已知探針（對稱/**非對稱** cone 或 tip.npy） | 還原表面 + certainty map |
 | `reconstruct_lines_3d.py` | 凸起樣品逐線 1D 去卷積 + 3D 重建（給定 R, θ） | Nanoscope .000 + 探針 R/θ | 還原高度圖 .npy + 3D 渲染 PNG |
 
 ### 3.1 `afm_gui.py`（盲探針重建 GUI）
@@ -240,6 +240,21 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ## 9. 變更紀錄 (Changelog)
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-07-07 — `blind_deconvolution.py`：GUI/CLI 可直接開 Nanoscope `.000` 原始檔回推**
+  - **需求**：使用者要在 GUI 直接載入 `.000` 掃描檔做去卷積回推，不必先用 detect.py 轉 `.npy`。
+  - **新增 TF-free Nanoscope 載入器**（沿用 detect.py / reconstruct_lines_3d 邏輯）：
+    `is_nanoscope_file` / `_parse_nanoscope_header`（Data length 上界防跨通道污染）/
+    `_read_height_channel`（Z-scale 校正）/ `_despike`（去孤立尖刺）/ `_flatten_rows`
+    （逐行去傾斜，孔洞 pct95、凸起 pct10 基線）/ `load_nanoscope_surface(fp, sample)`。
+    **保留原生解析度不 resize**，使影像 px_nm 與探針一致；回傳 (surface_nm, px_nm, info)。
+  - **GUI**：① 檔案對話框加入 `.000–.009`；載入 Nanoscope 檔時自動解析、去尖刺、去傾斜、
+    **自動帶入 px_nm**；新增「樣品類型 孔洞/凸起」選項（只影響基線方向，erosion 對平移不變，
+    不改變還原形狀）。**CLI** 同步：位置參數可為 `.000`，新增 `--sample hole|bump`，
+    檔頭 px_nm 覆寫 `--px-nm` 確保探針/影像尺度一致。
+  - **驗證**：真實 `std.000` 端到端跑通（解析 ch='Height Sensor'、px_nm=19.53、Z 校正、
+    去卷積 s_r≤i、certain 99.9%）；GUI 非阻塞測試確認 .000 分支載入成功並自動帶入 px_nm。
+    （註：該 std.000 僅 26/256 行為部分掃描壞檔，載入器正確但幾何不具代表性，建議換掃滿的乾淨檔。）
 
 - **2026-07-07 — `blind_deconvolution.py`：新增步驟式 GUI + 非對稱探針（θx/θy）支援**
   - **GUI（`launch_gui()`，Tkinter）**：把零訓練去卷積流程做成「按步驟操作」介面——

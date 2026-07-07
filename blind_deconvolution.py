@@ -34,10 +34,14 @@ blind_deconvolution.py — 通用 AFM 探針去卷積引擎（零訓練，原型
   python blind_deconvolution.py scan.npy --tip tip.npy       # 用已知探針去卷積
   python blind_deconvolution.py scan.npy --cone-R 2 --cone-theta 25 --tip-half 5
                                                              # 用廠商 cone 去卷積
-（輸入 .npy 為 nm 單位 2D 陣列；Nanoscope 原始檔可先用 detect.py 轉出 _input.npy）
+  python blind_deconvolution.py std.000 --cone-R 2 --sample hole
+                                                             # 直接開 Nanoscope .000 回推
+（輸入可為 Nanoscope .000 原始檔（自動解析/去尖刺/去傾斜/帶入 px_nm），
+  或 nm 單位 2D .npy 陣列）
 """
 import os
 import sys
+import re
 import argparse
 # Windows 主控台預設 cp950 無法輸出 ≤/⊕ 等符號，改用 UTF-8 避免 print 崩潰（不影響 GUI）
 try:
@@ -57,7 +61,7 @@ matplotlib.rcParams['font.sans-serif'] = [
 ] + matplotlib.rcParams.get('font.sans-serif', [])
 matplotlib.rcParams['axes.unicode_minus'] = False  # 負號不用方塊替代
 import matplotlib.pyplot as plt
-from scipy.ndimage import grey_dilation, grey_erosion
+from scipy.ndimage import grey_dilation, grey_erosion, median_filter
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -198,6 +202,114 @@ def depth_of(arr):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Nanoscope 原始檔載入（TF-free，沿用 detect.py / reconstruct_lines_3d 邏輯）
+#   讓 GUI/CLI 直接開 .000 等原始掃描檔回推，不需先轉 .npy。
+# ──────────────────────────────────────────────────────────────────
+def is_nanoscope_file(path):
+    """副檔名以 3 位數字開頭（.000/.004…，容許後接描述字，如 .000-after_flatten）。"""
+    return bool(re.match(r'^\.\d{3}', os.path.splitext(path)[1]))
+
+
+def _parse_nanoscope_header(fp):
+    with open(fp, 'rb') as f:
+        hdr = f.read(65536).decode('latin-1')
+
+    def fv(pat, cast=str, default=None):
+        m = re.search(pat, hdr)
+        return cast(m.group(1)) if m else default
+
+    n_px = fv(r'\\Samps/line:\s*(\d+)', int, 256)
+    n_ln = fv(r'\\(?:Number of lines|Lines):\s*(\d+)', int, 256)
+    m_sc = re.search(r'\\Scan Size:\s*([\d.]+)\s*([\d.]*)\s*(~m|nm|um)', hdr)
+    scan = float(m_sc.group(1)) * 1000 if m_sc and m_sc.group(3) in ('~m', 'um') \
+        else (float(m_sc.group(1)) if m_sc else 5000.)
+    zss = fv(r'@Sens\. ZsensSens:\s*V\s*([\d.]+)', float, 813.1653)
+    zs  = fv(r'@Sens\. Zsens:\s*V\s*([\d.]+)',     float, 32.07862)
+    chs = []
+    for blk in hdr.split('\\*Ciao image list'):
+        if not blk.strip():
+            continue
+        off = re.search(r'\\Data offset:\s*(\d+)', blk)
+        bpp = re.search(r'\\Bytes/pixel:\s*(\d+)', blk)
+        dln = re.search(r'\\Data length:\s*(\d+)', blk)
+        nm  = re.search(r'@2:Image Data:\s*S\s*\[([^\]]+)\].*?"([^"]+)"', blk)
+        zsc = re.search(r'@2:Z scale:\s*V \[Sens\.\s*(\w+)\]\s*\(([\d.e+-]+)', blk)
+        if off and nm:
+            chs.append({'offset': int(off.group(1)),
+                        'bpp': int(bpp.group(1)) if bpp else 2,
+                        'data_length': int(dln.group(1)) if dln else None,
+                        'name': nm.group(2).strip(),
+                        'z_key': zsc.group(1) if zsc else 'ZsensSens',
+                        'z_lsb': float(zsc.group(2)) if zsc else 0.000375})
+    return {'n_px': n_px, 'n_lines': n_ln, 'scan_nm': scan, 'px_nm': scan / n_px,
+            'zsens': zs, 'zsens_s': zss, 'channels': chs}
+
+
+def _read_height_channel(fp, meta):
+    """讀高度通道 → nm 2D array，以 Data length 為界防跨通道污染（detect.py 邏輯）。"""
+    ch_idx = 0
+    for i, ch in enumerate(meta['channels']):
+        if any(k in ch['name'].lower() for k in ('zsensor', 'height sensor', 'height')):
+            ch_idx = i
+            break
+    ch = meta['channels'][ch_idx]
+    dt = np.int16 if ch['bpp'] == 2 else np.int32
+    read_bytes = meta['n_px'] * meta['n_lines'] * ch['bpp']
+    if ch.get('data_length'):
+        read_bytes = min(read_bytes, ch['data_length'])
+    with open(fp, 'rb') as f:
+        f.seek(ch['offset'])
+        raw = np.frombuffer(f.read(read_bytes), dtype=dt)
+    actual = len(raw) // meta['n_px']
+    if actual == 0:
+        raise ValueError('通道資料不足，無法組成影像')
+    img  = raw[:actual * meta['n_px']].reshape(actual, meta['n_px']).astype(np.float64)
+    sens = meta['zsens_s'] if 'ZsensSens' in ch['z_key'] else meta['zsens']
+    return img * (ch['z_lsb'] * sens), ch['name'], actual
+
+
+def _despike(img, win=3, abs_thresh_nm=300.0, n_sigma=8.0):
+    """去孤立尖刺（中值殘差門檻）；真實深孔/壞線鄰域同偏移故保留。"""
+    med   = median_filter(img, size=win)
+    resid = img - med
+    mad   = np.median(np.abs(resid - np.median(resid)))
+    thr   = max(abs_thresh_nm, n_sigma * 1.4826 * mad)
+    m     = np.abs(resid) > thr
+    if m.any():
+        img = img.copy(); img[m] = med[m]
+    return img, int(m.sum())
+
+
+def _flatten_rows(img, sample='hole'):
+    """逐行一階去傾斜，再以百分位基線歸零。孔洞:表面為高值(pct95)、凸起:低值(pct10)。
+    （erosion 對垂直平移不變，基線只影響顯示/certainty，不改變還原形狀。）"""
+    flat = img.astype(np.float64).copy()
+    x = np.arange(img.shape[1])
+    for i in range(img.shape[0]):
+        flat[i] -= np.polyval(np.polyfit(x, flat[i], 1), x)
+    return flat - np.percentile(flat, 95 if sample == 'hole' else 10)
+
+
+def load_nanoscope_surface(fp, sample='hole'):
+    """載入 Nanoscope 原始掃描 → nm 單位 2D 表面。
+
+    流程：解析標頭 → 讀高度通道(Z 校正) → 去尖刺 → (孔洞另做物理裁切移除連續壞區)
+    → 逐行去傾斜。保留原生解析度（不 resize），使影像 px_nm 與探針一致。
+    回傳 (surface_nm, px_nm, info_str)。
+    """
+    meta = _parse_nanoscope_header(fp)
+    img, ch_name, actual = _read_height_channel(fp, meta)
+    img, n_spike = _despike(img)
+    if sample == 'hole':                       # 孔洞表面為高基準，收緊高側移除大台階
+        ref = float(np.median(img))
+        img = np.clip(img, ref - 300.0, ref + 60.0)
+    flat = _flatten_rows(img, sample)
+    info = (f"ch='{ch_name}' {flat.shape} px_nm={meta['px_nm']:.2f} "
+            f"尖刺={n_spike} 行={actual}/{meta['n_lines']}")
+    return flat, meta['px_nm'], info
+
+
+# ──────────────────────────────────────────────────────────────────
 # 視覺化
 # ──────────────────────────────────────────────────────────────────
 def save_panels(image, recon, certain, tip, certain_frac, out_path, title=''):
@@ -321,13 +433,21 @@ def launch_gui():
                 return lf
 
             # ① 影像
-            s1 = step('① 載入影像')
-            ttk.Button(s1, text='📂 選擇影像 (.npy, nm 單位)',
+            s1 = step('① 載入掃描檔')
+            ttk.Button(s1, text='📂 選擇掃描檔 (.000 原始檔 或 .npy)',
                        command=self._load_image).pack(fill='x')
             self.lbl_img = ttk.Label(s1, text='（尚未載入）', wraplength=250,
                                      foreground='#666')
             self.lbl_img.pack(fill='x', pady=(4, 0))
-            ttk.Label(s1, text='※ Nanoscope 原始檔請先用 detect.py 轉出 _input.npy',
+            srow = ttk.Frame(s1); srow.pack(fill='x', pady=(4, 0))
+            ttk.Label(srow, text='樣品類型：').pack(side='left')
+            self.var_sample = tk.StringVar(value='hole')
+            ttk.Radiobutton(srow, text='孔洞', value='hole',
+                            variable=self.var_sample).pack(side='left')
+            ttk.Radiobutton(srow, text='凸起', value='bump',
+                            variable=self.var_sample).pack(side='left')
+            ttk.Label(s1, text='※ .000 原始檔會自動去尖刺+去傾斜並帶入 px_nm；'
+                              '樣品類型只影響基線方向，不改變 erosion 還原結果',
                       wraplength=250, foreground='#999',
                       font=('', 8)).pack(fill='x')
 
@@ -447,15 +567,27 @@ def launch_gui():
         def _log_safe(self, msg):
             self.after(0, lambda m=msg: self._log(m))
 
-        # ── ① 載入影像 ────────────────────────────────────────
+        # ── ① 載入掃描檔（Nanoscope .000 或 .npy）─────────────
         def _load_image(self):
             p = filedialog.askopenfilename(
-                title='選擇影像 (.npy)',
-                filetypes=[('NumPy 陣列', '*.npy'), ('所有檔案', '*.*')])
+                title='選擇掃描檔',
+                filetypes=[('AFM 掃描 (.000… / .npy)',
+                            '*.npy *.000 *.001 *.002 *.003 *.004 '
+                            '*.005 *.006 *.007 *.008 *.009'),
+                           ('所有檔案', '*.*')])
             if not p:
                 return
             try:
-                arr = np.squeeze(np.load(p)).astype(np.float64)
+                if is_nanoscope_file(p):
+                    sample = self.var_sample.get()
+                    arr, px_nm, info = load_nanoscope_surface(p, sample)
+                    self.var_px.set(f'{px_nm:.2f}')            # 自動帶入尺度
+                    src = f'Nanoscope {os.path.basename(p)}\n{info}'
+                    self._log(f'解析 Nanoscope：{info}（樣品={sample}）')
+                else:
+                    arr = np.squeeze(np.load(p)).astype(np.float64)
+                    src = (f'{os.path.basename(p)}\nshape={arr.shape}  '
+                           f'[{arr.min():.1f}, {arr.max():.1f}] nm')
             except Exception as e:
                 messagebox.showerror('讀取失敗', str(e)); return
             if arr.ndim != 2:
@@ -464,10 +596,9 @@ def launch_gui():
                 return
             self.image, self.image_path = arr, p
             self.recon = self.certain = self.frac = None
-            self.lbl_img.config(
-                text=f'{os.path.basename(p)}\nshape={arr.shape}  '
-                     f'[{arr.min():.1f}, {arr.max():.1f}] nm')
-            self._log(f'載入影像 {os.path.basename(p)} {arr.shape}')
+            self.lbl_img.config(text=src)
+            self._log(f'載入 {os.path.basename(p)} {arr.shape} '
+                      f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
             self._refresh()
 
         # ── ③ 載入探針檔 ──────────────────────────────────────
@@ -635,7 +766,10 @@ def launch_gui():
 def main():
     ap = argparse.ArgumentParser(
         description='通用 AFM 探針去卷積（Villarrubia 形態學 certainty，零訓練）')
-    ap.add_argument('image', nargs='?', help='輸入影像 .npy（nm 單位 2D 陣列）')
+    ap.add_argument('image', nargs='?',
+                    help='輸入掃描：Nanoscope .000 原始檔 或 .npy（nm 單位 2D 陣列）')
+    ap.add_argument('--sample', choices=['hole', 'bump'], default='hole',
+                    help='樣品類型（影響 .000 基線方向；預設 hole 孔洞）')
     ap.add_argument('--tip', help='已知探針 .npy（apex 置中=0，向外為負）')
     ap.add_argument('--cone-R', type=float, help='改用廠商 cone：尖端球半徑 R (nm)')
     ap.add_argument('--cone-theta', type=float, default=25.0, help='cone 半錐角 θ (°)')
@@ -655,9 +789,14 @@ def main():
         return
 
     os.makedirs(args.out, exist_ok=True)
-    image = np.squeeze(np.load(args.image)).astype(np.float64)
-    print(f"輸入影像：{args.image}  shape={image.shape}  "
-          f"範圍[{image.min():.1f}, {image.max():.1f}] nm")
+    if is_nanoscope_file(args.image):
+        image, px_nm, info = load_nanoscope_surface(args.image, args.sample)
+        args.px_nm = px_nm                       # 以檔頭尺度覆寫，確保探針/影像一致
+        print(f"輸入 Nanoscope：{args.image}  {info}  (樣品={args.sample})")
+    else:
+        image = np.squeeze(np.load(args.image)).astype(np.float64)
+        print(f"輸入影像：{args.image}  shape={image.shape}  "
+              f"範圍[{image.min():.1f}, {image.max():.1f}] nm")
 
     if args.tip:
         tip = np.load(args.tip).astype(np.float64); tip -= tip.max()
