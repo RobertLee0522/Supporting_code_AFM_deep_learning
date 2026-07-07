@@ -21,7 +21,15 @@ blind_deconvolution.py — 通用 AFM 探針去卷積引擎（零訓練，原型
   ⚠ 本檔不自行實作 blind 盲估 —— 該演算法（Villarrubia 迭代）需仔細實作與驗證，
      用 Gwyddion 的成熟版本比我重造一個易錯的更可靠、更誠實。
 
+探針對稱性：真實探針未必旋轉對稱。本引擎支援
+  • 對稱 cone（單一半錐角 θ）
+  • 非對稱 cone（θx / θy 兩軸各自角度，橢圓內插；make_cone_tip_asym）
+  • 或直接載入任意 2D 探針 .npy（Gwyddion 匯出）。
+形態學 erosion/certainty 對任意 2D 探針皆成立，非對稱無需改動核心。
+
 用法：
+  python blind_deconvolution.py                              # 預設啟動圖形介面（GUI）
+  python blind_deconvolution.py --gui                        # 明確啟動 GUI（步驟式操作）
   python blind_deconvolution.py --demo                       # 合成資料驗證 + 教學圖
   python blind_deconvolution.py scan.npy --tip tip.npy       # 用已知探針去卷積
   python blind_deconvolution.py scan.npy --cone-R 2 --cone-theta 25 --tip-half 5
@@ -29,10 +37,25 @@ blind_deconvolution.py — 通用 AFM 探針去卷積引擎（零訓練，原型
 （輸入 .npy 為 nm 單位 2D 陣列；Nanoscope 原始檔可先用 detect.py 轉出 _input.npy）
 """
 import os
+import sys
 import argparse
+# Windows 主控台預設 cp950 無法輸出 ≤/⊕ 等符號，改用 UTF-8 避免 print 崩潰（不影響 GUI）
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')                      # 無頭環境輸出 PNG
+matplotlib.use('Agg')                      # 無頭環境輸出 PNG（GUI 以 FigureCanvasTkAgg 嵌入，不受此影響）
+# ── Matplotlib CJK 字型（讓圖中中文正確顯示）────────────────────────
+matplotlib.rcParams['font.sans-serif'] = [
+    'Microsoft JhengHei', 'Microsoft YaHei',   # Windows
+    'PingFang TC', 'PingFang SC', 'Heiti TC',  # macOS
+    'Noto Sans CJK TC', 'Noto Sans CJK SC',    # Linux
+    'WenQuanYi Micro Hei', 'SimHei',
+] + matplotlib.rcParams.get('font.sans-serif', [])
+matplotlib.rcParams['axes.unicode_minus'] = False  # 負號不用方塊替代
 import matplotlib.pyplot as plt
 from scipy.ndimage import grey_dilation, grey_erosion
 
@@ -114,6 +137,34 @@ def make_cone_tip(half_px, px_nm, R_nm=2.0, theta_deg=25.0):
     tip[m] = -(R_nm - np.sqrt(np.maximum(R_nm ** 2 - r[m] ** 2, 0)))
     zt = -(R_nm - np.sqrt(max(R_nm ** 2 - rt ** 2, 0.0)))
     tip[~m] = zt - (r[~m] - rt) / np.tan(th)
+    tip -= tip.max()
+    return tip
+
+
+def make_cone_tip_asym(half_px, px_nm, R_nm=2.0, theta_x_deg=25.0, theta_y_deg=15.0):
+    """非對稱錐探針：X/Y 兩軸各自的半錐角（θx, θy），球冠+直線錐壁、apex=0、向外為負。
+
+    物理：真實探針常非旋轉對稱（例如做成刀刃狀或製程不對稱），沿快軸/慢軸的
+    有效錐角不同。此處把「半錐角隨方位角 φ 變化」建成橢圓內插——
+      tan θ(φ) = (a·b) / sqrt((b·cosφ)² + (a·sinφ)²)，a=tanθx, b=tanθy
+    使 φ=0（沿 X）得 θx、φ=90°（沿 Y）得 θy，兩軸間平滑過渡。
+    當 θx==θy 時退化為對稱 cone（與 make_cone_tip 一致）。
+    """
+    size = 2 * half_px + 1
+    yi, xi = np.indices((size, size))
+    dy = (yi - half_px).astype(float)
+    dx = (xi - half_px).astype(float)
+    r  = np.sqrt(dy ** 2 + dx ** 2) * px_nm
+    phi = np.arctan2(dy, dx)
+    a, b = np.tan(np.radians(theta_x_deg)), np.tan(np.radians(theta_y_deg))
+    tan_th = (a * b) / np.sqrt((b * np.cos(phi)) ** 2 + (a * np.sin(phi)) ** 2 + 1e-12)
+    rt = R_nm * (tan_th / np.sqrt(1.0 + tan_th ** 2))          # = R·sinθ（每 px 方向不同）
+    tip = np.zeros((size, size))
+    cap = r <= rt                                             # 球冠區
+    tip[cap] = -(R_nm - np.sqrt(np.maximum(R_nm ** 2 - r[cap] ** 2, 0.0)))
+    zt = -(R_nm - np.sqrt(np.maximum(R_nm ** 2 - rt ** 2, 0.0)))
+    wall = ~cap                                              # 直線錐壁區
+    tip[wall] = zt[wall] - (r[wall] - rt[wall]) / tan_th[wall]
     tip -= tip.max()
     return tip
 
@@ -230,6 +281,355 @@ def run_demo(out_dir='blind_demo'):
 
 
 # ──────────────────────────────────────────────────────────────────
+# 圖形介面（Tkinter）：讓使用者「按流程」操作
+#   ① 載入影像(.npy) → ② 設定 px_nm → ③ 設定探針（對稱 θ／非對稱 θx,θy 或載入探針）
+#   → ④ 執行去卷積 → ⑤ 檢視 certainty → ⑥ 儲存結果
+# 形態學運算對任意 2D 探針皆成立，非對稱探針無需改動核心（reconstruct/certainty）。
+# ──────────────────────────────────────────────────────────────────
+def launch_gui():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    import threading
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title('AFM 通用去卷積工具（零訓練 · Villarrubia certainty）')
+            self.geometry('1200x780')
+            # 狀態
+            self.image = None          # 輸入影像 (nm 2D)
+            self.image_path = None
+            self.tip = None            # 目前探針
+            self.tip_npy_path = None   # 載入的探針檔
+            self.recon = None
+            self.certain = None
+            self.frac = None
+            self._build_ui()
+
+        # ── 版面 ──────────────────────────────────────────────
+        def _build_ui(self):
+            left = ttk.Frame(self, padding=8)
+            left.pack(side='left', fill='y')
+            right = ttk.Frame(self)
+            right.pack(side='right', fill='both', expand=True)
+
+            def step(title):
+                lf = ttk.LabelFrame(left, text=title, padding=6)
+                lf.pack(fill='x', pady=4)
+                return lf
+
+            # ① 影像
+            s1 = step('① 載入影像')
+            ttk.Button(s1, text='📂 選擇影像 (.npy, nm 單位)',
+                       command=self._load_image).pack(fill='x')
+            self.lbl_img = ttk.Label(s1, text='（尚未載入）', wraplength=250,
+                                     foreground='#666')
+            self.lbl_img.pack(fill='x', pady=(4, 0))
+            ttk.Label(s1, text='※ Nanoscope 原始檔請先用 detect.py 轉出 _input.npy',
+                      wraplength=250, foreground='#999',
+                      font=('', 8)).pack(fill='x')
+
+            # ② 尺度
+            s2 = step('② 影像尺度')
+            row = ttk.Frame(s2); row.pack(fill='x')
+            ttk.Label(row, text='每 px = ').pack(side='left')
+            self.var_px = tk.StringVar(value='39.1')
+            ttk.Entry(row, textvariable=self.var_px, width=8).pack(side='left')
+            ttk.Label(row, text=' nm').pack(side='left')
+
+            # ③ 探針
+            s3 = step('③ 探針設定')
+            self.var_source = tk.StringVar(value='cone')
+            ttk.Radiobutton(s3, text='廠商 cone（輸入規格）', value='cone',
+                            variable=self.var_source,
+                            command=self._update_tip_mode).pack(anchor='w')
+            ttk.Radiobutton(s3, text='載入探針檔（Gwyddion itip_estimate .npy）',
+                            value='npy', variable=self.var_source,
+                            command=self._update_tip_mode).pack(anchor='w')
+
+            # cone 參數
+            cone = ttk.Frame(s3); cone.pack(fill='x', padx=(14, 0), pady=2)
+            r1 = ttk.Frame(cone); r1.pack(fill='x')
+            ttk.Label(r1, text='球冠半徑 R = ').pack(side='left')
+            self.var_R = tk.StringVar(value='2.0')
+            self.e_R = ttk.Entry(r1, textvariable=self.var_R, width=7)
+            self.e_R.pack(side='left'); ttk.Label(r1, text=' nm').pack(side='left')
+
+            r2 = ttk.Frame(cone); r2.pack(fill='x')
+            ttk.Label(r2, text='視窗半徑 = ').pack(side='left')
+            self.var_half = tk.StringVar(value='5')
+            self.e_half = ttk.Entry(r2, textvariable=self.var_half, width=7)
+            self.e_half.pack(side='left'); ttk.Label(r2, text=' px').pack(side='left')
+
+            # 對稱 / 非對稱
+            self.var_asym = tk.BooleanVar(value=False)
+            self.chk_asym = ttk.Checkbutton(
+                cone, text='☑ 非對稱探針（θx / θy 分開設定）',
+                variable=self.var_asym, command=self._update_tip_mode)
+            self.chk_asym.pack(anchor='w', pady=(4, 0))
+
+            r3 = ttk.Frame(cone); r3.pack(fill='x')
+            ttk.Label(r3, text='半錐角 θ = ').pack(side='left')
+            self.var_th = tk.StringVar(value='25')
+            self.e_th = ttk.Entry(r3, textvariable=self.var_th, width=7)
+            self.e_th.pack(side='left'); ttk.Label(r3, text=' °（對稱）').pack(side='left')
+
+            r4 = ttk.Frame(cone); r4.pack(fill='x')
+            ttk.Label(r4, text='θx = ').pack(side='left')
+            self.var_thx = tk.StringVar(value='25')
+            self.e_thx = ttk.Entry(r4, textvariable=self.var_thx, width=6)
+            self.e_thx.pack(side='left')
+            ttk.Label(r4, text=' °   θy = ').pack(side='left')
+            self.var_thy = tk.StringVar(value='15')
+            self.e_thy = ttk.Entry(r4, textvariable=self.var_thy, width=6)
+            self.e_thy.pack(side='left'); ttk.Label(r4, text=' °').pack(side='left')
+
+            # 載入探針檔
+            self.btn_tipnpy = ttk.Button(s3, text='📂 選擇探針 .npy',
+                                         command=self._load_tip_npy)
+            self.btn_tipnpy.pack(fill='x', pady=(4, 0))
+            self.lbl_tip = ttk.Label(s3, text='', wraplength=250, foreground='#666')
+            self.lbl_tip.pack(fill='x')
+
+            ttk.Button(s3, text='👁 預覽探針形狀',
+                       command=self._preview_tip).pack(fill='x', pady=(4, 0))
+
+            # ④ 執行
+            s4 = step('④ 執行')
+            ttk.Button(s4, text='▶ 執行去卷積', command=self._run).pack(fill='x')
+
+            # ⑤ 結果
+            s5 = step('⑤ 結果')
+            g = ttk.Frame(s5); g.pack(fill='x')
+            self.lbl_cert = self._stat(g, '可信像素 certain', 0)
+            self.lbl_din = self._stat(g, '影像孔深', 1)
+            self.lbl_dre = self._stat(g, '還原孔深（下界）', 2)
+
+            # ⑥ 儲存
+            s6 = step('⑥ 儲存')
+            ttk.Button(s6, text='💾 儲存結果（npy + PNG）',
+                       command=self._save).pack(fill='x')
+
+            # log
+            self.txt = tk.Text(left, height=7, width=38, font=('Consolas', 8))
+            self.txt.pack(fill='x', pady=(6, 0))
+
+            # 右側圖
+            self.fig = Figure(figsize=(8.5, 7.4))
+            self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+            self.canvas.get_tk_widget().pack(fill='both', expand=True)
+            self._refresh()
+            self._update_tip_mode()
+
+        def _stat(self, parent, name, row):
+            ttk.Label(parent, text=name + '：').grid(row=row, column=0, sticky='w')
+            v = ttk.Label(parent, text='—', foreground='#0a7')
+            v.grid(row=row, column=1, sticky='w')
+            return v
+
+        # ── 探針模式切換（對稱/非對稱、cone/npy 啟停）──────────
+        def _update_tip_mode(self):
+            cone = self.var_source.get() == 'cone'
+            asym = self.var_asym.get()
+
+            def en(w, on): w.config(state=('normal' if on else 'disabled'))
+            en(self.e_R, cone); en(self.e_half, cone); en(self.chk_asym, cone)
+            en(self.e_th, cone and not asym)
+            en(self.e_thx, cone and asym); en(self.e_thy, cone and asym)
+            en(self.btn_tipnpy, not cone)
+
+        # ── log（主執行緒安全）────────────────────────────────
+        def _log(self, msg):
+            self.txt.insert('end', msg + '\n'); self.txt.see('end')
+
+        def _log_safe(self, msg):
+            self.after(0, lambda m=msg: self._log(m))
+
+        # ── ① 載入影像 ────────────────────────────────────────
+        def _load_image(self):
+            p = filedialog.askopenfilename(
+                title='選擇影像 (.npy)',
+                filetypes=[('NumPy 陣列', '*.npy'), ('所有檔案', '*.*')])
+            if not p:
+                return
+            try:
+                arr = np.squeeze(np.load(p)).astype(np.float64)
+            except Exception as e:
+                messagebox.showerror('讀取失敗', str(e)); return
+            if arr.ndim != 2:
+                messagebox.showerror('格式錯誤',
+                                     f'需要 2D 陣列，讀到 shape={arr.shape}')
+                return
+            self.image, self.image_path = arr, p
+            self.recon = self.certain = self.frac = None
+            self.lbl_img.config(
+                text=f'{os.path.basename(p)}\nshape={arr.shape}  '
+                     f'[{arr.min():.1f}, {arr.max():.1f}] nm')
+            self._log(f'載入影像 {os.path.basename(p)} {arr.shape}')
+            self._refresh()
+
+        # ── ③ 載入探針檔 ──────────────────────────────────────
+        def _load_tip_npy(self):
+            p = filedialog.askopenfilename(
+                title='選擇探針 (.npy)',
+                filetypes=[('NumPy 陣列', '*.npy'), ('所有檔案', '*.*')])
+            if not p:
+                return
+            self.tip_npy_path = p
+            self.lbl_tip.config(text=f'探針檔：{os.path.basename(p)}')
+            self._log(f'指定探針檔 {os.path.basename(p)}')
+
+        # ── 依 UI 設定建立探針 ────────────────────────────────
+        def _build_tip(self):
+            half = int(float(self.var_half.get()))
+            px_nm = float(self.var_px.get())
+            if self.var_source.get() == 'npy':
+                if not self.tip_npy_path:
+                    raise ValueError('尚未選擇探針 .npy（或改用廠商 cone）')
+                tip = np.squeeze(np.load(self.tip_npy_path)).astype(np.float64)
+                tip -= tip.max()
+                return tip
+            R = float(self.var_R.get())
+            if self.var_asym.get():
+                tx, ty = float(self.var_thx.get()), float(self.var_thy.get())
+                return make_cone_tip_asym(half, px_nm, R, tx, ty)
+            th = float(self.var_th.get())
+            return make_cone_tip(half, px_nm, R, th)
+
+        # ── 預覽探針 ──────────────────────────────────────────
+        def _preview_tip(self):
+            try:
+                self.tip = self._build_tip()
+            except Exception as e:
+                messagebox.showerror('探針設定錯誤', str(e)); return
+            kind = ('非對稱 cone' if (self.var_source.get() == 'cone'
+                    and self.var_asym.get())
+                    else '對稱 cone' if self.var_source.get() == 'cone'
+                    else '載入探針')
+            self._log(f'預覽探針（{kind}）shape={self.tip.shape}')
+            self._refresh()
+
+        # ── ④ 執行去卷積（背景執行緒）─────────────────────────
+        def _run(self):
+            if self.image is None:
+                messagebox.showwarning('缺少影像', '請先於 ① 載入影像'); return
+            try:
+                tip = self._build_tip()
+            except Exception as e:
+                messagebox.showerror('探針設定錯誤', str(e)); return
+            self.tip = tip
+            self._log('去卷積中…（grey_erosion + certainty）')
+
+            def worker():
+                try:
+                    res = deconvolve(self.image, tip)
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror('去卷積失敗', str(e)))
+                    return
+                self.after(0, lambda: self._done(res))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _done(self, res):
+            self.recon, self.certain = res['recon'], res['certain']
+            self.frac = res['certain_frac']
+            self.lbl_cert.config(text=f'{self.frac*100:.1f} %')
+            self.lbl_din.config(text=f'{depth_of(self.image):.1f} nm')
+            self.lbl_dre.config(text=f'{depth_of(self.recon):.1f} nm')
+            # 下界性質檢查（誠實回報）
+            ok = bool(np.all(self.recon <= self.image + 1e-6))
+            self._log(f'完成：certain={self.frac*100:.1f}%  '
+                      f'還原孔深={depth_of(self.recon):.1f}nm  '
+                      f'下界 s_r≤i={ok}')
+            self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
+            self._refresh()
+
+        # ── ⑥ 儲存 ───────────────────────────────────────────
+        def _save(self):
+            if self.recon is None:
+                messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
+            d = filedialog.askdirectory(title='選擇輸出資料夾')
+            if not d:
+                return
+            stem = os.path.splitext(os.path.basename(
+                self.image_path or 'scan'))[0]
+            np.save(os.path.join(d, f'{stem}_reconstructed.npy'), self.recon)
+            np.save(os.path.join(d, f'{stem}_certain.npy'), self.certain)
+            png = os.path.join(d, f'{stem}_blind_deconv.png')
+            save_panels(self.image, self.recon, self.certain, self.tip, self.frac,
+                        png, title=f'Certainty deconvolution — {stem}')
+            self._log(f'已儲存至 {d}')
+            messagebox.showinfo('完成', f'結果已存至：\n{d}')
+
+        # ── 統一重繪（有什麼畫什麼）───────────────────────────
+        def _refresh(self):
+            self.fig.clf()
+            axs = self.fig.subplots(2, 3)
+            # 影像類子圖關掉刻度；剖面折線圖保留刻度（於下方另設）
+            for ax in (axs[0, 0], axs[0, 1], axs[0, 2], axs[1, 0]):
+                ax.set_xticks([]); ax.set_yticks([])
+
+            # 共用色階（影像+還原）
+            imgs = [a for a in (self.image, self.recon) if a is not None]
+            if imgs:
+                vmin = min(a.min() for a in imgs)
+                vmax = max(a.max() for a in imgs)
+            else:
+                vmin = vmax = None
+
+            if self.image is not None:
+                axs[0, 0].imshow(self.image, cmap='viridis', vmin=vmin, vmax=vmax)
+                axs[0, 0].set_title(f'輸入影像\nmin={self.image.min():.1f} '
+                                    f'max={self.image.max():.1f} nm', fontsize=9)
+            else:
+                axs[0, 0].set_title('輸入影像（尚未載入）', fontsize=9)
+
+            if self.recon is not None:
+                axs[0, 1].imshow(self.recon, cmap='viridis', vmin=vmin, vmax=vmax)
+                axs[0, 1].set_title(f'還原表面（erosion）\n'
+                                    f'min={self.recon.min():.1f} nm 確定下界',
+                                    fontsize=9)
+                axs[0, 2].imshow(self.recon, cmap='gray', vmin=vmin, vmax=vmax)
+                ov = np.zeros((*self.certain.shape, 4))
+                ov[~self.certain] = [1, 0, 0, 0.40]
+                axs[0, 2].imshow(ov)
+                axs[0, 2].set_title(f'certainty map\ncertain='
+                                    f'{self.frac*100:.1f}% (紅=碰不到)', fontsize=9)
+            else:
+                axs[0, 1].set_title('還原表面（待執行）', fontsize=9)
+                axs[0, 2].set_title('certainty map（待執行）', fontsize=9)
+
+            # 探針視覺化
+            if self.tip is not None:
+                t = self.tip
+                h = t.shape[0] // 2
+                im = axs[1, 0].imshow(t, cmap='magma')
+                self.fig.colorbar(im, ax=axs[1, 0], fraction=0.046, pad=0.04)
+                axs[1, 0].set_title('探針 2D（apex=0）', fontsize=9)
+                xs = np.arange(-h, t.shape[1] - h)
+                axs[1, 1].plot(xs, t[h, :], color='#1d9e75', lw=2)
+                axs[1, 1].axhline(0, color='gray', lw=0.6)
+                axs[1, 1].set_title('探針 X 剖面', fontsize=9)
+                axs[1, 1].grid(alpha=0.3); axs[1, 1].set_xlabel('px')
+                ys = np.arange(-h, t.shape[0] - h)
+                axs[1, 2].plot(ys, t[:, h], color='#d1495b', lw=2)
+                axs[1, 2].axhline(0, color='gray', lw=0.6)
+                axs[1, 2].set_title('探針 Y 剖面', fontsize=9)
+                axs[1, 2].grid(alpha=0.3); axs[1, 2].set_xlabel('px')
+            else:
+                for j, name in enumerate(('探針 2D', '探針 X 剖面', '探針 Y 剖面')):
+                    axs[1, j].set_xticks([]); axs[1, j].set_yticks([])
+                    axs[1, j].set_title(f'{name}（未設定）', fontsize=9)
+
+            self.fig.tight_layout()
+            self.canvas.draw()
+
+    App().mainloop()
+
+
+# ──────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────
 def main():
@@ -243,13 +643,14 @@ def main():
     ap.add_argument('--px-nm', type=float, default=39.1, help='影像每 px nm（預設 39.1）')
     ap.add_argument('--out', default='blind_out', help='輸出資料夾')
     ap.add_argument('--demo', action='store_true', help='跑合成資料驗證 + 教學圖')
+    ap.add_argument('--gui', action='store_true', help='啟動圖形介面（步驟式操作）')
     args = ap.parse_args()
 
-    if args.demo or args.image is None:
-        if args.image is None and not args.demo:
-            ap.print_help()
-            print("\n（提示：先試 `python blind_deconvolution.py --demo`）")
-            return
+    # 無參數 → 預設啟動 GUI；或明確指定 --gui
+    if args.gui or (args.image is None and not args.demo):
+        launch_gui()
+        return
+    if args.demo:
         run_demo('blind_demo')
         return
 

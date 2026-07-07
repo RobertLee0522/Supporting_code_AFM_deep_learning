@@ -66,7 +66,7 @@
 | `batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
 | `evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
 | `check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
-| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學） | 影像 .npy + 已知探針 | 還原表面 + certainty map |
+| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學）+ **步驟式 GUI** | 影像 .npy + 已知探針（對稱/**非對稱** cone 或 tip.npy） | 還原表面 + certainty map |
 | `reconstruct_lines_3d.py` | 凸起樣品逐線 1D 去卷積 + 3D 重建（給定 R, θ） | Nanoscope .000 + 探針 R/θ | 還原高度圖 .npy + 3D 渲染 PNG |
 
 ### 3.1 `afm_gui.py`（盲探針重建 GUI）
@@ -240,6 +240,22 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ## 9. 變更紀錄 (Changelog)
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-07-07 — `blind_deconvolution.py`：新增步驟式 GUI + 非對稱探針（θx/θy）支援**
+  - **GUI（`launch_gui()`，Tkinter）**：把零訓練去卷積流程做成「按步驟操作」介面——
+    ① 載入影像(.npy) → ② 設 px_nm → ③ 設探針 → ④ 執行去卷積 → ⑤ 檢視 certainty → ⑥ 儲存。
+    右側 2×3 圖：輸入 / 還原(erosion) / certainty map(紅=探針碰不到) / 探針 2D / X 剖面 / Y 剖面。
+    去卷積在背景執行緒跑、以 `self.after()` 回主緒更新（沿用 afm_gui 執行緒安全慣例）；
+    嵌入採 `FigureCanvasTkAgg`＋`Figure`，不受模組頂 `matplotlib.use('Agg')` 影響（無頭仍可 import）。
+    無參數執行即開 GUI（`--gui` 亦可）；`--demo` 與既有 CLI 位置參數行為不變。
+  - **非對稱探針 `make_cone_tip_asym(half, px_nm, R, θx, θy)`**：真實探針未必旋轉對稱，
+    支援 X/Y 兩軸各自半錐角。以「半錐角隨方位角 φ 橢圓內插」
+    `tanθ(φ)=(a·b)/√((b·cosφ)²+(a·sinφ)²)`（a=tanθx, b=tanθy）建構，φ=0 得 θx、φ=90° 得 θy，
+    平滑過渡；`θx==θy` 時嚴格退化為對稱 `make_cone_tip`（單元測試 max|diff|≈1.4e-9）。
+    GUI 以「☑ 非對稱探針」核取方塊切換單一 θ ↔ θx/θy 兩欄。
+  - **核心不動**：`reconstruct_surface`(grey_erosion)/`surface_certainty` 對任意 2D 探針皆成立，
+    非對稱只是換一支非旋轉對稱的 structure。煙霧測試：非對稱 tip(θx25/θy10) 下 `s_r ≤ i` 恆成立（不過度去卷積）。
+  - CJK 字型 rcParams 移到模組頂（圖中中文正確顯示）。TF-free。
 
 - **2026-06-25 — 新增 `reconstruct_lines_3d.py`：凸起樣品探針去卷積 + 3D 重建（2D/逐線1D）**
   - **需求**：給定探針 R(球冠半徑 nm)/θ(半錐角 °)，對 Nanoscope `.000` 凸起樣品掃描去卷積、
