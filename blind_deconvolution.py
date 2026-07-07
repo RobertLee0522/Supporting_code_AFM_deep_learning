@@ -395,20 +395,21 @@ def load_nanoscope_surface(fp, sample='hole'):
 # ──────────────────────────────────────────────────────────────────
 # 視覺化
 # ──────────────────────────────────────────────────────────────────
-def _draw_width(ax, meas):
-    """在給定 axes 上畫寬度量測：X/Y 跨距紅線 + 極值點 + 數值標註。"""
+def _draw_width(ax, meas, color='red'):
+    """在給定 axes 上畫寬度量測：X/Y 跨距線 + 極值點 + 數值標註（color 區分影像/還原）。"""
     m = meas
-    ax.plot([m['x0'], m['x1']], [m['cy'], m['cy']], '-', color='red', lw=1.6)
-    ax.plot([m['cx'], m['cx']], [m['y0'], m['y1']], '-', color='red', lw=1.6)
-    ax.plot(m['cx'], m['cy'], '+', color='red', ms=9, mew=1.6)
+    ax.plot([m['x0'], m['x1']], [m['cy'], m['cy']], '-', color=color, lw=1.6)
+    ax.plot([m['cx'], m['cx']], [m['y0'], m['y1']], '-', color=color, lw=1.6)
+    ax.plot(m['cx'], m['cy'], '+', color=color, ms=9, mew=1.6)
     ax.text(0.02, 0.98,
             f"W@{int(m['frac']*100)}%\nX={m['width_x_nm']:.1f}nm\n"
             f"Y={m['width_y_nm']:.1f}nm\nD={m['equiv_diam_nm']:.1f}nm",
             transform=ax.transAxes, va='top', ha='left', fontsize=8, color='white',
-            bbox=dict(boxstyle='round', fc='red', ec='none', alpha=0.65))
+            bbox=dict(boxstyle='round', fc=color, ec='none', alpha=0.65))
 
 
-def save_panels(image, recon, certain, tip, certain_frac, out_path, title='', meas=None):
+def save_panels(image, recon, certain, tip, certain_frac, out_path, title='',
+                meas=None, meas_in=None):
     fig, ax = plt.subplots(1, 4, figsize=(20, 5))
     vmin = min(image.min(), recon.min())
     vmax = max(image.max(), recon.max())
@@ -416,6 +417,8 @@ def save_panels(image, recon, certain, tip, certain_frac, out_path, title='', me
     im0 = ax[0].imshow(image, cmap='viridis', vmin=vmin, vmax=vmax)
     ax[0].set_title(f'Input image (AFM)\nmin={image.min():.1f} max={image.max():.1f} nm')
     plt.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
+    if meas_in:                                        # 影像寬度（橘色，對照用）
+        _draw_width(ax[0], meas_in, color='#ff8c00')
 
     im1 = ax[1].imshow(recon, cmap='viridis', vmin=vmin, vmax=vmax)
     ax[1].set_title(f'Reconstructed surface (erosion)\n'
@@ -517,6 +520,7 @@ def launch_gui():
             self.certain = None
             self.frac = None
             self.meas = None           # 還原表面寬度量測結果
+            self.meas_in = None        # 影像寬度量測結果（對照）
             self._build_ui()
 
         # ── 版面 ──────────────────────────────────────────────
@@ -733,7 +737,7 @@ def launch_gui():
                                      f'需要 2D 陣列，讀到 shape={arr.shape}')
                 return
             self.image, self.image_path = arr, p
-            self.recon = self.certain = self.frac = self.meas = None
+            self.recon = self.certain = self.frac = self.meas = self.meas_in = None
             self.lbl_img.config(text=src)
             self._log(f'載入 {os.path.basename(p)} {arr.shape} '
                       f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
@@ -829,6 +833,7 @@ def launch_gui():
             sample = self.var_sample.get()
             self.meas = measure_feature_width(self.recon, px_nm, sample, frac)
             m_in = measure_feature_width(self.image, px_nm, sample, frac)
+            self.meas_in = m_in
             if self.meas:
                 self.lbl_wre.config(
                     text=f"{self.meas['width_x_nm']:.1f}×{self.meas['width_y_nm']:.1f}"
@@ -857,7 +862,8 @@ def launch_gui():
             np.save(os.path.join(d, f'{stem}_certain.npy'), self.certain)
             png = os.path.join(d, f'{stem}_blind_deconv.png')
             save_panels(self.image, self.recon, self.certain, self.tip, self.frac,
-                        png, title=f'Certainty deconvolution — {stem}', meas=self.meas)
+                        png, title=f'Certainty deconvolution — {stem}',
+                        meas=self.meas, meas_in=self.meas_in)
             self._log(f'已儲存至 {d}')
             messagebox.showinfo('完成', f'結果已存至：\n{d}')
 
@@ -881,6 +887,8 @@ def launch_gui():
                 axs[0, 0].imshow(self.image, cmap='viridis', vmin=vmin, vmax=vmax)
                 axs[0, 0].set_title(f'輸入影像\nmin={self.image.min():.1f} '
                                     f'max={self.image.max():.1f} nm', fontsize=9)
+                if self.meas_in:                       # 影像寬度（橘色，對照）
+                    _draw_width(axs[0, 0], self.meas_in, color='#ff8c00')
             else:
                 axs[0, 0].set_title('輸入影像（尚未載入）', fontsize=9)
 
@@ -1007,7 +1015,7 @@ def main():
     np.save(os.path.join(args.out, f'{stem}_certain.npy'), res['certain'])
     save_panels(image, recon, res['certain'], tip, res['certain_frac'],
                 os.path.join(args.out, f'{stem}_blind_deconv.png'),
-                title=f'Certainty deconvolution — {stem}', meas=meas)
+                title=f'Certainty deconvolution — {stem}', meas=meas, meas_in=m_in)
     print(f"\n完成。結果存於：{args.out}/")
 
 
