@@ -676,7 +676,7 @@ def launch_gui():
             self.txt.pack(fill='x', pady=(6, 0))
 
             # 右側圖
-            self.fig = Figure(figsize=(8.5, 7.4))
+            self.fig = Figure(figsize=(11, 7.2))
             self.canvas = FigureCanvasTkAgg(self.fig, master=right)
             self.canvas.get_tk_widget().pack(fill='both', expand=True)
             self.canvas.mpl_connect('button_press_event', self._on_click)
@@ -917,7 +917,7 @@ def launch_gui():
         # ── 統一重繪（有什麼畫什麼）───────────────────────────
         def _refresh(self):
             self.fig.clf()
-            axs = self.fig.subplots(2, 3)
+            axs = self.fig.subplots(2, 4)
             self._ax_img, self._ax_rec = axs[0, 0], axs[0, 1]   # 供點選量測判定
             # 影像類子圖關掉刻度；剖面折線圖保留刻度（於下方另設）
             for ax in (axs[0, 0], axs[0, 1], axs[0, 2], axs[1, 0]):
@@ -979,8 +979,56 @@ def launch_gui():
                     axs[1, j].set_xticks([]); axs[1, j].set_yticks([])
                     axs[1, j].set_title(f'{name}（未設定）', fontsize=9)
 
+            # 特徵剖面（沿量測線的高度曲線，同操作人看的 2D 剖面）
+            self._draw_feature_profile(axs[0, 3], horiz=True)
+            self._draw_feature_profile(axs[1, 3], horiz=False)
+
             self.fig.tight_layout()
             self.canvas.draw()
+
+        # ── 特徵剖面圖：影像(橘) vs 還原(紅)，量測跨距畫在門檻高度 ──
+        def _draw_feature_profile(self, ax, horiz=True):
+            name = '特徵剖面 X（沿量測線）' if horiz else '特徵剖面 Y（沿量測線）'
+            if not (self.meas or self.meas_in):
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.set_title(f'{name}\n（量測後顯示）', fontsize=9)
+                return
+            try:
+                px = float(self.var_px.get())
+            except ValueError:
+                px = 1.0
+            sample = self.var_sample.get()
+            for surf, m, color, lab in ((self.image, self.meas_in, '#ff8c00', '影像'),
+                                        (self.recon, self.meas, '#d1495b', '還原')):
+                if surf is None or not m:
+                    continue
+                if horiz:
+                    line = surf[m['cy'], :]; lo, hi = m['x0'], m['x1']
+                else:
+                    line = surf[:, m['cx']]; lo, hi = m['y0'], m['y1']
+                ax.plot(np.arange(len(line)) * px, line, color=color, lw=1.4, label=lab)
+                # 量測跨距畫在『該量測自己的門檻高度』（frac×振幅，相對基線）
+                if sample == 'bump':
+                    thr_z = np.percentile(surf, 10) + m['frac'] * m['amp_nm']
+                else:
+                    thr_z = np.percentile(surf, 95) - m['frac'] * m['amp_nm']
+                ax.plot([lo * px, hi * px], [thr_z, thr_z],
+                        color=color, lw=2.2, ls='--')
+                # 影像標在線上方、還原標在線下方，避免兩標籤重疊
+                above = (lab == '影像') if sample == 'bump' else (lab != '影像')
+                ax.annotate(f'{lab} {(hi - lo) * px:.1f}nm',
+                            ((lo + hi) / 2 * px, thr_z), fontsize=8, color=color,
+                            ha='center', va='bottom' if above else 'top',
+                            xytext=(0, 3 if above else -3),
+                            textcoords='offset points')
+            # 視野鎖定特徵附近（±2.5× 跨距），才看得清楚曲線形狀
+            m = self.meas or self.meas_in
+            lo, hi = (m['x0'], m['x1']) if horiz else (m['y0'], m['y1'])
+            c, w = (lo + hi) / 2, max(hi - lo, 4)
+            ax.set_xlim(max(0.0, (c - 2.5 * w) * px), (c + 2.5 * w) * px)
+            ax.set_title(name, fontsize=9)
+            ax.set_xlabel('nm'); ax.set_ylabel('nm')
+            ax.grid(alpha=0.3); ax.legend(fontsize=7, loc='upper right')
 
     App().mainloop()
 
