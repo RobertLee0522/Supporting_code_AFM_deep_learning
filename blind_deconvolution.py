@@ -515,6 +515,17 @@ def run_demo(out_dir='blind_demo'):
 #   → ④ 執行去卷積 → ⑤ 檢視 certainty → ⑥ 儲存結果
 # 形態學運算對任意 2D 探針皆成立，非對稱探針無需改動核心（reconstruct/certainty）。
 # ──────────────────────────────────────────────────────────────────
+def _fnum(s):
+    """寬容數字解析：接受中文輸入法的全形小數點（。．，）與逗號。
+
+    使用者以中文 IME 輸入「20。7」時 float() 會失敗，看起來像「不能輸入小數點」；
+    此處統一正規化成半形句點再解析。
+    """
+    return float(str(s).strip()
+                 .replace('。', '.').replace('．', '.')
+                 .replace('，', '.').replace(',', '.'))
+
+
 def launch_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -790,10 +801,10 @@ def launch_gui():
             if self.image is None:
                 return None
             try:
-                R = float(self.var_R.get())
-                th = (max(float(self.var_thx.get()), float(self.var_thy.get()))
-                      if self.var_asym.get() else float(self.var_th.get()))
-                px_nm = float(self.var_px.get())
+                R = _fnum(self.var_R.get())
+                th = (max(_fnum(self.var_thx.get()), _fnum(self.var_thy.get()))
+                      if self.var_asym.get() else _fnum(self.var_th.get()))
+                px_nm = _fnum(self.var_px.get())
             except (ValueError, tk.TclError):
                 return None
             return auto_tip_half(self.image, px_nm, R, th, self.var_sample.get())
@@ -864,19 +875,19 @@ def launch_gui():
 
         # ── 依 UI 設定建立探針 ────────────────────────────────
         def _build_tip(self):
-            half = int(float(self.var_half.get()))
-            px_nm = float(self.var_px.get())
+            half = int(_fnum(self.var_half.get()))
+            px_nm = _fnum(self.var_px.get())
             if self.var_source.get() == 'npy':
                 if not self.tip_npy_path:
                     raise ValueError('尚未選擇探針 .npy（或改用廠商 cone）')
                 tip = np.squeeze(np.load(self.tip_npy_path)).astype(np.float64)
                 tip -= tip.max()
                 return tip
-            R = float(self.var_R.get())
+            R = _fnum(self.var_R.get())
             if self.var_asym.get():
-                tx, ty = float(self.var_thx.get()), float(self.var_thy.get())
+                tx, ty = _fnum(self.var_thx.get()), _fnum(self.var_thy.get())
                 return make_cone_tip_asym(half, px_nm, R, tx, ty)
-            th = float(self.var_th.get())
+            th = _fnum(self.var_th.get())
             return make_cone_tip(half, px_nm, R, th)
 
         # ── 預覽探針 ──────────────────────────────────────────
@@ -1123,7 +1134,7 @@ def launch_gui():
             z = map_coordinates(surf, [y0 + (y1 - y0) * ts, x0 + (x1 - x0) * ts],
                                 order=1, mode='nearest')
             try:
-                px = float(self.var_px.get())
+                px = _fnum(self.var_px.get())
             except ValueError:
                 px = 1.0
             return ts * dist_px * px, z
@@ -1177,10 +1188,10 @@ def launch_gui():
             if self.recon is None:
                 messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
             try:
-                frac = min(0.95, max(0.05, float(self.var_wfrac.get())))
+                frac = min(0.95, max(0.05, _fnum(self.var_wfrac.get())))
             except ValueError:
                 frac = 0.5
-            px_nm = float(self.var_px.get())
+            px_nm = _fnum(self.var_px.get())
             sample = self.var_sample.get()
             self.meas = measure_feature_width(self.recon, px_nm, sample, frac,
                                               at=self.pick)
@@ -1378,7 +1389,7 @@ def launch_gui():
             step = max(1, max(H, W) // 90)               # 降取樣到 ~90 供旋轉流暢
             z = np.asarray(surf[::step, ::step], dtype=float)
             try:
-                px = float(self.var_px.get())
+                px = _fnum(self.var_px.get())
             except ValueError:
                 px = 1.0
             xs = np.arange(z.shape[1]) * step * px
@@ -1419,7 +1430,7 @@ def launch_gui():
                 ax.set_title(f'{name}\n（量測後顯示）', fontsize=9)
                 return
             try:
-                px = float(self.var_px.get())
+                px = _fnum(self.var_px.get())
             except ValueError:
                 px = 1.0
             sample = self.var_sample.get()
@@ -1492,14 +1503,17 @@ def launch_gui():
                                       ms=6, mec='k', zorder=5)
                 sa['di2'], = axp.plot([xs[i2]], [zi[i2]], 'o', color='#ff8c00',
                                       ms=6, mec='k', zorder=5)
-                sa['hli'], = axp.plot([xs[i1], xs[i2]], [zi[i1], zi[i1]], ':',
+                # L 形連線：水平段(點1高度)＋垂直段(至點2)，兩端準確落在兩圓點上
+                sa['hli'], = axp.plot([xs[i1], xs[i2], xs[i2]],
+                                      [zi[i1], zi[i1], zi[i2]], ':',
                                       color='#ff8c00', lw=1.3, alpha=0.9)
                 if zr is not None:
                     sa['dr1'], = axp.plot([xs[i1]], [zr[i1]], 'o', color='#d1495b',
                                           ms=6, mec='k', zorder=5)
                     sa['dr2'], = axp.plot([xs[i2]], [zr[i2]], 'o', color='#d1495b',
                                           ms=6, mec='k', zorder=5)
-                    sa['hlr'], = axp.plot([xs[i1], xs[i2]], [zr[i1], zr[i1]], ':',
+                    sa['hlr'], = axp.plot([xs[i1], xs[i2], xs[i2]],
+                                          [zr[i1], zr[i1], zr[i2]], ':',
                                           color='#d1495b', lw=1.3, alpha=0.9)
                 # 數字標註：色碼對應曲線（影像橘、還原紅），字放大加粗
                 L = self._section_lines()
@@ -1563,11 +1577,13 @@ def launch_gui():
                 # 更新交點/ΔZ 虛線/數字
                 sa['di1'].set_data([xs[i1]], [zi[i1]])
                 sa['di2'].set_data([xs[i2]], [zi[i2]])
-                sa['hli'].set_data([xs[i1], xs[i2]], [zi[i1], zi[i1]])
+                sa['hli'].set_data([xs[i1], xs[i2], xs[i2]],
+                                   [zi[i1], zi[i1], zi[i2]])
                 if zr is not None and 'dr1' in sa:
                     sa['dr1'].set_data([xs[i1]], [zr[i1]])
                     sa['dr2'].set_data([xs[i2]], [zr[i2]])
-                    sa['hlr'].set_data([xs[i1], xs[i2]], [zr[i1], zr[i1]])
+                    sa['hlr'].set_data([xs[i1], xs[i2], xs[i2]],
+                                       [zr[i1], zr[i1], zr[i2]])
                 L = self._section_lines()
                 if 'stxt_h' in sa:
                     sa['stxt_h'].set_text(L['h'])
