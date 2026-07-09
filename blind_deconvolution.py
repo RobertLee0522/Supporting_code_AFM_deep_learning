@@ -61,7 +61,8 @@ matplotlib.rcParams['font.sans-serif'] = [
 ] + matplotlib.rcParams.get('font.sans-serif', [])
 matplotlib.rcParams['axes.unicode_minus'] = False  # 負號不用方塊替代
 import matplotlib.pyplot as plt
-from scipy.ndimage import grey_dilation, grey_erosion, median_filter, label
+from scipy.ndimage import (grey_dilation, grey_erosion, median_filter, label,
+                           map_coordinates)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -540,6 +541,10 @@ def launch_gui():
             self._auto_job = None      # 參數變更自動重跑（防抖）排程 id
             self._meas_job = None      # 半深比例變更自動重量測排程 id
             self._busy = False         # 去卷積執行中旗標（避免並行重跑）
+            # NanoScope Section 式剖面線：p0/p1=端點(y,x)、c1/c2=游標參數位置(0~1)
+            self.section = None
+            self._drag = None          # 進行中的拖曳 ('endpoint'|'cursor'|'maybe_new', ...)
+            self._sa = {}              # 剖面線 artists（拖曳時輕量更新用）
             self._build_ui()
 
         # ── 版面 ──────────────────────────────────────────────
@@ -666,9 +671,11 @@ def launch_gui():
                        command=self._measure).pack(side='left', padx=(6, 0))
             ttk.Button(mrow, text='↺ 自動',
                        command=self._pick_reset).pack(side='left', padx=(4, 0))
+            ttk.Button(mrow, text='✕ 剖面線',
+                       command=self._section_clear).pack(side='left', padx=(4, 0))
             self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
-                                               '👆 點影像/還原圖=選特徵；'
-                                               '點剖面圖高度=改量測門檻',
+                                               '👆 點影像=選特徵；按住拖曳=拉剖面線'
+                                               '（Section）；點剖面圖高度=改門檻',
                                       wraplength=250, foreground='#999', font=('', 8))
             self.lbl_pick.pack(fill='x')
 
@@ -685,7 +692,9 @@ def launch_gui():
             self.fig = Figure(figsize=(11, 7.2))
             self.canvas = FigureCanvasTkAgg(self.fig, master=right)
             self.canvas.get_tk_widget().pack(fill='both', expand=True)
-            self.canvas.mpl_connect('button_press_event', self._on_click)
+            self.canvas.mpl_connect('button_press_event', self._on_press)
+            self.canvas.mpl_connect('motion_notify_event', self._on_motion)
+            self.canvas.mpl_connect('button_release_event', self._on_release)
             # 探針 R/θ/尺度/樣品變動時，若「自動」開啟則重算視窗半徑
             for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
                       self.var_px, self.var_sample):
@@ -773,6 +782,7 @@ def launch_gui():
             self.image, self.image_path = arr, p
             self.recon = self.certain = self.frac = self.meas = self.meas_in = None
             self.pick = None                     # 新影像重設點選位置
+            self.section = None                  # 新影像清除剖面線
             self.lbl_img.config(text=src)
             self._log(f'載入 {os.path.basename(p)} {arr.shape} '
                       f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
@@ -926,39 +936,164 @@ def launch_gui():
             self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
             self._measure()                    # 去卷積後自動量測寬度並繪圖
 
-        # ── ⑤ 點選量測位置（影像/還原圖）或量測高度（剖面圖）──
-        def _on_click(self, event):
-            if event.inaxes is None:
+        # ── 滑鼠互動總管：拉剖面線 / 拖端點 / 拖游標 / 點特徵 / 點門檻 ──
+        def _on_press(self, event):
+            if event.inaxes is None or event.xdata is None:
                 return
-            # 剖面圖點選：以點選的『高度』重設量測門檻（半深比例）再重量
-            #   點基線附近 = 操作人的底部全寬量法；點半高 = FWHM。
-            if event.inaxes in (getattr(self, '_ax_profx', None),
-                                getattr(self, '_ax_profy', None)):
-                if self.recon is None or not self.meas_in or event.ydata is None:
+            ax = event.inaxes
+            img_axs = (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None))
+            if ax in img_axs:
+                # 先檢查是否命中剖面線端點（拖曳調整）
+                if self.section:
+                    for key in ('p0', 'p1'):
+                        py_, px_ = self.section[key]
+                        if abs(event.xdata - px_) < 7 and abs(event.ydata - py_) < 7:
+                            self._drag = ('endpoint', key)
+                            return
+                # 可能是「點特徵」或「拉新剖面線」——放開時依移動距離判定
+                self._drag = ('maybe_new', (float(event.ydata), float(event.xdata)),
+                              (event.x, event.y))
+            elif self.section and ax is getattr(self, '_ax_sec', None):
+                # Section 面板：點/拖 = 移動較近的游標（NanoScope 手感）
+                t = self._event_to_t(event)
+                if t is None:
                     return
-                z = float(event.ydata)
-                if self.var_sample.get() == 'bump':
-                    base = float(np.percentile(self.image, 10))
-                    frac = (z - base) / self.meas_in['amp_nm']
-                else:
-                    base = float(np.percentile(self.image, 95))
-                    frac = (base - z) / self.meas_in['amp_nm']
-                frac = min(0.95, max(0.05, frac))
-                self.var_wfrac.set(f'{frac:.2f}')
-                self._log(f'剖面點選高度 {z:.2f}nm → 門檻比例 {frac:.2f}，重新量測')
-                self._measure()
+                key = ('c1' if abs(t - self.section['c1']) <=
+                       abs(t - self.section['c2']) else 'c2')
+                self.section[key] = t
+                self._drag = ('cursor', key)
+                self._update_section_artists()
+            elif ax in (getattr(self, '_ax_profx', None),
+                        getattr(self, '_ax_profy', None)):
+                self._threshold_click(event)
+
+        def _on_motion(self, event):
+            if not self._drag:
                 return
-            axs = (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None))
-            if event.inaxes not in axs:
+            kind = self._drag[0]
+            if kind == 'maybe_new':
+                # 移動超過 4 螢幕像素 → 開始拉新剖面線
+                x0, y0 = self._drag[2]
+                if abs(event.x - x0) <= 4 and abs(event.y - y0) <= 4:
+                    return
+                if event.inaxes not in (self._ax_img, self._ax_rec) \
+                        or event.xdata is None:
+                    return
+                p0 = self._drag[1]
+                self.section = {'p0': p0,
+                                'p1': (float(event.ydata), float(event.xdata)),
+                                'c1': 0.25, 'c2': 0.75}
+                self._drag = ('endpoint', 'p1')
+                self._refresh()                    # 建立 artists 後改走輕量更新
+            elif kind == 'endpoint':
+                if event.inaxes not in (self._ax_img, self._ax_rec) \
+                        or event.xdata is None:
+                    return
+                H, W = self.image.shape
+                self.section[self._drag[1]] = (
+                    float(np.clip(event.ydata, 0, H - 1)),
+                    float(np.clip(event.xdata, 0, W - 1)))
+                self._update_section_artists()
+            elif kind == 'cursor':
+                if event.inaxes is not getattr(self, '_ax_sec', None):
+                    return
+                t = self._event_to_t(event)
+                if t is not None:
+                    self.section[self._drag[1]] = t
+                    self._update_section_artists()
+
+        def _on_release(self, event):
+            drag, self._drag = self._drag, None
+            if not drag:
                 return
-            if self.recon is None or event.xdata is None or event.ydata is None:
+            if drag[0] == 'maybe_new':             # 沒拖動 → 原本的「點特徵」
+                y, x = drag[1]
+                self._pick_feature(y, x)
+            elif drag[0] in ('endpoint', 'cursor') and self.section:
+                d, dz_i, dz_r = self._section_readout()
+                self._log(f'剖面線游標：距離 {d:.1f} nm'
+                          + (f'  Δz影像 {dz_i:+.2f}' if dz_i is not None else '')
+                          + (f'  Δz還原 {dz_r:+.2f} nm' if dz_r is not None else ''))
+                self._refresh()                    # 收尾統一重繪
+
+        # ── 點特徵（原本的影像點選量測）──────────────────────
+        def _pick_feature(self, y, x):
+            if self.recon is None:
                 return
-            self.pick = (float(event.ydata), float(event.xdata))
+            self.pick = (float(y), float(x))
             self.lbl_pick.config(
-                text=f'量測位置：點選 (x={int(event.xdata)}, y={int(event.ydata)})'
+                text=f'量測位置：點選 (x={int(x)}, y={int(y)})'
                      f'　→ 按「↺ 自動」可還原')
-            self._log(f'點選量測位置 (x={int(event.xdata)}, y={int(event.ydata)})')
+            self._log(f'點選量測位置 (x={int(x)}, y={int(y)})')
             self._measure()
+
+        # ── 點剖面圖高度＝設定量測門檻 ────────────────────────
+        def _threshold_click(self, event):
+            if self.recon is None or not self.meas_in or event.ydata is None:
+                return
+            z = float(event.ydata)
+            if self.var_sample.get() == 'bump':
+                base = float(np.percentile(self.image, 10))
+                frac = (z - base) / self.meas_in['amp_nm']
+            else:
+                base = float(np.percentile(self.image, 95))
+                frac = (base - z) / self.meas_in['amp_nm']
+            frac = min(0.95, max(0.05, frac))
+            self.var_wfrac.set(f'{frac:.2f}')
+            self._log(f'剖面點選高度 {z:.2f}nm → 門檻比例 {frac:.2f}，重新量測')
+            self._measure()
+
+        # ── Section 剖面線：取樣 / 座標換算 / 讀值 / 清除 ────
+        def _section_profile(self, surf, n=240):
+            """沿剖面線取樣：回傳 (距離nm 陣列, 高度nm 陣列)；線長為 0 回 None。"""
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            dist_px = float(np.hypot(y1 - y0, x1 - x0))
+            if dist_px < 1e-6:
+                return None
+            ts = np.linspace(0.0, 1.0, n)
+            z = map_coordinates(surf, [y0 + (y1 - y0) * ts, x0 + (x1 - x0) * ts],
+                                order=1, mode='nearest')
+            try:
+                px = float(self.var_px.get())
+            except ValueError:
+                px = 1.0
+            return ts * dist_px * px, z
+
+        def _event_to_t(self, event):
+            """Section 面板 x 座標（nm）→ 線上參數 t (0~1)。"""
+            prof = self._section_profile(self.image)
+            if prof is None or event.xdata is None:
+                return None
+            total = prof[0][-1]
+            return float(np.clip(event.xdata / max(total, 1e-9), 0.0, 1.0))
+
+        def _section_pt(self, t):
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            return y0 + (y1 - y0) * t, x0 + (x1 - x0) * t
+
+        def _section_readout(self):
+            """游標間距(nm) 與兩曲線在游標處的 Δz；無資料回 None。"""
+            prof_i = self._section_profile(self.image)
+            if prof_i is None:
+                return 0.0, None, None
+            xs, zi = prof_i
+            t1, t2 = self.section['c1'], self.section['c2']
+            i1 = int(round(t1 * (len(xs) - 1)))
+            i2 = int(round(t2 * (len(xs) - 1)))
+            d = abs(xs[i2] - xs[i1])
+            dz_i = float(zi[i2] - zi[i1])
+            dz_r = None
+            if self.recon is not None:
+                _, zr = self._section_profile(self.recon)
+                dz_r = float(zr[i2] - zr[i1])
+            return d, dz_i, dz_r
+
+        def _section_clear(self):
+            if self.section is None:
+                return
+            self.section = None
+            self._log('已清除剖面線')
+            self._refresh()
 
         def _pick_reset(self):
             self.pick = None
@@ -1081,9 +1216,15 @@ def launch_gui():
                     axs[1, j].set_xticks([]); axs[1, j].set_yticks([])
                     axs[1, j].set_title(f'{name}（未設定）', fontsize=9)
 
-            # 特徵剖面（沿量測線的高度曲線，同操作人看的 2D 剖面）
-            self._ax_profx, self._ax_profy = axs[0, 3], axs[1, 3]  # 供點選門檻判定
-            self._draw_feature_profile(axs[0, 3], horiz=True)
+            # 右欄：有剖面線 → Section 面板（NanoScope 式）；否則特徵剖面 X
+            self._ax_profy = axs[1, 3]
+            if self.section is not None and self.image is not None:
+                self._ax_sec, self._ax_profx = axs[0, 3], None
+                self._draw_section(axs[0, 3])
+            else:
+                self._ax_profx, self._ax_sec = axs[0, 3], None
+                self._sa = {}
+                self._draw_feature_profile(axs[0, 3], horiz=True)
             self._draw_feature_profile(axs[1, 3], horiz=False)
 
             self.fig.tight_layout()
@@ -1132,6 +1273,91 @@ def launch_gui():
             ax.set_title(name, fontsize=9)
             ax.set_xlabel('nm'); ax.set_ylabel('nm')
             ax.grid(alpha=0.3); ax.legend(fontsize=7, loc='upper right')
+
+        # ── Section 剖面線繪製（影像上的線/端點/游標 + 剖面面板）──
+        C1, C2 = '#00acc1', '#e91e63'            # 游標 1/2 顏色（青 / 洋紅）
+
+        def _draw_section(self, ax_sec):
+            sa = {}
+            t1, t2 = self.section['c1'], self.section['c2']
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            cy1, cx1 = self._section_pt(t1)
+            cy2, cx2 = self._section_pt(t2)
+            # 影像/還原面板上：白線 + 端點方塊 + 游標圓點
+            for name, ax in (('img', self._ax_img), ('rec', self._ax_rec)):
+                if ax is None:
+                    continue
+                sa[f'line_{name}'], = ax.plot([x0, x1], [y0, y1], '-',
+                                              color='white', lw=1.4, alpha=0.9)
+                sa[f'ends_{name}'], = ax.plot([x0, x1], [y0, y1], 's',
+                                              color='white', ms=6, mec='black')
+                sa[f'c1_{name}'], = ax.plot([cx1], [cy1], 'o', color=self.C1,
+                                            ms=7, mec='white')
+                sa[f'c2_{name}'], = ax.plot([cx2], [cy2], 'o', color=self.C2,
+                                            ms=7, mec='white')
+            # Section 剖面面板：影像/還原曲線 + 兩條游標垂線 + 讀值
+            prof_i = self._section_profile(self.image)
+            if prof_i is not None:
+                xs, zi = prof_i
+                sa['prof_img'], = ax_sec.plot(xs, zi, color='#ff8c00',
+                                              lw=1.4, label='影像')
+                if self.recon is not None:
+                    _, zr = self._section_profile(self.recon)
+                    sa['prof_rec'], = ax_sec.plot(xs, zr, color='#d1495b',
+                                                  lw=1.4, label='還原')
+                total = xs[-1]
+                sa['vl1'] = ax_sec.axvline(t1 * total, color=self.C1,
+                                           ls='--', lw=1.6)
+                sa['vl2'] = ax_sec.axvline(t2 * total, color=self.C2,
+                                           ls='--', lw=1.6)
+                d, dz_i, dz_r = self._section_readout()
+                txt = f'距離 {d:.1f} nm'
+                if dz_i is not None:
+                    txt += f'   Δz影像 {dz_i:+.2f}'
+                if dz_r is not None:
+                    txt += f' / 還原 {dz_r:+.2f} nm'
+                sa['txt'] = ax_sec.set_title(f'剖面線 Section（拖游標量測）\n{txt}',
+                                             fontsize=9)
+                ax_sec.set_xlabel('nm'); ax_sec.set_ylabel('nm')
+                ax_sec.grid(alpha=0.3); ax_sec.legend(fontsize=7, loc='upper right')
+            self._sa = sa
+
+        def _update_section_artists(self):
+            """拖曳中的輕量更新：只改 artists 資料，不整張重繪（保持滑順）。"""
+            sa = self._sa
+            if not sa or self.section is None:
+                self._refresh(); return
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            t1, t2 = self.section['c1'], self.section['c2']
+            cy1, cx1 = self._section_pt(t1)
+            cy2, cx2 = self._section_pt(t2)
+            for name in ('img', 'rec'):
+                if f'line_{name}' not in sa:
+                    continue
+                sa[f'line_{name}'].set_data([x0, x1], [y0, y1])
+                sa[f'ends_{name}'].set_data([x0, x1], [y0, y1])
+                sa[f'c1_{name}'].set_data([cx1], [cy1])
+                sa[f'c2_{name}'].set_data([cx2], [cy2])
+            prof_i = self._section_profile(self.image)
+            if prof_i is not None and 'prof_img' in sa:
+                xs, zi = prof_i
+                sa['prof_img'].set_data(xs, zi)
+                if 'prof_rec' in sa and self.recon is not None:
+                    _, zr = self._section_profile(self.recon)
+                    sa['prof_rec'].set_data(xs, zr)
+                total = xs[-1]
+                sa['vl1'].set_xdata([t1 * total, t1 * total])
+                sa['vl2'].set_xdata([t2 * total, t2 * total])
+                ax = sa['prof_img'].axes
+                ax.relim(); ax.autoscale_view()
+                d, dz_i, dz_r = self._section_readout()
+                txt = f'距離 {d:.1f} nm'
+                if dz_i is not None:
+                    txt += f'   Δz影像 {dz_i:+.2f}'
+                if dz_r is not None:
+                    txt += f' / 還原 {dz_r:+.2f} nm'
+                sa['txt'].set_text(f'剖面線 Section（拖游標量測）\n{txt}')
+            self.canvas.draw_idle()
 
     App().mainloop()
 
