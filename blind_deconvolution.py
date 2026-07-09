@@ -662,7 +662,8 @@ def launch_gui():
             ttk.Button(mrow, text='↺ 自動',
                        command=self._pick_reset).pack(side='left', padx=(4, 0))
             self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
-                                               '👆 可直接在影像/還原圖上點選要量的特徵',
+                                               '👆 點影像/還原圖=選特徵；'
+                                               '點剖面圖高度=改量測門檻',
                                       wraplength=250, foreground='#999', font=('', 8))
             self.lbl_pick.pack(fill='x')
 
@@ -845,10 +846,30 @@ def launch_gui():
             self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
             self._measure()                    # 去卷積後自動量測寬度並繪圖
 
-        # ── ⑤ 點選量測位置（在影像/還原圖上點擊）──────────────
+        # ── ⑤ 點選量測位置（影像/還原圖）或量測高度（剖面圖）──
         def _on_click(self, event):
+            if event.inaxes is None:
+                return
+            # 剖面圖點選：以點選的『高度』重設量測門檻（半深比例）再重量
+            #   點基線附近 = 操作人的底部全寬量法；點半高 = FWHM。
+            if event.inaxes in (getattr(self, '_ax_profx', None),
+                                getattr(self, '_ax_profy', None)):
+                if self.recon is None or not self.meas_in or event.ydata is None:
+                    return
+                z = float(event.ydata)
+                if self.var_sample.get() == 'bump':
+                    base = float(np.percentile(self.image, 10))
+                    frac = (z - base) / self.meas_in['amp_nm']
+                else:
+                    base = float(np.percentile(self.image, 95))
+                    frac = (base - z) / self.meas_in['amp_nm']
+                frac = min(0.95, max(0.05, frac))
+                self.var_wfrac.set(f'{frac:.2f}')
+                self._log(f'剖面點選高度 {z:.2f}nm → 門檻比例 {frac:.2f}，重新量測')
+                self._measure()
+                return
             axs = (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None))
-            if event.inaxes not in axs or event.inaxes is None:
+            if event.inaxes not in axs:
                 return
             if self.recon is None or event.xdata is None or event.ydata is None:
                 return
@@ -862,7 +883,8 @@ def launch_gui():
         def _pick_reset(self):
             self.pick = None
             self.lbl_pick.config(text='量測位置：自動（全圖最大特徵）\n'
-                                      '👆 可直接在影像/還原圖上點選要量的特徵')
+                                      '👆 點影像/還原圖=選特徵；'
+                                      '點剖面圖高度=改量測門檻')
             if self.recon is not None:
                 self._measure()
 
@@ -980,6 +1002,7 @@ def launch_gui():
                     axs[1, j].set_title(f'{name}（未設定）', fontsize=9)
 
             # 特徵剖面（沿量測線的高度曲線，同操作人看的 2D 剖面）
+            self._ax_profx, self._ax_profy = axs[0, 3], axs[1, 3]  # 供點選門檻判定
             self._draw_feature_profile(axs[0, 3], horiz=True)
             self._draw_feature_profile(axs[1, 3], horiz=False)
 
