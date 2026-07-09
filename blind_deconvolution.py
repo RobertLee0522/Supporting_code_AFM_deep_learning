@@ -521,6 +521,7 @@ def launch_gui():
     import threading
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D            # noqa: F401 (註冊 3d 投影)
 
     class App(tk.Tk):
         def __init__(self):
@@ -722,6 +723,28 @@ def launch_gui():
             self.canvas.mpl_connect('button_press_event', self._on_press)
             self.canvas.mpl_connect('motion_notify_event', self._on_motion)
             self.canvas.mpl_connect('button_release_event', self._on_release)
+
+            # ── 頁3：3D 還原表面（可滑鼠旋轉）──
+            tab3 = ttk.Frame(self.nb)
+            self.nb.add(tab3, text='  3D 還原  ')
+            top3 = ttk.Frame(tab3); top3.pack(fill='x', pady=2)
+            self.var_3dsrc = tk.StringVar(value='recon')
+            ttk.Radiobutton(top3, text='還原表面', value='recon',
+                            variable=self.var_3dsrc,
+                            command=self._draw_3d).pack(side='left')
+            ttk.Radiobutton(top3, text='輸入影像', value='image',
+                            variable=self.var_3dsrc,
+                            command=self._draw_3d).pack(side='left')
+            ttk.Button(top3, text='⟳ 重繪 3D',
+                       command=self._draw_3d).pack(side='left', padx=6)
+            ttk.Label(top3, text='（滑鼠拖曳可旋轉角度；滾輪縮放）',
+                      foreground='#888').pack(side='left')
+            self.fig3 = Figure(figsize=(8, 6))
+            self.ax3 = self.fig3.add_subplot(111, projection='3d')
+            self.canvas3 = FigureCanvasTkAgg(self.fig3, master=tab3)
+            self.canvas3.get_tk_widget().pack(fill='both', expand=True)
+            self._3d_drawn_for = None          # 記錄已繪的 (來源, recon物件id)
+            self.nb.bind('<<NotebookTabChanged>>', self._on_tab_change)
             # 探針 R/θ/尺度/樣品變動時，若「自動」開啟則重算視窗半徑
             for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
                       self.var_px, self.var_sample):
@@ -1313,6 +1336,44 @@ def launch_gui():
             self.tbl.tag_configure('img', foreground='#d2691e')
             self.tbl.tag_configure('rec', foreground='#c0392b')
 
+        # ── 頁3：3D 表面（切到該頁才繪，避免拖慢其他頁）────────
+        def _on_tab_change(self, _evt=None):
+            if self.nb.index('current') == 2:            # 第3頁 = 3D
+                key = (self.var_3dsrc.get(),
+                       id(self.recon) if self.var_3dsrc.get() == 'recon'
+                       else id(self.image))
+                if key != self._3d_drawn_for:            # 資料沒變就不重畫
+                    self._draw_3d()
+
+        def _draw_3d(self):
+            surf = self.recon if self.var_3dsrc.get() == 'recon' else self.image
+            self.ax3.clear()
+            if surf is None:
+                self.ax3.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
+                self.canvas3.draw(); return
+            H, W = surf.shape
+            step = max(1, max(H, W) // 90)               # 降取樣到 ~90 供旋轉流暢
+            z = np.asarray(surf[::step, ::step], dtype=float)
+            try:
+                px = float(self.var_px.get())
+            except ValueError:
+                px = 1.0
+            xs = np.arange(z.shape[1]) * step * px
+            ys = np.arange(z.shape[0]) * step * px
+            X, Y = np.meshgrid(xs, ys)
+            self.ax3.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
+                                  antialiased=False,
+                                  rcount=z.shape[0], ccount=z.shape[1])
+            lab = '還原表面' if self.var_3dsrc.get() == 'recon' else '輸入影像'
+            self.ax3.set_title(f'{lab} 3D（{z.shape[1]}×{z.shape[0]} 取樣；拖曳旋轉）',
+                               fontsize=10)
+            self.ax3.set_xlabel('X (nm)'); self.ax3.set_ylabel('Y (nm)')
+            self.ax3.set_zlabel('Z (nm)')
+            self.canvas3.draw()
+            self._3d_drawn_for = (self.var_3dsrc.get(),
+                                  id(self.recon) if self.var_3dsrc.get() == 'recon'
+                                  else id(self.image))
+
         # ── 特徵剖面圖：影像(橘) vs 還原(紅)，量測跨距畫在門檻高度 ──
         def _draw_feature_profile(self, ax, horiz=True):
             name = '特徵剖面 X（沿量測線）' if horiz else '特徵剖面 Y（沿量測線）'
@@ -1377,8 +1438,11 @@ def launch_gui():
             prof_i = self._section_profile(self.image)
             if prof_i is not None:
                 xs, zi = prof_i
+                n = len(xs)
+                i1 = int(round(t1 * (n - 1))); i2 = int(round(t2 * (n - 1)))
                 sa['prof_img'], = axp.plot(xs, zi, color='#ff8c00', lw=1.5,
                                            label='影像')
+                zr = None
                 if self.recon is not None:
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'], = axp.plot(xs, zr, color='#d1495b', lw=1.5,
@@ -1386,11 +1450,40 @@ def launch_gui():
                 total = xs[-1]
                 sa['vl1'] = axp.axvline(t1 * total, color=self.C1, ls='--', lw=1.6)
                 sa['vl2'] = axp.axvline(t2 * total, color=self.C2, ls='--', lw=1.6)
-                axp.set_title('Section 剖面（拖青/洋紅游標量測 → 見下方表格）',
-                              fontsize=9)
+                # 各曲線游標交點 + ΔZ 水平虛線（影像橘、還原紅）
+                sa['di1'], = axp.plot([xs[i1]], [zi[i1]], 'o', color='#ff8c00',
+                                      ms=6, mec='k', zorder=5)
+                sa['di2'], = axp.plot([xs[i2]], [zi[i2]], 'o', color='#ff8c00',
+                                      ms=6, mec='k', zorder=5)
+                sa['hli'], = axp.plot([xs[i1], xs[i2]], [zi[i1], zi[i1]], ':',
+                                      color='#ff8c00', lw=1.3, alpha=0.9)
+                if zr is not None:
+                    sa['dr1'], = axp.plot([xs[i1]], [zr[i1]], 'o', color='#d1495b',
+                                          ms=6, mec='k', zorder=5)
+                    sa['dr2'], = axp.plot([xs[i2]], [zr[i2]], 'o', color='#d1495b',
+                                          ms=6, mec='k', zorder=5)
+                    sa['hlr'], = axp.plot([xs[i1], xs[i2]], [zr[i1], zr[i1]], ':',
+                                          color='#d1495b', lw=1.3, alpha=0.9)
+                sa['stxt'] = axp.text(0.02, 0.98, self._section_text(),
+                                      transform=axp.transAxes, va='top', ha='left',
+                                      fontsize=8, family='sans-serif',
+                                      bbox=dict(boxstyle='round', fc='white',
+                                                ec='#888', alpha=0.85))
+                axp.set_title('Section 剖面（拖青/洋紅游標量測）', fontsize=9)
                 axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
-                axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='best')
+                axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='upper right')
             self._sa = sa
+
+        def _section_text(self):
+            si = self._pair_stats(self.image)
+            if not si:
+                return ''
+            lines = [f"水平距離 {si['hd']:.2f} nm", f"ΔZ 影像 {si['vd']:+.2f} nm"]
+            if self.recon is not None:
+                sr = self._pair_stats(self.recon)
+                if sr:
+                    lines.append(f"ΔZ 還原 {sr['vd']:+.2f} nm")
+            return '\n'.join(lines)
 
         def _update_section_artists(self):
             """拖曳中的輕量更新：只改 artists 資料 + 表格，不整張重繪（保持滑順）。"""
@@ -1409,13 +1502,26 @@ def launch_gui():
             prof_i = self._section_profile(self.image)
             if prof_i is not None and 'prof_img' in sa:
                 xs, zi = prof_i
+                n = len(xs)
+                i1 = int(round(t1 * (n - 1))); i2 = int(round(t2 * (n - 1)))
                 sa['prof_img'].set_data(xs, zi)
+                zr = None
                 if 'prof_rec' in sa and self.recon is not None:
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'].set_data(xs, zr)
                 total = xs[-1]
                 sa['vl1'].set_xdata([t1 * total, t1 * total])
                 sa['vl2'].set_xdata([t2 * total, t2 * total])
+                # 更新交點/ΔZ 虛線/數字
+                sa['di1'].set_data([xs[i1]], [zi[i1]])
+                sa['di2'].set_data([xs[i2]], [zi[i2]])
+                sa['hli'].set_data([xs[i1], xs[i2]], [zi[i1], zi[i1]])
+                if zr is not None and 'dr1' in sa:
+                    sa['dr1'].set_data([xs[i1]], [zr[i1]])
+                    sa['dr2'].set_data([xs[i2]], [zr[i2]])
+                    sa['hlr'].set_data([xs[i1], xs[i2]], [zr[i1], zr[i1]])
+                if 'stxt' in sa:
+                    sa['stxt'].set_text(self._section_text())
                 ax = sa['prof_img'].axes
                 ax.relim(); ax.autoscale_view()
             self._update_table()

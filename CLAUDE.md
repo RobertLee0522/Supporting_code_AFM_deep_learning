@@ -241,6 +241,17 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-10 — `blind_deconvolution.py`：Section 影像/還原 ΔZ 虛線標註 + 新增 3D 還原分頁**
+  - **Section 剖面數字化**：兩游標交點在**影像(橘)/還原(紅) 各畫圓點 + ΔZ 水平虛線**，
+    左上文字框即時顯示「水平距離 / ΔZ 影像 / ΔZ 還原」（`_section_text`）；拖曳時一併輕量更新
+    （`_update_section_artists`）。數字不再只在表格，剖面圖上直接看得到影像 vs 還原差異。
+  - **新增頁3「3D 還原」**：以 256² 高度資料 `plot_surface`（降取樣至 ~90 邊長供旋轉流暢，
+    afmhot 色）畫可**滑鼠拖曳旋轉/縮放**的 3D 表面；單選鈕切換「還原表面 / 輸入影像」、「⟳ 重繪」鈕。
+    切到該頁才繪（`_on_tab_change` + `_3d_drawn_for` 快取，資料未變不重畫），不拖慢其他頁；
+    自有 `canvas3` 不掛自訂事件，沿用 matplotlib 內建 3D 旋轉。
+  - 驗證（30nm.003）：Section 文字框「水平 31.50 / ΔZ影像 −2.13 / ΔZ還原 −0.80 nm」+ 四交點虛線；
+    3D 頁還原表面（128×128 取樣）三顆凸起峰正確、可旋轉。
+
 - **2026-07-10 — `blind_deconvolution.py`：GUI 改分頁版面 + NanoScope 式 Pair 量測表**
   - **需求**：仿 NanoScope Section 視窗（左大掃描圖＋右剖面＋下方 Pair 數據表），版面分頁避免太滿；
     量測改**純游標手動量**（選好範圍＝拉線＋兩游標，直接比對大小）。
