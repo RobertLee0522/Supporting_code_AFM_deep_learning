@@ -543,7 +543,7 @@ def launch_gui():
             self._busy = False         # 去卷積執行中旗標（避免並行重跑）
             # NanoScope Section 式剖面線：p0/p1=端點(y,x)、c1/c2=游標參數位置(0~1)
             self.section = None
-            self._drag = None          # 進行中的拖曳 ('endpoint'|'cursor'|'maybe_new', ...)
+            self._drag = None          # 進行中的拖曳 ('newline'|'endpoint'|'cursor'|'pick')
             self._sa = {}              # 剖面線 artists（拖曳時輕量更新用）
             self._build_ui()
 
@@ -688,9 +688,36 @@ def launch_gui():
             self.txt = tk.Text(left, height=7, width=38, font=('Consolas', 8))
             self.txt.pack(fill='x', pady=(6, 0))
 
-            # 右側圖
+            # 右側：分頁（頁1 Section 量測＝NanoScope 式；頁2 去卷積詳情）
+            self.nb = ttk.Notebook(right)
+            self.nb.pack(fill='both', expand=True)
+            tab1 = ttk.Frame(self.nb); tab2 = ttk.Frame(self.nb)
+            self.nb.add(tab1, text='  Section 量測  ')
+            self.nb.add(tab2, text='  去卷積詳情  ')
+
+            # ── 頁1：左大影像 + 右 Section 剖面 + 下方數據表 ──
+            self.fig1 = Figure(figsize=(11, 5.2))
+            gs = self.fig1.add_gridspec(1, 2, width_ratios=[1.0, 1.15])
+            self._ax_sec_img = self.fig1.add_subplot(gs[0])
+            self._ax_sec_prof = self.fig1.add_subplot(gs[1])
+            self.canvas1 = FigureCanvasTkAgg(self.fig1, master=tab1)
+            self.canvas1.get_tk_widget().pack(fill='both', expand=True)
+            for ev, fn in (('button_press_event', self._on_press),
+                           ('motion_notify_event', self._on_motion),
+                           ('button_release_event', self._on_release)):
+                self.canvas1.mpl_connect(ev, fn)
+            cols = ('curve', 'hd', 'vd', 'sd', 'ang')
+            heads = ('曲線', '水平距離 (nm)', '高低差 ΔZ (nm)',
+                     '表面距離 (nm)', '角度 (°)')
+            self.tbl = ttk.Treeview(tab1, columns=cols, show='headings', height=2)
+            for c, h in zip(cols, heads):
+                self.tbl.heading(c, text=h)
+                self.tbl.column(c, width=120, anchor='center')
+            self.tbl.pack(fill='x', padx=4, pady=(0, 4))
+
+            # ── 頁2：原 2×4 詳情圖 ──
             self.fig = Figure(figsize=(11, 7.2))
-            self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+            self.canvas = FigureCanvasTkAgg(self.fig, master=tab2)
             self.canvas.get_tk_widget().pack(fill='both', expand=True)
             self.canvas.mpl_connect('button_press_event', self._on_press)
             self.canvas.mpl_connect('motion_notify_event', self._on_motion)
@@ -936,26 +963,28 @@ def launch_gui():
             self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
             self._measure()                    # 去卷積後自動量測寬度並繪圖
 
-        # ── 滑鼠互動總管：拉剖面線 / 拖端點 / 拖游標 / 點特徵 / 點門檻 ──
+        # ── 滑鼠互動總管 ──────────────────────────────────────
+        #   頁1 掃描影像：按住拖曳＝拉剖面線；拖端點＝調整
+        #   頁1 Section 剖面：點/拖＝移動較近的游標
+        #   頁2 影像/還原：點＝選特徵；頁2 特徵剖面：點＝改門檻
         def _on_press(self, event):
             if event.inaxes is None or event.xdata is None:
                 return
             ax = event.inaxes
-            img_axs = (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None))
-            if ax in img_axs:
-                # 先檢查是否命中剖面線端點（拖曳調整）
-                if self.section:
+            if ax is getattr(self, '_ax_sec_img', None):     # 頁1 掃描影像
+                if self.image is None:
+                    return
+                if self.section:                             # 命中端點 → 拖曳調整
+                    tol = max(6, 0.02 * self.image.shape[1])
                     for key in ('p0', 'p1'):
                         py_, px_ = self.section[key]
-                        if abs(event.xdata - px_) < 7 and abs(event.ydata - py_) < 7:
+                        if abs(event.xdata - px_) < tol and abs(event.ydata - py_) < tol:
                             self._drag = ('endpoint', key)
                             return
-                # 可能是「點特徵」或「拉新剖面線」——放開時依移動距離判定
-                self._drag = ('maybe_new', (float(event.ydata), float(event.xdata)),
+                self._drag = ('newline', (float(event.ydata), float(event.xdata)),
                               (event.x, event.y))
-            elif self.section and ax is getattr(self, '_ax_sec', None):
-                # Section 面板：點/拖 = 移動較近的游標（NanoScope 手感）
-                t = self._event_to_t(event)
+            elif self.section and ax is getattr(self, '_ax_sec_prof', None):
+                t = self._event_to_t(event)                  # 頁1 剖面 → 拖游標
                 if t is None:
                     return
                 key = ('c1' if abs(t - self.section['c1']) <=
@@ -963,6 +992,8 @@ def launch_gui():
                 self.section[key] = t
                 self._drag = ('cursor', key)
                 self._update_section_artists()
+            elif ax in (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None)):
+                self._drag = ('pick', (float(event.ydata), float(event.xdata)))
             elif ax in (getattr(self, '_ax_profx', None),
                         getattr(self, '_ax_profy', None)):
                 self._threshold_click(event)
@@ -971,23 +1002,19 @@ def launch_gui():
             if not self._drag:
                 return
             kind = self._drag[0]
-            if kind == 'maybe_new':
-                # 移動超過 4 螢幕像素 → 開始拉新剖面線
-                x0, y0 = self._drag[2]
+            if kind == 'newline':
+                x0, y0 = self._drag[2]                        # 移動 >4 螢幕px 才建線
                 if abs(event.x - x0) <= 4 and abs(event.y - y0) <= 4:
                     return
-                if event.inaxes not in (self._ax_img, self._ax_rec) \
-                        or event.xdata is None:
+                if event.inaxes is not self._ax_sec_img or event.xdata is None:
                     return
-                p0 = self._drag[1]
-                self.section = {'p0': p0,
+                self.section = {'p0': self._drag[1],
                                 'p1': (float(event.ydata), float(event.xdata)),
                                 'c1': 0.25, 'c2': 0.75}
                 self._drag = ('endpoint', 'p1')
-                self._refresh()                    # 建立 artists 後改走輕量更新
+                self._refresh_section()                      # 建立 artists
             elif kind == 'endpoint':
-                if event.inaxes not in (self._ax_img, self._ax_rec) \
-                        or event.xdata is None:
+                if event.inaxes is not self._ax_sec_img or event.xdata is None:
                     return
                 H, W = self.image.shape
                 self.section[self._drag[1]] = (
@@ -995,7 +1022,7 @@ def launch_gui():
                     float(np.clip(event.xdata, 0, W - 1)))
                 self._update_section_artists()
             elif kind == 'cursor':
-                if event.inaxes is not getattr(self, '_ax_sec', None):
+                if event.inaxes is not self._ax_sec_prof:
                     return
                 t = self._event_to_t(event)
                 if t is not None:
@@ -1006,15 +1033,11 @@ def launch_gui():
             drag, self._drag = self._drag, None
             if not drag:
                 return
-            if drag[0] == 'maybe_new':             # 沒拖動 → 原本的「點特徵」
+            if drag[0] == 'pick':                            # 頁2：點選特徵量測
                 y, x = drag[1]
                 self._pick_feature(y, x)
             elif drag[0] in ('endpoint', 'cursor') and self.section:
-                d, dz_i, dz_r = self._section_readout()
-                self._log(f'剖面線游標：距離 {d:.1f} nm'
-                          + (f'  Δz影像 {dz_i:+.2f}' if dz_i is not None else '')
-                          + (f'  Δz還原 {dz_r:+.2f} nm' if dz_r is not None else ''))
-                self._refresh()                    # 收尾統一重繪
+                self._refresh_section()                      # 收尾統一重繪
 
         # ── 點特徵（原本的影像點選量測）──────────────────────
         def _pick_feature(self, y, x):
@@ -1151,8 +1174,36 @@ def launch_gui():
             self._log(f'已儲存至 {d}')
             messagebox.showinfo('完成', f'結果已存至：\n{d}')
 
-        # ── 統一重繪（有什麼畫什麼）───────────────────────────
+        # ── 統一重繪：頁1 Section + 頁2 詳情 ──────────────────
         def _refresh(self):
+            self._refresh_section()
+            self._refresh_detail()
+
+        # ── 頁1：掃描影像 + Section 剖面（NanoScope 式）────────
+        def _refresh_section(self):
+            axi, axp = self._ax_sec_img, self._ax_sec_prof
+            axi.clear(); axp.clear()
+            axi.set_xticks([]); axi.set_yticks([])
+            if self.image is None:
+                axi.set_title('掃描影像（尚未載入）', fontsize=9)
+                axp.set_xticks([]); axp.set_yticks([])
+                axp.set_title('Section 剖面（載入後在左圖拖線量測）', fontsize=9)
+                self._clear_table(); self._sa = {}
+                self.fig1.tight_layout(); self.canvas1.draw()
+                return
+            axi.imshow(self.image, cmap='afmhot')            # AFM 金銅色調
+            axi.set_title('掃描影像　（按住拖曳＝拉剖面線；拖白點＝調整）', fontsize=9)
+            if self.section:
+                self._draw_section(axi, axp)
+                self._update_table()
+            else:
+                axp.set_xticks([]); axp.set_yticks([])
+                axp.set_title('Section 剖面\n（在左圖按住滑鼠拖出一條線）', fontsize=9)
+                self._clear_table(); self._sa = {}
+            self.fig1.tight_layout(); self.canvas1.draw()
+
+        # ── 頁2：去卷積詳情（原 2×4 圖）───────────────────────
+        def _refresh_detail(self):
             self.fig.clf()
             axs = self.fig.subplots(2, 4)
             self._ax_img, self._ax_rec = axs[0, 0], axs[0, 1]   # 供點選量測判定
@@ -1216,19 +1267,51 @@ def launch_gui():
                     axs[1, j].set_xticks([]); axs[1, j].set_yticks([])
                     axs[1, j].set_title(f'{name}（未設定）', fontsize=9)
 
-            # 右欄：有剖面線 → Section 面板（NanoScope 式）；否則特徵剖面 X
-            self._ax_profy = axs[1, 3]
-            if self.section is not None and self.image is not None:
-                self._ax_sec, self._ax_profx = axs[0, 3], None
-                self._draw_section(axs[0, 3])
-            else:
-                self._ax_profx, self._ax_sec = axs[0, 3], None
-                self._sa = {}
-                self._draw_feature_profile(axs[0, 3], horiz=True)
+            # 右欄：特徵剖面 X / Y（含門檻量測線）
+            self._ax_profx, self._ax_profy = axs[0, 3], axs[1, 3]
+            self._draw_feature_profile(axs[0, 3], horiz=True)
             self._draw_feature_profile(axs[1, 3], horiz=False)
 
             self.fig.tight_layout()
             self.canvas.draw()
+
+        # ── NanoScope 式 Pair 表：影像/還原各一列（游標間量測）──
+        def _pair_stats(self, surf):
+            prof = self._section_profile(surf)
+            if prof is None:
+                return None
+            xs, z = prof
+            n = len(xs)
+            i1 = int(round(self.section['c1'] * (n - 1)))
+            i2 = int(round(self.section['c2'] * (n - 1)))
+            lo, hi = min(i1, i2), max(i1, i2)
+            hd = float(abs(xs[i2] - xs[i1]))               # 水平距離
+            vd = float(z[i2] - z[i1])                      # 高低差 ΔZ
+            sd = float(np.hypot(np.diff(xs[lo:hi + 1]),
+                                np.diff(z[lo:hi + 1])).sum())  # 表面距離
+            ang = float(np.degrees(np.arctan2(vd, hd))) if hd > 1e-9 else 0.0
+            return {'hd': hd, 'vd': vd, 'sd': sd, 'ang': ang}
+
+        def _clear_table(self):
+            for r in self.tbl.get_children():
+                self.tbl.delete(r)
+
+        def _update_table(self):
+            self._clear_table()
+            if not self.section:
+                return
+            for surf, lab, tag in ((self.image, '影像', 'img'),
+                                   (self.recon, '還原', 'rec')):
+                if surf is None:
+                    continue
+                s = self._pair_stats(surf)
+                if not s:
+                    continue
+                self.tbl.insert('', 'end', tags=(tag,),
+                                values=(lab, f"{s['hd']:.2f}", f"{s['vd']:+.2f}",
+                                        f"{s['sd']:.2f}", f"{s['ang']:+.1f}"))
+            self.tbl.tag_configure('img', foreground='#d2691e')
+            self.tbl.tag_configure('rec', foreground='#c0392b')
 
         # ── 特徵剖面圖：影像(橘) vs 還原(紅)，量測跨距畫在門檻高度 ──
         def _draw_feature_profile(self, ax, horiz=True):
@@ -1274,70 +1357,55 @@ def launch_gui():
             ax.set_xlabel('nm'); ax.set_ylabel('nm')
             ax.grid(alpha=0.3); ax.legend(fontsize=7, loc='upper right')
 
-        # ── Section 剖面線繪製（影像上的線/端點/游標 + 剖面面板）──
+        # ── Section 繪製（掃描影像上的線/端點/游標 + 剖面面板）──
         C1, C2 = '#00acc1', '#e91e63'            # 游標 1/2 顏色（青 / 洋紅）
 
-        def _draw_section(self, ax_sec):
+        def _draw_section(self, axi, axp):
             sa = {}
             t1, t2 = self.section['c1'], self.section['c2']
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
             cy1, cx1 = self._section_pt(t1)
             cy2, cx2 = self._section_pt(t2)
-            # 影像/還原面板上：白線 + 端點方塊 + 游標圓點
-            for name, ax in (('img', self._ax_img), ('rec', self._ax_rec)):
-                if ax is None:
-                    continue
-                sa[f'line_{name}'], = ax.plot([x0, x1], [y0, y1], '-',
-                                              color='white', lw=1.4, alpha=0.9)
-                sa[f'ends_{name}'], = ax.plot([x0, x1], [y0, y1], 's',
-                                              color='white', ms=6, mec='black')
-                sa[f'c1_{name}'], = ax.plot([cx1], [cy1], 'o', color=self.C1,
-                                            ms=7, mec='white')
-                sa[f'c2_{name}'], = ax.plot([cx2], [cy2], 'o', color=self.C2,
-                                            ms=7, mec='white')
-            # Section 剖面面板：影像/還原曲線 + 兩條游標垂線 + 讀值
+            # 掃描影像上：白線 + 端點方塊 + 兩游標圓點
+            sa['line'], = axi.plot([x0, x1], [y0, y1], '-', color='white',
+                                   lw=1.6, alpha=0.95)
+            sa['ends'], = axi.plot([x0, x1], [y0, y1], 's', color='white',
+                                   ms=7, mec='black')
+            sa['c1i'], = axi.plot([cx1], [cy1], 'o', color=self.C1, ms=8, mec='white')
+            sa['c2i'], = axi.plot([cx2], [cy2], 'o', color=self.C2, ms=8, mec='white')
+            # Section 剖面：影像(橘)/還原(紅) 疊同一圖 + 兩游標垂線
             prof_i = self._section_profile(self.image)
             if prof_i is not None:
                 xs, zi = prof_i
-                sa['prof_img'], = ax_sec.plot(xs, zi, color='#ff8c00',
-                                              lw=1.4, label='影像')
+                sa['prof_img'], = axp.plot(xs, zi, color='#ff8c00', lw=1.5,
+                                           label='影像')
                 if self.recon is not None:
                     _, zr = self._section_profile(self.recon)
-                    sa['prof_rec'], = ax_sec.plot(xs, zr, color='#d1495b',
-                                                  lw=1.4, label='還原')
+                    sa['prof_rec'], = axp.plot(xs, zr, color='#d1495b', lw=1.5,
+                                               label='還原')
                 total = xs[-1]
-                sa['vl1'] = ax_sec.axvline(t1 * total, color=self.C1,
-                                           ls='--', lw=1.6)
-                sa['vl2'] = ax_sec.axvline(t2 * total, color=self.C2,
-                                           ls='--', lw=1.6)
-                d, dz_i, dz_r = self._section_readout()
-                txt = f'距離 {d:.1f} nm'
-                if dz_i is not None:
-                    txt += f'   Δz影像 {dz_i:+.2f}'
-                if dz_r is not None:
-                    txt += f' / 還原 {dz_r:+.2f} nm'
-                sa['txt'] = ax_sec.set_title(f'剖面線 Section（拖游標量測）\n{txt}',
-                                             fontsize=9)
-                ax_sec.set_xlabel('nm'); ax_sec.set_ylabel('nm')
-                ax_sec.grid(alpha=0.3); ax_sec.legend(fontsize=7, loc='upper right')
+                sa['vl1'] = axp.axvline(t1 * total, color=self.C1, ls='--', lw=1.6)
+                sa['vl2'] = axp.axvline(t2 * total, color=self.C2, ls='--', lw=1.6)
+                axp.set_title('Section 剖面（拖青/洋紅游標量測 → 見下方表格）',
+                              fontsize=9)
+                axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
+                axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='best')
             self._sa = sa
 
         def _update_section_artists(self):
-            """拖曳中的輕量更新：只改 artists 資料，不整張重繪（保持滑順）。"""
+            """拖曳中的輕量更新：只改 artists 資料 + 表格，不整張重繪（保持滑順）。"""
             sa = self._sa
             if not sa or self.section is None:
-                self._refresh(); return
+                self._refresh_section(); return
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
             t1, t2 = self.section['c1'], self.section['c2']
             cy1, cx1 = self._section_pt(t1)
             cy2, cx2 = self._section_pt(t2)
-            for name in ('img', 'rec'):
-                if f'line_{name}' not in sa:
-                    continue
-                sa[f'line_{name}'].set_data([x0, x1], [y0, y1])
-                sa[f'ends_{name}'].set_data([x0, x1], [y0, y1])
-                sa[f'c1_{name}'].set_data([cx1], [cy1])
-                sa[f'c2_{name}'].set_data([cx2], [cy2])
+            if 'line' in sa:
+                sa['line'].set_data([x0, x1], [y0, y1])
+                sa['ends'].set_data([x0, x1], [y0, y1])
+                sa['c1i'].set_data([cx1], [cy1])
+                sa['c2i'].set_data([cx2], [cy2])
             prof_i = self._section_profile(self.image)
             if prof_i is not None and 'prof_img' in sa:
                 xs, zi = prof_i
@@ -1350,14 +1418,8 @@ def launch_gui():
                 sa['vl2'].set_xdata([t2 * total, t2 * total])
                 ax = sa['prof_img'].axes
                 ax.relim(); ax.autoscale_view()
-                d, dz_i, dz_r = self._section_readout()
-                txt = f'距離 {d:.1f} nm'
-                if dz_i is not None:
-                    txt += f'   Δz影像 {dz_i:+.2f}'
-                if dz_r is not None:
-                    txt += f' / 還原 {dz_r:+.2f} nm'
-                sa['txt'].set_text(f'剖面線 Section（拖游標量測）\n{txt}')
-            self.canvas.draw_idle()
+            self._update_table()
+            self.canvas1.draw_idle()
 
     App().mainloop()
 

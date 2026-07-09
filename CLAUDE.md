@@ -241,6 +241,21 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-10 — `blind_deconvolution.py`：GUI 改分頁版面 + NanoScope 式 Pair 量測表**
+  - **需求**：仿 NanoScope Section 視窗（左大掃描圖＋右剖面＋下方 Pair 數據表），版面分頁避免太滿；
+    量測改**純游標手動量**（選好範圍＝拉線＋兩游標，直接比對大小）。
+  - **分頁（`ttk.Notebook`）**：
+    - **頁1「Section 量測」**：左＝掃描影像（`afmhot` 金銅色，`_ax_sec_img`）＋右＝Section 剖面
+      （`_ax_sec_prof`，影像橘/還原紅疊同圖＋青/洋紅游標虛線）＋下方 `ttk.Treeview` Pair 表：
+      **影像/還原各一列**，欄位＝水平距離/高低差 ΔZ/表面距離/角度（NanoScope Pair 對應），
+      兩列同色碼（影像橘、還原紅）即時比對去卷積前後尺寸。
+    - **頁2「去卷積詳情」**：原 2×4 圖（輸入/還原/certainty/探針 2D·X·Y/特徵剖面 X·Y）。
+  - **互動分流**（`_on_press/motion/release` 依 axes 判定）：頁1 掃描圖=拉線/拖端點、頁1 剖面=拖游標；
+    頁2 影像=點選特徵、頁2 剖面=點高度改門檻。`_pair_stats` 算 hd/vd/sd/ang、`_update_table` 填表；
+    拖曳走 `_update_section_artists`（artists+表格+`canvas1.draw_idle`）保持滑順，放開才 `_refresh_section`。
+  - `_refresh` 拆成 `_refresh_section`（頁1）＋`_refresh_detail`（頁2）。驗證（30nm.003, bump, R=8/θ=20.7）：
+    2 分頁、拉線游標到凸起兩腳表格「影像水平 31.50nm / 還原 31.50、ΔZ 影像 −2.13 / 還原 −0.80」，頁2 點特徵不受影響。
+
 - **2026-07-09 — `blind_deconvolution.py`：NanoScope Section 式互動剖面線（拖線/拖游標即時量測）**
   - **需求**：仿 NanoScope 的滑順操作——在掃描原圖上拉兩節點的線、旁邊即時顯示沿線 2D
     剖面、剖面上兩條游標線對應圖上位置、可拖曳調整。
