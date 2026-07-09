@@ -537,6 +537,9 @@ def launch_gui():
             self.meas = None           # 還原表面寬度量測結果
             self.meas_in = None        # 影像寬度量測結果（對照）
             self.pick = None           # 使用者點選的量測位置 (y, x)；None=自動
+            self._auto_job = None      # 參數變更自動重跑（防抖）排程 id
+            self._meas_job = None      # 半深比例變更自動重量測排程 id
+            self._busy = False         # 去卷積執行中旗標（避免並行重跑）
             self._build_ui()
 
         # ── 版面 ──────────────────────────────────────────────
@@ -562,9 +565,11 @@ def launch_gui():
             ttk.Label(srow, text='樣品類型：').pack(side='left')
             self.var_sample = tk.StringVar(value='hole')
             ttk.Radiobutton(srow, text='孔洞', value='hole',
-                            variable=self.var_sample).pack(side='left')
+                            variable=self.var_sample,
+                            command=self._on_sample_change).pack(side='left')
             ttk.Radiobutton(srow, text='凸起', value='bump',
-                            variable=self.var_sample).pack(side='left')
+                            variable=self.var_sample,
+                            command=self._on_sample_change).pack(side='left')
             ttk.Label(s1, text='※ .000 原始檔會自動去尖刺+去傾斜並帶入 px_nm；'
                               '樣品類型只影響基線方向，不改變 erosion 還原結果',
                       wraplength=250, foreground='#999',
@@ -685,6 +690,11 @@ def launch_gui():
             for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
                       self.var_px, self.var_sample):
                 v.trace_add('write', lambda *_: self.after(60, self._refresh_auto_half))
+            # 參數變更 → 自動重跑去卷積（防抖）；半深比例 → 自動重量測
+            for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
+                      self.var_px, self.var_half):
+                v.trace_add('write', lambda *_: self._schedule_auto_run())
+            self.var_wfrac.trace_add('write', lambda *_: self._schedule_measure())
             self._refresh()
             self._update_tip_mode()
 
@@ -770,6 +780,7 @@ def launch_gui():
             if self.var_autohalf.get():
                 self._log(f'自動視窗半徑 = {self.var_half.get()} px')
             self._refresh()
+            self._schedule_auto_run()          # 載入即自動跑第一輪去卷積
 
         # ── ③ 載入探針檔 ──────────────────────────────────────
         def _load_tip_npy(self):
@@ -821,19 +832,88 @@ def launch_gui():
             except Exception as e:
                 messagebox.showerror('探針設定錯誤', str(e)); return
             self.tip = tip
+            self._busy = True
             self._log('去卷積中…（grey_erosion + certainty）')
 
             def worker():
                 try:
                     res = deconvolve(self.image, tip)
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror('去卷積失敗', str(e)))
+                    def fail():
+                        self._busy = False
+                        messagebox.showerror('去卷積失敗', str(e))
+                    self.after(0, fail)
                     return
                 self.after(0, lambda: self._done(res))
 
             threading.Thread(target=worker, daemon=True).start()
 
+        # ── 參數變更 → 自動重跑（防抖 0.7s；輸入中的不完整值靜默略過）──
+        def _schedule_auto_run(self):
+            if self.image is None:
+                return
+            if self._auto_job:
+                self.after_cancel(self._auto_job)
+            self._auto_job = self.after(700, self._auto_run)
+
+        def _auto_run(self):
+            self._auto_job = None
+            if self.image is None:
+                return
+            if self._busy:                       # 上一輪還在跑 → 稍後重試
+                self._auto_job = self.after(300, self._auto_run)
+                return
+            try:
+                tip = self._build_tip()
+            except Exception:
+                return                           # 欄位輸入中/不完整 → 不跳錯誤視窗
+            self.tip = tip
+            self._busy = True
+            self._log('參數變更 → 自動重新去卷積…')
+
+            def worker():
+                try:
+                    res = deconvolve(self.image, tip)
+                except Exception as e:
+                    self.after(0, lambda: (self._log(f'自動重跑失敗：{e}'),
+                                           setattr(self, '_busy', False)))
+                    return
+                self.after(0, lambda: self._done(res))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _schedule_measure(self):
+            if self._meas_job:
+                self.after_cancel(self._meas_job)
+            self._meas_job = self.after(500, self._measure_if_ready)
+
+        def _measure_if_ready(self):
+            self._meas_job = None
+            if self.recon is not None:
+                self._measure()
+
+        # ── 樣品類型切換：Nanoscope 檔需以新基線方向重新載入 ──
+        def _on_sample_change(self):
+            if self.image_path and is_nanoscope_file(self.image_path):
+                sample = self.var_sample.get()
+                try:
+                    arr, px_nm, info = load_nanoscope_surface(self.image_path, sample)
+                except Exception as e:
+                    self._log(f'重新載入失敗：{e}'); return
+                self.image = arr
+                self.var_px.set(f'{px_nm:.2f}')
+                self.recon = self.certain = self.frac = None
+                self.meas = self.meas_in = None
+                self.pick = None
+                self.lbl_img.config(
+                    text=f'Nanoscope {os.path.basename(self.image_path)}\n{info}')
+                self._log(f'樣品類型 → {sample}：已重新載入並重新去傾斜')
+                self._refresh()
+            self._refresh_auto_half()
+            self._schedule_auto_run()
+
         def _done(self, res):
+            self._busy = False
             self.recon, self.certain = res['recon'], res['certain']
             self.frac = res['certain_frac']
             self.lbl_cert.config(text=f'{self.frac*100:.1f} %')
