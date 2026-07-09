@@ -1041,10 +1041,10 @@ def launch_gui():
                 self._drag = ('newline', (float(event.ydata), float(event.xdata)),
                               (event.x, event.y))
             elif self.section and ax is getattr(self, '_ax_sec_prof', None):
-                if event.ydata is None:
+                if event.xdata is None:
                     return
-                self.section['zlev'] = float(event.ydata)    # 頁1 剖面 → 拖量測高度
-                self._drag = ('level',)
+                self.section['xpos'] = float(event.xdata)    # 頁1 剖面 → 拖位置游標
+                self._drag = ('xcur',)
                 self._update_section_artists()
             elif ax in (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None)):
                 self._drag = ('pick', (float(event.ydata), float(event.xdata)))
@@ -1064,8 +1064,8 @@ def launch_gui():
                     return
                 self.section = {'p0': self._drag[1],
                                 'p1': (float(event.ydata), float(event.xdata)),
-                                'zlev': None}
-                self.section['zlev'] = self._default_level()  # 預設抓半高
+                                'xpos': None}
+                self.section['xpos'] = self._default_xpos()  # 預設抓半高左緣
                 self._drag = ('endpoint', 'p1')
                 self._refresh_section()                      # 建立 artists
             elif kind == 'endpoint':
@@ -1076,10 +1076,10 @@ def launch_gui():
                     float(np.clip(event.ydata, 0, H - 1)),
                     float(np.clip(event.xdata, 0, W - 1)))
                 self._update_section_artists()
-            elif kind == 'level':
-                if event.inaxes is not self._ax_sec_prof or event.ydata is None:
+            elif kind == 'xcur':
+                if event.inaxes is not self._ax_sec_prof or event.xdata is None:
                     return
-                self.section['zlev'] = float(event.ydata)
+                self.section['xpos'] = float(event.xdata)
                 self._update_section_artists()
 
         def _on_release(self, event):
@@ -1089,7 +1089,7 @@ def launch_gui():
             if drag[0] == 'pick':                            # 頁2：點選特徵量測
                 y, x = drag[1]
                 self._pick_feature(y, x)
-            elif drag[0] in ('endpoint', 'level') and self.section:
+            elif drag[0] in ('endpoint', 'xcur') and self.section:
                 L = self._section_lines()
                 self._log(f"Section：{L['h']}  {L['i']}  {L['r']}  {L['d']}".strip())
                 self._refresh_section()                      # 收尾統一重繪
@@ -1141,17 +1141,30 @@ def launch_gui():
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
             return y0 + (y1 - y0) * t, x0 + (x1 - x0) * t
 
-        def _default_level(self):
-            """建線後的預設量測高度：主特徵半高（凸起）/ 半深（孔洞）。"""
+        def _default_xpos(self):
+            """建線後的預設游標位置：影像曲線半高的左緣（落在特徵上升坡）。"""
             prof = self._section_profile(self.image)
             if prof is None:
                 return 0.0
-            z = prof[1]
+            xs, z = prof
             if self.var_sample.get() == 'bump':
                 base = float(np.percentile(z, 20))
-                return base + 0.5 * (float(z.max()) - base)
-            base = float(np.percentile(z, 80))
-            return base - 0.5 * (base - float(z.min()))
+                zlev = base + 0.5 * (float(z.max()) - base)
+            else:
+                base = float(np.percentile(z, 80))
+                zlev = base - 0.5 * (base - float(z.min()))
+            c = self._level_cross(self.image, zlev)
+            return c['xl'] if c else float(xs[-1]) * 0.25
+
+        def _curve_chord(self, surf, xpos):
+            """B 型等高：取『曲線在游標位置 xpos 的高度』為該曲線自己的量測高度，
+            回傳 (zlev, {'xl','xr','w'})——同一條曲線的左右緣必等高。"""
+            prof = self._section_profile(surf)
+            if prof is None or xpos is None:
+                return None, None
+            xs, z = prof
+            zlev = float(np.interp(np.clip(xpos, xs[0], xs[-1]), xs, z))
+            return zlev, self._level_cross(surf, zlev)
 
         def _level_cross(self, surf, zlev):
             """等高量測：在剖面上找『主特徵通過高度 zlev 的左右緣』（亞像素內插）。
@@ -1361,17 +1374,18 @@ def launch_gui():
             self._clear_table()
             if not self.section:
                 return
-            zlev = self.section.get('zlev')
+            xpos = self.section.get('xpos')
             for surf, lab, tag in ((self.image, '影像', 'img'),
                                    (self.recon, '還原', 'rec')):
                 if surf is None:
                     continue
-                c = self._level_cross(surf, zlev)
+                zlev, c = self._curve_chord(surf, xpos)
                 if c:
                     vals = (lab, f'{zlev:.2f}', f"{c['xl']:.2f}",
                             f"{c['xr']:.2f}", f"{c['w']:.2f}")
                 else:
-                    vals = (lab, f'{zlev:.2f}', '—', '—', '（此高度無交點）')
+                    vals = (lab, '—' if zlev is None else f'{zlev:.2f}',
+                            '—', '—', '（游標處無交點）')
                 self.tbl.insert('', 'end', tags=(tag,), values=vals)
             self.tbl.tag_configure('img', foreground='#d2691e')
             self.tbl.tag_configure('rec', foreground='#c0392b')
@@ -1472,20 +1486,21 @@ def launch_gui():
             ax.set_xlabel('nm'); ax.set_ylabel('nm')
             ax.grid(alpha=0.3); ax.legend(fontsize=7, loc='upper right')
 
-        # ── Section 繪製（等高量測：一條高度線，兩曲線同高取交點）──
+        # ── Section 繪製（B 型等高：各曲線在游標處自己的高度取水平弦）──
         def _section_lines(self):
-            """量測文字：h=量測高度、i=影像寬度、r=還原寬度、d=寬度差。"""
-            zlev = self.section.get('zlev') if self.section else None
-            if zlev is None:
+            """量測文字：h=游標位置、i=影像弦、r=還原弦、d=寬度差。"""
+            xpos = self.section.get('xpos') if self.section else None
+            if xpos is None:
                 return {'h': '', 'i': '', 'r': '', 'd': ''}
-            out = {'h': f'量測高度 {zlev:.2f} nm', 'i': '', 'r': '', 'd': ''}
-            ci = self._level_cross(self.image, zlev)
-            out['i'] = (f"影像寬度 {ci['w']:.2f} nm" if ci else '影像：此高度無交點')
+            out = {'h': f'游標位置 {xpos:.1f} nm', 'i': '', 'r': '', 'd': ''}
+            zi, ci = self._curve_chord(self.image, xpos)
+            out['i'] = (f"影像 寬 {ci['w']:.2f} nm（高 {zi:.2f}）" if ci
+                        else '影像：游標處無交點')
             cr = None
             if self.recon is not None:
-                cr = self._level_cross(self.recon, zlev)
-                out['r'] = (f"還原寬度 {cr['w']:.2f} nm" if cr
-                            else '還原：此高度無交點')
+                zr, cr = self._curve_chord(self.recon, xpos)
+                out['r'] = (f"還原 寬 {cr['w']:.2f} nm（高 {zr:.2f}）" if cr
+                            else '還原：游標處無交點')
             if ci and cr:
                 out['d'] = f"寬度差 {ci['w'] - cr['w']:+.2f} nm（探針撐寬量）"
             return out
@@ -1493,7 +1508,7 @@ def launch_gui():
         def _draw_section(self, axi, axp):
             sa = {}
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
-            zlev = self.section.get('zlev')
+            xpos = self.section.get('xpos')
             # 掃描影像上：白線 + 端點方塊 + 兩曲線交點（橘=影像、紅=還原）
             sa['line'], = axi.plot([x0, x1], [y0, y1], '-', color='white',
                                    lw=1.6, alpha=0.95)
@@ -1510,9 +1525,9 @@ def launch_gui():
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'], = axp.plot(xs, zr, color='#d1495b', lw=1.5,
                                                label='還原')
-                # 量測高度線（灰）＋兩曲線同高的交點與跨距虛線
-                sa['lev'] = axp.axhline(zlev, color='#555', ls='--', lw=1.3,
-                                        alpha=0.8)
+                # 位置游標（灰垂線）＋各曲線在自己高度的水平弦
+                sa['vcur'] = axp.axvline(xpos, color='#555', ls='--', lw=1.3,
+                                         alpha=0.8)
                 sa['di'], = axp.plot([], [], 'o', color='#ff8c00', ms=7,
                                      mec='k', zorder=5)
                 sa['hli'], = axp.plot([], [], ':', color='#ff8c00', lw=1.6)
@@ -1533,21 +1548,20 @@ def launch_gui():
                 sa['stxt_d'] = axp.text(0.02, 0.695, '', transform=axp.transAxes,
                                         va='top', fontsize=11, fontweight='bold',
                                         color='#1a7a4a', bbox=tb)
-                axp.set_title('Section 剖面（在圖上點/拖 ＝ 移動量測高度線）',
-                              fontsize=9)
+                axp.set_title('Section 剖面（點/拖 ＝ 移動位置游標，'
+                              '各曲線在自己高度取水平弦）', fontsize=9)
                 axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
                 axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='upper right')
             self._sa = sa
             self._update_section_artists(light=False)
 
         def _update_section_artists(self, light=True):
-            """更新等高量測 artists + 表格；light=True 時只 draw_idle（拖曳滑順）。"""
+            """更新 B 型等高 artists + 表格；light=True 時只 draw_idle（拖曳滑順）。"""
             sa = self._sa
             if not sa or self.section is None:
                 self._refresh_section(); return
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
-            zlev = self.section.get('zlev')
-            total_px = float(np.hypot(y1 - y0, x1 - x0))
+            xpos = self.section.get('xpos')
             if 'line' in sa:
                 sa['line'].set_data([x0, x1], [y0, y1])
                 sa['ends'].set_data([x0, x1], [y0, y1])
@@ -1555,27 +1569,29 @@ def launch_gui():
             if prof_i is not None and 'prof_img' in sa:
                 xs, zi = prof_i
                 total = xs[-1]
+                xpos = float(np.clip(xpos, 0.0, total))
+                self.section['xpos'] = xpos
                 sa['prof_img'].set_data(xs, zi)
                 if 'prof_rec' in sa and self.recon is not None:
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'].set_data(xs, zr)
-                sa['lev'].set_ydata([zlev, zlev])
-                # 影像/還原在同一高度的左右交點：點 + 跨距虛線；並映射回影像白線上
-                ci = self._level_cross(self.image, zlev)
+                sa['vcur'].set_xdata([xpos, xpos])
+                # 各曲線：游標處自己的高度 → 水平弦（兩端點必同高）；映射回白線
+                z_i, ci = self._curve_chord(self.image, xpos)
                 if ci:
-                    sa['di'].set_data([ci['xl'], ci['xr']], [zlev, zlev])
-                    sa['hli'].set_data([ci['xl'], ci['xr']], [zlev, zlev])
+                    sa['di'].set_data([ci['xl'], ci['xr']], [z_i, z_i])
+                    sa['hli'].set_data([ci['xl'], ci['xr']], [z_i, z_i])
                     ts = [ci['xl'] / total, ci['xr'] / total]
                     pts = [self._section_pt(t) for t in ts]
                     sa['mi'].set_data([p[1] for p in pts], [p[0] for p in pts])
                 else:
                     sa['di'].set_data([], []); sa['hli'].set_data([], [])
                     sa['mi'].set_data([], [])
-                cr = (self._level_cross(self.recon, zlev)
-                      if self.recon is not None else None)
+                z_r, cr = (self._curve_chord(self.recon, xpos)
+                           if self.recon is not None else (None, None))
                 if cr:
-                    sa['dr'].set_data([cr['xl'], cr['xr']], [zlev, zlev])
-                    sa['hlr'].set_data([cr['xl'], cr['xr']], [zlev, zlev])
+                    sa['dr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
+                    sa['hlr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
                     ts = [cr['xl'] / total, cr['xr'] / total]
                     pts = [self._section_pt(t) for t in ts]
                     sa['mr'].set_data([p[1] for p in pts], [p[0] for p in pts])
