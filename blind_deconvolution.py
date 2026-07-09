@@ -1156,14 +1156,20 @@ def launch_gui():
             c = self._level_cross(self.image, zlev)
             return c['xl'] if c else float(xs[-1]) * 0.25
 
-        def _curve_chord(self, surf, xpos):
-            """B 型等高：取『曲線在游標位置 xpos 的高度』為該曲線自己的量測高度，
-            回傳 (zlev, {'xl','xr','w'})——同一條曲線的左右緣必等高。"""
-            prof = self._section_profile(surf)
+        def _measure_level(self, xpos):
+            """混合式量測高度 z*：取『影像曲線』在游標位置 xpos 的高度。
+            影像與還原都用這個同一個 z* 量左右緣 → 四點同高、公平比較。"""
+            prof = self._section_profile(self.image)
             if prof is None or xpos is None:
-                return None, None
+                return None
             xs, z = prof
-            zlev = float(np.interp(np.clip(xpos, xs[0], xs[-1]), xs, z))
+            return float(np.interp(np.clip(xpos, xs[0], xs[-1]), xs, z))
+
+        def _curve_chord(self, surf, xpos):
+            """回傳 (z*, {'xl','xr','w'})：以影像高度 z* 量 surf 的左右緣（同高）。"""
+            zlev = self._measure_level(xpos)
+            if zlev is None:
+                return None, None
             return zlev, self._level_cross(surf, zlev)
 
         def _level_cross(self, surf, zlev):
