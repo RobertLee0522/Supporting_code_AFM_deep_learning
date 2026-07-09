@@ -542,6 +542,7 @@ def launch_gui():
             self._auto_job = None      # 參數變更自動重跑（防抖）排程 id
             self._meas_job = None      # 半深比例變更自動重量測排程 id
             self._busy = False         # 去卷積執行中旗標（避免並行重跑）
+            self._last_run_key = None  # 上次去卷積的參數指紋（相同就不重跑）
             # NanoScope Section 式剖面線：p0/p1=端點(y,x)、c1/c2=游標參數位置(0~1)
             self.section = None
             self._drag = None          # 進行中的拖曳 ('newline'|'endpoint'|'cursor'|'pick')
@@ -737,7 +738,12 @@ def launch_gui():
                             command=self._draw_3d).pack(side='left')
             ttk.Button(top3, text='⟳ 重繪 3D',
                        command=self._draw_3d).pack(side='left', padx=6)
-            ttk.Label(top3, text='（滑鼠拖曳可旋轉角度；滾輪縮放）',
+            ttk.Label(top3, text='  Z 高度比例').pack(side='left')
+            self.var_3dz = tk.DoubleVar(value=0.6)
+            tk.Scale(top3, from_=0.1, to=3.0, resolution=0.05,
+                     orient='horizontal', variable=self.var_3dz, length=150,
+                     command=self._apply_3d_z, showvalue=True).pack(side='left')
+            ttk.Label(top3, text='（拖曳旋轉；滑桿調 Z 軸高度）',
                       foreground='#888').pack(side='left')
             self.fig3 = Figure(figsize=(8, 6))
             self.ax3 = self.fig3.add_subplot(111, projection='3d')
@@ -754,6 +760,9 @@ def launch_gui():
                       self.var_px, self.var_half):
                 v.trace_add('write', lambda *_: self._schedule_auto_run())
             self.var_wfrac.trace_add('write', lambda *_: self._schedule_measure())
+            # 按 Enter 立即套用（不必等防抖）
+            for e in (self.e_R, self.e_th, self.e_thx, self.e_thy, self.e_half):
+                e.bind('<Return>', lambda _ev: (self._cancel_auto(), self._auto_run()))
             self._refresh()
             self._update_tip_mode()
 
@@ -908,13 +917,23 @@ def launch_gui():
 
             threading.Thread(target=worker, daemon=True).start()
 
-        # ── 參數變更 → 自動重跑（防抖 0.7s；輸入中的不完整值靜默略過）──
+        # ── 參數變更 → 自動重跑（防抖 0.9s，等打完再跑；不完整值略過）──
+        def _params_key(self):
+            return (self.var_source.get(), self.var_R.get(), self.var_asym.get(),
+                    self.var_th.get(), self.var_thx.get(), self.var_thy.get(),
+                    self.var_px.get(), self.var_half.get(), self.var_sample.get(),
+                    self.tip_npy_path)
+
+        def _cancel_auto(self):
+            if self._auto_job:
+                self.after_cancel(self._auto_job)
+                self._auto_job = None
+
         def _schedule_auto_run(self):
             if self.image is None:
                 return
-            if self._auto_job:
-                self.after_cancel(self._auto_job)
-            self._auto_job = self.after(700, self._auto_run)
+            self._cancel_auto()
+            self._auto_job = self.after(900, self._auto_run)   # 打字停 0.9s 才跑
 
         def _auto_run(self):
             self._auto_job = None
@@ -923,11 +942,15 @@ def launch_gui():
             if self._busy:                       # 上一輪還在跑 → 稍後重試
                 self._auto_job = self.after(300, self._auto_run)
                 return
+            key = self._params_key()
+            if key == self._last_run_key and self.recon is not None:
+                return                           # 參數沒實質改變 → 不重跑（免閃爍）
             try:
                 tip = self._build_tip()
             except Exception:
                 return                           # 欄位輸入中/不完整 → 不跳錯誤視窗
             self.tip = tip
+            self._last_run_key = key
             self._busy = True
             self._log('參數變更 → 自動重新去卷積…')
 
@@ -1369,10 +1392,24 @@ def launch_gui():
                                fontsize=10)
             self.ax3.set_xlabel('X (nm)'); self.ax3.set_ylabel('Y (nm)')
             self.ax3.set_zlabel('Z (nm)')
+            try:
+                self.ax3.set_box_aspect((1, 1, float(self.var_3dz.get())))
+            except Exception:
+                pass
             self.canvas3.draw()
             self._3d_drawn_for = (self.var_3dsrc.get(),
                                   id(self.recon) if self.var_3dsrc.get() == 'recon'
                                   else id(self.image))
+
+        def _apply_3d_z(self, *_):
+            """只調 Z 軸高度比例（不重算表面），保持滑桿拖曳流暢。"""
+            if getattr(self, 'ax3', None) is None or self._3d_drawn_for is None:
+                return
+            try:
+                self.ax3.set_box_aspect((1, 1, float(self.var_3dz.get())))
+                self.canvas3.draw_idle()
+            except Exception:
+                pass
 
         # ── 特徵剖面圖：影像(橘) vs 還原(紅)，量測跨距畫在門檻高度 ──
         def _draw_feature_profile(self, ax, horiz=True):
@@ -1464,26 +1501,37 @@ def launch_gui():
                                           ms=6, mec='k', zorder=5)
                     sa['hlr'], = axp.plot([xs[i1], xs[i2]], [zr[i1], zr[i1]], ':',
                                           color='#d1495b', lw=1.3, alpha=0.9)
-                sa['stxt'] = axp.text(0.02, 0.98, self._section_text(),
-                                      transform=axp.transAxes, va='top', ha='left',
-                                      fontsize=8, family='sans-serif',
-                                      bbox=dict(boxstyle='round', fc='white',
-                                                ec='#888', alpha=0.85))
+                # 數字標註：色碼對應曲線（影像橘、還原紅），字放大加粗
+                L = self._section_lines()
+                tb = dict(boxstyle='round', fc='white', ec='#bbb', alpha=0.92)
+                sa['stxt_h'] = axp.text(0.02, 0.98, L['h'], transform=axp.transAxes,
+                                        va='top', fontsize=12, fontweight='bold',
+                                        color='#222', bbox=tb)
+                sa['stxt_i'] = axp.text(0.02, 0.885, L['i'], transform=axp.transAxes,
+                                        va='top', fontsize=12, fontweight='bold',
+                                        color='#e8820e', bbox=tb)
+                if L['r']:
+                    sa['stxt_r'] = axp.text(0.02, 0.79, L['r'],
+                                            transform=axp.transAxes, va='top',
+                                            fontsize=12, fontweight='bold',
+                                            color='#c0392b', bbox=tb)
                 axp.set_title('Section 剖面（拖青/洋紅游標量測）', fontsize=9)
                 axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
                 axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='upper right')
             self._sa = sa
 
-        def _section_text(self):
+        def _section_lines(self):
+            """回傳三行量測字串 dict：h=水平距離、i=影像ΔZ、r=還原ΔZ。"""
             si = self._pair_stats(self.image)
             if not si:
-                return ''
-            lines = [f"水平距離 {si['hd']:.2f} nm", f"ΔZ 影像 {si['vd']:+.2f} nm"]
+                return {'h': '', 'i': '', 'r': ''}
+            out = {'h': f"水平距離 {si['hd']:.2f} nm",
+                   'i': f"影像 ΔZ {si['vd']:+.2f} nm", 'r': ''}
             if self.recon is not None:
                 sr = self._pair_stats(self.recon)
                 if sr:
-                    lines.append(f"ΔZ 還原 {sr['vd']:+.2f} nm")
-            return '\n'.join(lines)
+                    out['r'] = f"還原 ΔZ {sr['vd']:+.2f} nm"
+            return out
 
         def _update_section_artists(self):
             """拖曳中的輕量更新：只改 artists 資料 + 表格，不整張重繪（保持滑順）。"""
@@ -1520,8 +1568,12 @@ def launch_gui():
                     sa['dr1'].set_data([xs[i1]], [zr[i1]])
                     sa['dr2'].set_data([xs[i2]], [zr[i2]])
                     sa['hlr'].set_data([xs[i1], xs[i2]], [zr[i1], zr[i1]])
-                if 'stxt' in sa:
-                    sa['stxt'].set_text(self._section_text())
+                L = self._section_lines()
+                if 'stxt_h' in sa:
+                    sa['stxt_h'].set_text(L['h'])
+                    sa['stxt_i'].set_text(L['i'])
+                    if 'stxt_r' in sa:
+                        sa['stxt_r'].set_text(L['r'])
                 ax = sa['prof_img'].axes
                 ax.relim(); ax.autoscale_view()
             self._update_table()

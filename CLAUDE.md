@@ -241,6 +241,16 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-10 — `blind_deconvolution.py`：Section 數字色碼放大 + 3D Z 軸比例 + 修自動重跑干擾小數輸入**
+  - **Section 文字色碼**（`_section_lines`）：左上三行拆成獨立 text artists，字放大加粗（12pt），
+    **色碼對應曲線**——水平距離(深灰)/影像 ΔZ(橘 #e8820e)/還原 ΔZ(紅 #c0392b)，各自白框，一目瞭然。
+  - **3D Z 軸高度比例**：頁3 新增 `tk.Scale`（0.1–3.0），以 `set_box_aspect((1,1,z))` 調垂直誇張；
+    拖滑桿走 `_apply_3d_z`（只改 box aspect + `draw_idle`，不重算表面）保持流暢；淺特徵可拉高看清。
+  - **修「輸入角度小數點被吃掉」**：根因非欄位（θ 欄一直是 StringVar+float，小數本就支援，已驗證
+    `20.7` 保留），而是**自動重跑在打字中途觸發**、重繪干擾輸入。改善：防抖 0.7→0.9s（打完才跑）、
+    新增 `_params_key` 參數指紋（相同就不重跑，免閃爍）、數值欄按 **Enter 立即套用**。
+  - 驗證：Section 三行色碼、3D z=1.5 峰變高、相同參數 `_auto_run` 正確跳過、`var_th='20.7'` 保留。
+
 - **2026-07-10 — `blind_deconvolution.py`：Section 影像/還原 ΔZ 虛線標註 + 新增 3D 還原分頁**
   - **Section 剖面數字化**：兩游標交點在**影像(橘)/還原(紅) 各畫圓點 + ΔZ 水平虛線**，
     左上文字框即時顯示「水平距離 / ΔZ 影像 / ΔZ 還原」（`_section_text`）；拖曳時一併輕量更新
