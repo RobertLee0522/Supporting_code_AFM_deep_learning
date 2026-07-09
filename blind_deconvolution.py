@@ -230,30 +230,45 @@ def _half_span_bounds(line, i0, thr):
     return left, right, max(0.0, right - left)
 
 
-def measure_feature_width(surface, px_nm, sample='hole', frac=0.5):
-    """量測表面『主特徵』的寬度。
+def measure_feature_width(surface, px_nm, sample='hole', frac=0.5,
+                          at=None, search_px=12):
+    """量測表面特徵的寬度。
 
-    步驟：以表面基線為 0 把特徵轉成正向振幅（孔洞=深度、凸起=高度）→ 找最深/最高
-    的極值點 → 沿該點 X、Y 剖面量在 `frac×振幅` 門檻的連續跨距（FWHM，亞像素內插）
+    步驟：以表面基線為 0 把特徵轉成正向振幅（孔洞=深度、凸起=高度）→ 找極值點 →
+    沿該點 X、Y 剖面量在 `frac×振幅` 門檻的連續跨距（FWHM，亞像素內插）
     → 另以門檻連通區面積算等效直徑 ⌀=2√(A/π)。回傳 nm 單位 dict；無特徵回 None。
 
     frac=0.5 即半深/半高全寬（FWHM，AFM 常用）；可調 0.05–0.95。
+    at=(y, x)：**指定量測位置**（如 GUI 點選）——在其 ±search_px 視窗內找局部
+    極值當特徵中心，門檻用該特徵『自己的振幅』（局部量測，不受畫面最大特徵影響）；
+    at=None 則自動取全圖最深/最高特徵。
     """
     surf = np.asarray(surface, dtype=float)
     if sample == 'bump':                          # 凸起：表面低值、特徵向上
         feat = surf - np.percentile(surf, 10)
     else:                                         # 孔洞：表面高值，轉成深度為正
         feat = np.percentile(surf, 95) - surf
-    amp = float(feat.max())
+    H, W = feat.shape
+    if at is not None:                            # 點選模式：視窗內局部極值
+        ay = int(np.clip(round(at[0]), 0, H - 1))
+        ax_ = int(np.clip(round(at[1]), 0, W - 1))
+        ys, ye = max(0, ay - search_px), min(H, ay + search_px + 1)
+        xs, xe = max(0, ax_ - search_px), min(W, ax_ + search_px + 1)
+        dy, dx = np.unravel_index(int(np.argmax(feat[ys:ye, xs:xe])),
+                                  (ye - ys, xe - xs))
+        gy, gx = ys + dy, xs + dx
+        amp = float(feat[gy, gx])                 # 該特徵自己的振幅
+    else:                                         # 自動模式：全圖極值
+        gy, gx = np.unravel_index(int(np.argmax(feat)), feat.shape)
+        amp = float(feat.max())
     if amp <= 1e-9:
         return None
     thr = frac * amp
-    # 取『含最深/最高點』的連通區為主特徵，量測經其『形心』的 X/Y 剖面
+    # 取『含極值點』的連通區為主特徵，量測經其『形心』的 X/Y 剖面
     # （直接用 argmax 會落在平底特徵的邊角，剖面量到短弦 → 錯誤，故改用形心）
     lbl, n = label(feat >= thr)
-    if n == 0:
+    if n == 0 or lbl[gy, gx] == 0:
         return None
-    gy, gx = np.unravel_index(int(np.argmax(feat)), feat.shape)
     comp = lbl == lbl[gy, gx]
     ys, xs = np.where(comp)
     cy, cx = int(round(ys.mean())), int(round(xs.mean()))
@@ -521,6 +536,7 @@ def launch_gui():
             self.frac = None
             self.meas = None           # 還原表面寬度量測結果
             self.meas_in = None        # 影像寬度量測結果（對照）
+            self.pick = None           # 使用者點選的量測位置 (y, x)；None=自動
             self._build_ui()
 
         # ── 版面 ──────────────────────────────────────────────
@@ -643,6 +659,12 @@ def launch_gui():
             ttk.Entry(mrow, textvariable=self.var_wfrac, width=5).pack(side='left')
             ttk.Button(mrow, text='📏 量測寬度',
                        command=self._measure).pack(side='left', padx=(6, 0))
+            ttk.Button(mrow, text='↺ 自動',
+                       command=self._pick_reset).pack(side='left', padx=(4, 0))
+            self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
+                                               '👆 可直接在影像/還原圖上點選要量的特徵',
+                                      wraplength=250, foreground='#999', font=('', 8))
+            self.lbl_pick.pack(fill='x')
 
             # ⑥ 儲存
             s6 = step('⑥ 儲存')
@@ -657,6 +679,7 @@ def launch_gui():
             self.fig = Figure(figsize=(8.5, 7.4))
             self.canvas = FigureCanvasTkAgg(self.fig, master=right)
             self.canvas.get_tk_widget().pack(fill='both', expand=True)
+            self.canvas.mpl_connect('button_press_event', self._on_click)
             # 探針 R/θ/尺度/樣品變動時，若「自動」開啟則重算視窗半徑
             for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
                       self.var_px, self.var_sample):
@@ -738,6 +761,7 @@ def launch_gui():
                 return
             self.image, self.image_path = arr, p
             self.recon = self.certain = self.frac = self.meas = self.meas_in = None
+            self.pick = None                     # 新影像重設點選位置
             self.lbl_img.config(text=src)
             self._log(f'載入 {os.path.basename(p)} {arr.shape} '
                       f'範圍[{arr.min():.1f}, {arr.max():.1f}]nm')
@@ -821,7 +845,28 @@ def launch_gui():
             self._log(f'  （紅色死角=探針碰不到、不可信；引擎只給確定下界不腦補）')
             self._measure()                    # 去卷積後自動量測寬度並繪圖
 
-        # ── ⑤ 量測還原表面主特徵寬度（FWHM）──────────────────
+        # ── ⑤ 點選量測位置（在影像/還原圖上點擊）──────────────
+        def _on_click(self, event):
+            axs = (getattr(self, '_ax_img', None), getattr(self, '_ax_rec', None))
+            if event.inaxes not in axs or event.inaxes is None:
+                return
+            if self.recon is None or event.xdata is None or event.ydata is None:
+                return
+            self.pick = (float(event.ydata), float(event.xdata))
+            self.lbl_pick.config(
+                text=f'量測位置：點選 (x={int(event.xdata)}, y={int(event.ydata)})'
+                     f'　→ 按「↺ 自動」可還原')
+            self._log(f'點選量測位置 (x={int(event.xdata)}, y={int(event.ydata)})')
+            self._measure()
+
+        def _pick_reset(self):
+            self.pick = None
+            self.lbl_pick.config(text='量測位置：自動（全圖最大特徵）\n'
+                                      '👆 可直接在影像/還原圖上點選要量的特徵')
+            if self.recon is not None:
+                self._measure()
+
+        # ── ⑤ 量測還原表面特徵寬度（FWHM；自動或點選位置）────
         def _measure(self):
             if self.recon is None:
                 messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
@@ -831,8 +876,10 @@ def launch_gui():
                 frac = 0.5
             px_nm = float(self.var_px.get())
             sample = self.var_sample.get()
-            self.meas = measure_feature_width(self.recon, px_nm, sample, frac)
-            m_in = measure_feature_width(self.image, px_nm, sample, frac)
+            self.meas = measure_feature_width(self.recon, px_nm, sample, frac,
+                                              at=self.pick)
+            m_in = measure_feature_width(self.image, px_nm, sample, frac,
+                                         at=self.pick)
             self.meas_in = m_in
             if self.meas:
                 self.lbl_wre.config(
@@ -871,6 +918,7 @@ def launch_gui():
         def _refresh(self):
             self.fig.clf()
             axs = self.fig.subplots(2, 3)
+            self._ax_img, self._ax_rec = axs[0, 0], axs[0, 1]   # 供點選量測判定
             # 影像類子圖關掉刻度；剖面折線圖保留刻度（於下方另設）
             for ax in (axs[0, 0], axs[0, 1], axs[0, 2], axs[1, 0]):
                 ax.set_xticks([]); ax.set_yticks([])

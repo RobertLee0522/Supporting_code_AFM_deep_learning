@@ -241,6 +241,16 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-09 — `blind_deconvolution.py`：點選影像位置量測寬度（自動偵測 ≠ 使用者要量的特徵）**
+  - **需求**：自動偵測固定抓「全圖最深/最高」特徵，與使用者想量的特徵不同；要能自選位置。
+  - **`measure_feature_width` 新增 `at=(y,x)`/`search_px=12`**：給定位置時在 ±search_px 視窗內
+    找局部極值當特徵中心，門檻改用**該特徵自己的振幅**（局部量測，不被全圖最大特徵拉偏）；
+    `at=None` 維持原自動模式。單元測試：大(⌀40)+小(⌀16)雙凸起，自動量大、點選量小(18nm@局部振幅)。
+  - **GUI**：`mpl_connect('button_press_event')`——在輸入影像或還原圖上**直接點擊**即以該點
+    重新量測（`self.pick`，兩面板標註同步更新）；⑤ 新增「↺ 自動」鈕還原全圖自動偵測、
+    位置標籤顯示目前模式；換載新影像自動重設。真實 30nm.003 驗證：自動量 (129,120)⌀18.3、
+    點選 (240,228) 量到另一顆 ⌀19.9、↺ 還原正確。
+
 - **2026-07-07 — `blind_deconvolution.py`：還原表面特徵寬度量測（FWHM，X/Y + 等效直徑）**
   - **需求**：在還原表面上量測特徵寬度並顯示大小（還原 vs 影像對照，看去卷積收窄多少）。
   - **新增 `measure_feature_width(surface, px_nm, sample, frac=0.5)`**：把特徵轉成正向振幅
