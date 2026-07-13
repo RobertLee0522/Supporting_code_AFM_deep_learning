@@ -1492,21 +1492,22 @@ def launch_gui():
             ax.set_xlabel('nm'); ax.set_ylabel('nm')
             ax.grid(alpha=0.3); ax.legend(fontsize=7, loc='upper right')
 
-        # ── Section 繪製（B 型等高：各曲線在游標處自己的高度取水平弦）──
+        # ── Section 繪製（混合式：點取影像高度 z*，兩曲線同高量左右緣）──
         def _section_lines(self):
-            """量測文字：h=游標位置、i=影像弦、r=還原弦、d=寬度差。"""
+            """量測文字：h=量測高度 z*(以影像為準)、i=影像寬、r=還原寬、d=寬度差。"""
             xpos = self.section.get('xpos') if self.section else None
-            if xpos is None:
+            zstar = self._measure_level(xpos)
+            if zstar is None:
                 return {'h': '', 'i': '', 'r': '', 'd': ''}
-            out = {'h': f'游標位置 {xpos:.1f} nm', 'i': '', 'r': '', 'd': ''}
-            zi, ci = self._curve_chord(self.image, xpos)
-            out['i'] = (f"影像 寬 {ci['w']:.2f} nm（高 {zi:.2f}）" if ci
-                        else '影像：游標處無交點')
+            out = {'h': f'量測高度 {zstar:.2f} nm（影像基準）', 'i': '', 'r': '',
+                   'd': ''}
+            _, ci = self._curve_chord(self.image, xpos)
+            out['i'] = (f"影像寬度 {ci['w']:.2f} nm" if ci else '影像：此高度無交點')
             cr = None
             if self.recon is not None:
-                zr, cr = self._curve_chord(self.recon, xpos)
-                out['r'] = (f"還原 寬 {cr['w']:.2f} nm（高 {zr:.2f}）" if cr
-                            else '還原：游標處無交點')
+                _, cr = self._curve_chord(self.recon, xpos)
+                out['r'] = (f"還原寬度 {cr['w']:.2f} nm" if cr
+                            else '還原：此高度無交點')
             if ci and cr:
                 out['d'] = f"寬度差 {ci['w'] - cr['w']:+.2f} nm（探針撐寬量）"
             return out
@@ -1531,7 +1532,7 @@ def launch_gui():
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'], = axp.plot(xs, zr, color='#d1495b', lw=1.5,
                                                label='還原')
-                # 位置游標（灰垂線）＋各曲線在自己高度的水平弦
+                # 位置游標（灰垂線）＋兩曲線在同一 z*(影像高度) 的水平弦
                 sa['vcur'] = axp.axvline(xpos, color='#555', ls='--', lw=1.3,
                                          alpha=0.8)
                 sa['di'], = axp.plot([], [], 'o', color='#ff8c00', ms=7,
@@ -1554,8 +1555,8 @@ def launch_gui():
                 sa['stxt_d'] = axp.text(0.02, 0.695, '', transform=axp.transAxes,
                                         va='top', fontsize=11, fontweight='bold',
                                         color='#1a7a4a', bbox=tb)
-                axp.set_title('Section 剖面（點/拖 ＝ 移動位置游標，'
-                              '各曲線在自己高度取水平弦）', fontsize=9)
+                axp.set_title('Section 剖面（點/拖游標選高度，影像/還原同高比寬）',
+                              fontsize=9)
                 axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
                 axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='upper right')
             self._sa = sa
