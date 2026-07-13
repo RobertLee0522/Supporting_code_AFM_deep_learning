@@ -48,9 +48,10 @@ def batch_predict(input_dir, pattern='*.tif *.000 *.001 *.002 *.003 *.004', outp
         else:
             output_prefix = file_stem
 
-        # 執行 detect.py
+        # 執行 detect.py（與本檔同資料夾，用絕對路徑避免受工作目錄影響）
+        detect_py = str(Path(__file__).resolve().parent / 'detect.py')
         cmd = [
-            sys.executable, 'detect.py',
+            sys.executable, detect_py,
             file_path,
             '-o', output_prefix,
             '--no-display'  # 批次模式不顯示圖片

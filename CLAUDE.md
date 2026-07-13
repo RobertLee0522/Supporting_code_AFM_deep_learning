@@ -57,17 +57,24 @@
 
 ## 3. 程式架構與模組 (Architecture)
 
+> **目錄結構（2026-07-13 整理）**：程式碼分兩資料夾——`zerotrain/`（零訓練，推薦）與
+> `deeplearning/`（DL pipeline，需訓練）；補充文件在 `docs/`。**所有指令仍從專案根目錄執行**
+> （相對路徑 `runs/`、`tip.mat`、`blind_out/` 以根目錄為基準）。模組間無互相 import，
+> 搬移只需修 `deeplearning/batch_detect.py` 對 `detect.py` 的呼叫路徑（改用 `Path(__file__).parent`）。
+
 | 檔案 | 角色 | 輸入 | 輸出 |
 |------|------|------|------|
-| `afm_gui.py` | Step 1：Tkinter GUI 盲探針重建 | `.000`–`.009` Nanoscope + SEM 幾何 | `tip_estimated.mat` + 報告 PNG |
-| `tip_correction.py` | Step 2：探針校正（置中/徑向平均/縮放） | `tip_estimated.mat` | `*_corrected.mat/.npy` + 診斷圖 |
-| `Supporting_code_AFM_deep_learning.py` | Step 3：合成資料 + 訓練 | （自動生成合成資料） | `runs/train{N}/weights/*.keras`, `metrics.txt`, `config.txt` |
-| `detect.py` | Step 4：單張推論 | 真實 AFM 掃描 | 去卷積結果 `.npy/.mat/.png` |
-| `batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
-| `evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
-| `check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
-| `blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學）+ **步驟式 GUI** | Nanoscope `.000` 或影像 .npy + 已知探針（對稱/**非對稱** cone 或 tip.npy） | 還原表面 + certainty map |
-| `reconstruct_lines_3d.py` | 凸起樣品逐線 1D 去卷積 + 3D 重建（給定 R, θ） | Nanoscope .000 + 探針 R/θ | 還原高度圖 .npy + 3D 渲染 PNG |
+| `deeplearning/afm_gui.py` | Step 1：Tkinter GUI 盲探針重建 | `.000`–`.009` Nanoscope + SEM 幾何 | `tip_estimated.mat` + 報告 PNG |
+| `deeplearning/tip_correction.py` | Step 2：探針校正（置中/徑向平均/縮放） | `tip_estimated.mat` | `*_corrected.mat/.npy` + 診斷圖 |
+| `deeplearning/Supporting_code_AFM_deep_learning.py` | Step 3：合成資料 + 訓練 | （自動生成合成資料） | `runs/train{N}/weights/*.keras`, `metrics.txt`, `config.txt` |
+| `deeplearning/detect.py` | Step 4：單張推論 | 真實 AFM 掃描 | 去卷積結果 `.npy/.mat/.png` |
+| `deeplearning/batch_detect.py` | Step 4b：批次推論 | 資料夾 | 多檔去卷積結果 |
+| `deeplearning/evaluate.py` | 模型評估 | 模型 + 測試集 | 指標 CSV、loss 曲線、誤差直方圖 |
+| `deeplearning/check_image.py` | 輸入驗證 | 單張影像 | 格式/尺寸/數值範圍報告 |
+| `zerotrain/blind_deconvolution.py` | 通用去卷積引擎（零訓練，Villarrubia 形態學）+ **步驟式 GUI**（推薦主力） | Nanoscope `.000` 或影像 .npy + 已知探針（對稱/**非對稱** cone 或 tip.npy） | 還原表面 + certainty map |
+| `zerotrain/reconstruct_lines_3d.py` | 凸起樣品逐線 1D 去卷積 + 3D 重建（給定 R, θ） | Nanoscope .000 + 探針 R/θ | 還原高度圖 .npy + 3D 渲染 PNG |
+| `zerotrain/inspect_header.py` | Nanoscope 檔頭診斷工具 | `.000` 原始檔 | 各通道 offset/bpp/Z scale 報告 |
+| `啟動去卷積工具.bat` | 雙擊啟動零訓練 GUI（cd 到根目錄後跑 blind_deconvolution） | — | — |
 
 ### 3.1 `afm_gui.py`（盲探針重建 GUI）
 - `parse_nanoscope()` / `read_channel()`：解析 Nanoscope 二進位標頭，
@@ -240,6 +247,20 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ## 9. 變更紀錄 (Changelog)
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-07-13 — 倉庫整理：程式碼分 `zerotrain/`＋`deeplearning/`＋`docs/`，路徑一併更新**
+  - **動機**：根目錄 17 支 .py/.md 混在一起，使用者不知道該執行哪些。分兩條 pipeline 收納。
+  - **搬移**（`git mv` 保留歷史）：
+    - `zerotrain/`：`blind_deconvolution.py`、`reconstruct_lines_3d.py`、`inspect_header.py`
+    - `deeplearning/`：`afm_gui.py`、`tip_correction.py`、`Supporting_code_AFM_deep_learning.py`、
+      `detect.py`、`batch_detect.py`、`evaluate.py`、`check_image.py`
+    - `docs/`：`DETECT_README.md`、`GPU_SETUP_GUIDE.md`、`OPTIMIZATION_SUMMARY.md`
+  - **路徑影響極小**：模組間無互相 import；所有相對路徑（`runs/`、`tip.mat`、`blind_out/` …）
+    對**工作目錄**解析，維持「從專案根目錄執行」即不受影響（已用 `--demo` 端到端驗證）。
+    唯一修正：`batch_detect.py` 原用裸名 `'detect.py'` 呼叫 → 改 `Path(__file__).parent/'detect.py'`。
+  - **新增**：根目錄 `啟動去卷積工具.bat`（雙擊即開零訓練 GUI，內含 `cd /d %~dp0` 固定工作目錄）；
+    `README.md` 重寫成「我該執行哪一個」對照表（方法 A 零訓練 / 方法 B 深度學習）。
+  - **未動**：資料/權重/venv（`datafortip/`、`runs/`、`img/`、`tip.mat`、`afm/` 等，皆 gitignore）。
 
 - **2026-07-10 — `blind_deconvolution.py`：Section 改混合式量測高度 z*（以影像高度為基準）**
   - **需求**：B 型（各曲線自己高度）比的是兩個不同高度截面，側壁斜率會污染寬度差、還原失真。
