@@ -1222,34 +1222,45 @@ def launch_gui():
         def _level_cross(self, surf, zlev, xpos=None):
             """等高量測：找『游標所指特徵』通過高度 zlev 的左右緣（亞像素內插）。
 
-            關鍵：取『含游標 xpos（或最靠近 xpos）的連通區』，**不是全域最高峰**——
-            否則基線傾斜/雜訊/旁邊的特徵會讓量到的區段橫跨整條線（見 2026-07-13 修正）。
-            xpos=None 時退回全域極值所在區（供預設值用）。高度不落在特徵內回 None。
+            兩層穩健化（見 2026-07-13 修正）：
+              1) 取『含游標 xpos（或最近）的連通區』，不是全域最高峰——否則基線傾斜/
+                 雜訊/旁邊特徵會讓量到的區段橫跨整條線。
+              2) **自動判斷凸起/凹孔方向**：同時算 z≥zlev（凸起）與 z≤zlev（凹孔）兩候選區，
+                 『有界的特徵』優先於『貼到剖面邊界的基線』——即使樣品類型選錯也量得對。
+            xpos=None 時以全域極值當種子。高度不落在特徵內回 None。
             """
             prof = self._section_profile(surf)
             if prof is None or zlev is None:
                 return None
             xs, z = prof
             n = len(z)
-            inside = (z >= zlev) if self.var_sample.get() == 'bump' else (z <= zlev)
-            if not inside.any():
-                return None
-            lbl, m = label(inside)               # 標記所有 ≥zlev（或 ≤）的連通區
             if xpos is not None:
-                ix = int(np.clip(np.argmin(np.abs(xs - xpos)), 0, n - 1))
-                if lbl[ix] > 0:                  # 游標正落在某區內
-                    rid = lbl[ix]
-                else:                            # 游標在區外 → 取最近的一區
-                    cand = np.where(inside)[0]
-                    rid = lbl[cand[int(np.argmin(np.abs(cand - ix)))]]
-            else:                                # 無 xpos → 全域極值所在區
-                ipk = int(np.argmax(z) if self.var_sample.get() == 'bump'
-                          else np.argmin(z))
-                rid = lbl[ipk]
-                if rid == 0:
+                seed = int(np.clip(np.argmin(np.abs(xs - xpos)), 0, n - 1))
+            else:
+                seed = int(np.argmax(z) if self.var_sample.get() == 'bump'
+                           else np.argmin(z))
+
+            def span(inside):                    # 含 seed（或最近）的連通區 [L,R]
+                if not inside.any():
                     return None
-            idx = np.where(lbl == rid)[0]
-            L, R = int(idx[0]), int(idx[-1])
+                lbl, _ = label(inside)
+                rid = lbl[seed]
+                if rid == 0:
+                    cand = np.where(inside)[0]
+                    rid = lbl[cand[int(np.argmin(np.abs(cand - seed)))]]
+                idx = np.where(lbl == rid)[0]
+                return int(idx[0]), int(idx[-1])
+
+            up, dn = span(z >= zlev), span(z <= zlev)   # 凸起候選 / 凹孔候選
+
+            def bounded(r):                      # 兩緣都是真交點（沒貼到陣列邊界）
+                return r is not None and r[0] > 0 and r[1] < n - 1
+            order = ([up, dn] if self.var_sample.get() == 'bump' else [dn, up])
+            chosen = (next((r for r in order if bounded(r)), None)
+                      or next((r for r in order if r), None))
+            if chosen is None:
+                return None
+            L, R = chosen
 
             def interp(a, b):                    # a=特徵內緣、b=外側鄰點
                 if z[b] == z[a]:
