@@ -1217,32 +1217,39 @@ def launch_gui():
             zlev = self._measure_level(xpos)
             if zlev is None:
                 return None, None
-            return zlev, self._level_cross(surf, zlev)
+            return zlev, self._level_cross(surf, zlev, xpos)
 
-        def _level_cross(self, surf, zlev):
-            """等高量測：在剖面上找『主特徵通過高度 zlev 的左右緣』（亞像素內插）。
+        def _level_cross(self, surf, zlev, xpos=None):
+            """等高量測：找『游標所指特徵』通過高度 zlev 的左右緣（亞像素內插）。
 
-            從峰頂（凸起）/谷底（孔洞）向兩側走到跨越 zlev 處——影像與還原用
-            **同一高度**量，兩者寬度直接相減即為去卷積修正量。
-            高度不落在特徵範圍內回 None。
+            關鍵：取『含游標 xpos（或最靠近 xpos）的連通區』，**不是全域最高峰**——
+            否則基線傾斜/雜訊/旁邊的特徵會讓量到的區段橫跨整條線（見 2026-07-13 修正）。
+            xpos=None 時退回全域極值所在區（供預設值用）。高度不落在特徵內回 None。
             """
             prof = self._section_profile(surf)
             if prof is None or zlev is None:
                 return None
             xs, z = prof
             n = len(z)
-            if self.var_sample.get() == 'bump':
-                ipk = int(np.argmax(z)); inside = z >= zlev
-            else:
-                ipk = int(np.argmin(z)); inside = z <= zlev
-            if not inside[ipk]:
+            inside = (z >= zlev) if self.var_sample.get() == 'bump' else (z <= zlev)
+            if not inside.any():
                 return None
-            L = ipk
-            while L > 0 and inside[L - 1]:
-                L -= 1
-            R = ipk
-            while R < n - 1 and inside[R + 1]:
-                R += 1
+            lbl, m = label(inside)               # 標記所有 ≥zlev（或 ≤）的連通區
+            if xpos is not None:
+                ix = int(np.clip(np.argmin(np.abs(xs - xpos)), 0, n - 1))
+                if lbl[ix] > 0:                  # 游標正落在某區內
+                    rid = lbl[ix]
+                else:                            # 游標在區外 → 取最近的一區
+                    cand = np.where(inside)[0]
+                    rid = lbl[cand[int(np.argmin(np.abs(cand - ix)))]]
+            else:                                # 無 xpos → 全域極值所在區
+                ipk = int(np.argmax(z) if self.var_sample.get() == 'bump'
+                          else np.argmin(z))
+                rid = lbl[ipk]
+                if rid == 0:
+                    return None
+            idx = np.where(lbl == rid)[0]
+            L, R = int(idx[0]), int(idx[-1])
 
             def interp(a, b):                    # a=特徵內緣、b=外側鄰點
                 if z[b] == z[a]:
