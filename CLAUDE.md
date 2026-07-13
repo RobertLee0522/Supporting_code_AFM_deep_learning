@@ -248,6 +248,14 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-13 — `zerotrain/blind_deconvolution.py`：數值欄支援算式（按 Enter 自動加減乘除）**
+  - **需求**：在欄位輸入「90-41」「41.4/2」按 Enter 自動算出結果填回並套用（例：全開角 41.4÷2 = 半錐角）。
+  - **`_feval()`**：以 `ast` 白名單求值（僅 `+ - * / ( )` 與數字，**不用 eval**，杜絕任意程式執行）；
+    共用 `_FW` 全形轉換表（全形數字/運算子/括號→半形），故「４１．４／２」「90。5-41」也可解析。
+  - **`_apply_expr(var, kind)`**：Enter 時算出→`f'{val:.6g}'` 去尾零填回→`tip` 類立即 `_auto_run`、
+    `meas` 類（半深比例）立即 `_measure`。綁定 R/θ/θx/θy/視窗半徑/px_nm/半深比例七個欄位。
+  - 驗證：`41.4/2→20.7`（且重跑去卷積）、`1/5→0.2`、`90-85→5`；安全性 `__import__(...)`/`1;2`/`x+1` 皆拒絕。
+
 - **2026-07-13 — 倉庫整理：程式碼分 `zerotrain/`＋`deeplearning/`＋`docs/`，路徑一併更新**
   - **動機**：根目錄 17 支 .py/.md 混在一起，使用者不知道該執行哪些。分兩條 pipeline 收納。
   - **搬移**（`git mv` 保留歷史）：

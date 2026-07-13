@@ -515,15 +515,42 @@ def run_demo(out_dir='blind_demo'):
 #   → ④ 執行去卷積 → ⑤ 檢視 certainty → ⑥ 儲存結果
 # 形態學運算對任意 2D 探針皆成立，非對稱探針無需改動核心（reconstruct/certainty）。
 # ──────────────────────────────────────────────────────────────────
-def _fnum(s):
-    """寬容數字解析：接受中文輸入法的全形小數點（。．，）與逗號。
+# 全形 → 半形（小數點、運算子、括號、數字），供數值/算式解析共用
+_FW = str.maketrans({
+    '。': '.', '．': '.', '，': '.', '－': '-', '–': '-', '—': '-', '＋': '+',
+    '×': '*', '＊': '*', '·': '*', '÷': '/', '／': '/', '（': '(', '）': ')',
+    '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
+    '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
+})
 
-    使用者以中文 IME 輸入「20。7」時 float() 會失敗，看起來像「不能輸入小數點」；
-    此處統一正規化成半形句點再解析。
+
+def _fnum(s):
+    """寬容數字解析：接受中文輸入法的全形小數點/數字（如「20。7」）。"""
+    return float(str(s).strip().translate(_FW))
+
+
+def _feval(s):
+    """安全算式解析：支援 + - * / 與括號（如「90-41」→49、「41.4/2」→20.7）。
+
+    用 ast 白名單求值，**不使用 eval**——只允許數字與四則運算，杜絕任意程式執行。
+    純數字也適用（退化為 _fnum）。解析失敗會拋例外，由呼叫端決定是否忽略。
     """
-    return float(str(s).strip()
-                 .replace('。', '.').replace('．', '.')
-                 .replace('，', '.').replace(',', '.'))
+    import ast
+    import operator as _op
+    binops = {ast.Add: _op.add, ast.Sub: _op.sub,
+              ast.Mult: _op.mul, ast.Div: _op.truediv}
+    unops = {ast.USub: _op.neg, ast.UAdd: _op.pos}
+
+    def ev(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return float(n.value)
+        if isinstance(n, ast.BinOp) and type(n.op) in binops:
+            return binops[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.UnaryOp) and type(n.op) in unops:
+            return unops[type(n.op)](ev(n.operand))
+        raise ValueError('不支援的算式')
+
+    return float(ev(ast.parse(str(s).strip().translate(_FW), mode='eval').body))
 
 
 def launch_gui():
@@ -598,7 +625,8 @@ def launch_gui():
             row = ttk.Frame(s2); row.pack(fill='x')
             ttk.Label(row, text='每 px = ').pack(side='left')
             self.var_px = tk.StringVar(value='39.1')
-            ttk.Entry(row, textvariable=self.var_px, width=8).pack(side='left')
+            self.e_px = ttk.Entry(row, textvariable=self.var_px, width=8)
+            self.e_px.pack(side='left')
             ttk.Label(row, text=' nm').pack(side='left')
 
             # ③ 探針
@@ -679,7 +707,8 @@ def launch_gui():
             mrow = ttk.Frame(s5); mrow.pack(fill='x', pady=(4, 0))
             ttk.Label(mrow, text='半深比例 ').pack(side='left')
             self.var_wfrac = tk.StringVar(value='0.5')
-            ttk.Entry(mrow, textvariable=self.var_wfrac, width=5).pack(side='left')
+            self.e_wfrac = ttk.Entry(mrow, textvariable=self.var_wfrac, width=5)
+            self.e_wfrac.pack(side='left')
             ttk.Button(mrow, text='📏 量測寬度',
                        command=self._measure).pack(side='left', padx=(6, 0))
             ttk.Button(mrow, text='↺ 自動',
@@ -771,9 +800,13 @@ def launch_gui():
                       self.var_px, self.var_half):
                 v.trace_add('write', lambda *_: self._schedule_auto_run())
             self.var_wfrac.trace_add('write', lambda *_: self._schedule_measure())
-            # 按 Enter 立即套用（不必等防抖）
-            for e in (self.e_R, self.e_th, self.e_thx, self.e_thy, self.e_half):
-                e.bind('<Return>', lambda _ev: (self._cancel_auto(), self._auto_run()))
+            # 按 Enter：先把算式（如 90-41、41.4/2）算出填回，再立即套用
+            for e, v in ((self.e_R, self.var_R), (self.e_th, self.var_th),
+                         (self.e_thx, self.var_thx), (self.e_thy, self.var_thy),
+                         (self.e_half, self.var_half), (self.e_px, self.var_px)):
+                e.bind('<Return>', lambda _ev, var=v: self._apply_expr(var, 'tip'))
+            self.e_wfrac.bind('<Return>',
+                              lambda _ev: self._apply_expr(self.var_wfrac, 'meas'))
             self._refresh()
             self._update_tip_mode()
 
@@ -939,6 +972,20 @@ def launch_gui():
             if self._auto_job:
                 self.after_cancel(self._auto_job)
                 self._auto_job = None
+
+        def _apply_expr(self, var, kind='tip'):
+            """按 Enter：把欄位裡的算式（90-41、41.4/2…）算出、填回數字，再立即套用。"""
+            try:
+                val = _feval(var.get())
+            except Exception:
+                return                           # 不是有效算式 → 忽略（不動欄位）
+            var.set(f'{val:.6g}')                # 去尾零；整數不帶小數
+            if kind == 'meas':
+                if self.recon is not None:
+                    self._measure()
+            else:
+                self._cancel_auto()
+                self._auto_run()
 
         def _schedule_auto_run(self):
             if self.image is None:
