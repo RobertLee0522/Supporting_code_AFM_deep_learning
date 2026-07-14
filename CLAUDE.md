@@ -248,7 +248,14 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
-- **2026-07-14 — `zerotrain/blind_deconvolution.py`：⑤ 寬度顯示長寬比 X:Y + 垂直壁模式套用兩軸**
+- **2026-07-14 — `zerotrain/blind_deconvolution.py`：垂直壁模式畫完整綠色還原曲線**
+  - **需求**：垂直壁模式除了量測弦，還要一條**綠色垂直還原曲線**疊在剖面上。
+  - **`_vwall_profile(xs, zimg, xpos)`**：逐高度把影像邊緣往內收 `w(Δz)`（`_chord_1d` 取含游標
+    連通區左右緣，Δz=頂−該高度），填出還原高度陣列。頂端貼合影像（Δz→0）、往下漸窄。
+  - **重構**：`_level_cross` 的連通區/方向判斷抽成可重用的 `_chord_1d(xs, z, zlev, xpos)`，
+    供逐高度掃描重用。Section vwall 分支 `sa['gv']` 由「一條弦」改為整條 `_vwall_profile` 曲線，
+    綠菱形 `gvd` 仍標量測高度的真實寬弦。
+  - 驗證（30nm.003, R8/θ20.7°）：綠曲線峰高=影像 7.44、頂端貼合、往基部收窄；量測弦真實寬隨深度變。
   - **需求**：圓形樣品下半部探針掃不到＝等效垂直壁；勾垂直壁時要顯示還原後長寬比（驗證是否為圓）。
   - **`_measure`**：影像/還原/垂直壁三種都加「長寬比 (大/小):1」。垂直壁模式對 X、Y 兩軸各減
     `2·w(Δz)`（Δz=(1−frac)×特徵高），顯示「垂直壁 X×Y nm 長寬比」；`meas_vw` 暫存。

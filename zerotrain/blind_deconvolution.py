@@ -1254,7 +1254,10 @@ def launch_gui():
             prof = self._section_profile(surf)
             if prof is None or zlev is None:
                 return None
-            xs, z = prof
+            return self._chord_1d(prof[0], prof[1], zlev, xpos)
+
+        def _chord_1d(self, xs, z, zlev, xpos=None):
+            """在 (xs, z) 剖面上找含游標的等高左右緣；邏輯同 _level_cross。"""
             n = len(z)
             if xpos is not None:
                 seed = int(np.clip(np.argmin(np.abs(xs - xpos)), 0, n - 1))
@@ -1293,6 +1296,26 @@ def launch_gui():
             xl = interp(L, L - 1) if L > 0 else float(xs[0])
             xr = interp(R, R + 1) if R < n - 1 else float(xs[-1])
             return {'xl': xl, 'xr': xr, 'w': xr - xl}
+
+        def _vwall_profile(self, xs, zimg, xpos):
+            """建構『垂直壁還原剖面』：每個高度把影像邊緣往內收 w(Δz)，Δz=頂−高度。
+            回傳與 xs 同長度的還原高度陣列（供綠色曲線）。"""
+            bump = self.var_sample.get() == 'bump'
+            ztop = float(zimg.max()) if bump else float(zimg.min())
+            base = (float(np.percentile(zimg, 10)) if bump
+                    else float(np.percentile(zimg, 90)))
+            out = np.full_like(zimg, base)
+            for zl in np.linspace(base, ztop, 140):
+                c = self._chord_1d(xs, zimg, zl, xpos)
+                if not c:
+                    continue
+                w = self._tip_lateral(abs(ztop - zl))
+                xl, xr = c['xl'] + w, c['xr'] - w
+                if xr <= xl:
+                    xl = xr = 0.5 * (c['xl'] + c['xr'])   # 收到極窄 → 中心
+                m = (xs >= xl) & (xs <= xr)
+                out[m] = np.maximum(out[m], zl) if bump else np.minimum(out[m], zl)
+            return out
 
         def _section_clear(self):
             if self.section is None:
@@ -1734,10 +1757,10 @@ def launch_gui():
                     sa['mi'].set_data([], [])
                 L = self._section_lines()
                 vw = L.get('vw')
-                if vw is not None:                       # 垂直壁模式：畫綠色真實寬弦
+                if vw is not None:                       # 垂直壁模式：綠色還原曲線 + 量測弦
                     sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
-                    sa['mr'].set_data([], [])
-                    sa['gv'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
+                    ztrue = self._vwall_profile(xs, zi, xpos)
+                    sa['gv'].set_data(xs, ztrue)         # 完整綠色垂直還原曲線
                     sa['gvd'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
                     ts = [np.clip(vw['xl']/total, 0, 1), np.clip(vw['xr']/total, 0, 1)]
                     pts = [self._section_pt(t) for t in ts]
