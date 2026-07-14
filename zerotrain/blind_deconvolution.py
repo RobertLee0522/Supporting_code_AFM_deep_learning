@@ -715,6 +715,11 @@ def launch_gui():
                        command=self._pick_reset).pack(side='left', padx=(4, 0))
             ttk.Button(mrow, text='✕ 剖面線',
                        command=self._section_clear).pack(side='left', padx=(4, 0))
+            # 已知垂直側壁 → Section 改用幾何還原（撐寬 = 2×探針側向寬 w(Δz)）
+            self.var_vwall = tk.BooleanVar(value=False)
+            ttk.Checkbutton(s5, text='☑ 已知垂直側壁（Section 用幾何還原 影像−2·w）',
+                            variable=self.var_vwall,
+                            command=self._refresh_section).pack(anchor='w', pady=(3, 0))
             self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
                                                '👆 點影像=選特徵；按住拖曳=拉剖面線'
                                                '（Section）；點剖面圖高度=改門檻',
@@ -1219,6 +1224,22 @@ def launch_gui():
                 return None, None
             return zlev, self._level_cross(surf, zlev, xpos)
 
+        def _tip_lateral(self, dz):
+            """探針在頂點以下深度 dz 處的『單邊側向寬度』w(Δz)：
+              球冠區(dz≤R(1−cosθ))：√(2R·dz−dz²)；錐區：R·sinθ+(dz−R(1−cosθ))·tanθ。
+            用於『已知垂直側壁』時計算撐寬量（垂直壁單邊撐寬 = w(Δz)）。"""
+            try:
+                R = _fnum(self.var_R.get())
+                th = np.radians(max(_fnum(self.var_thx.get()), _fnum(self.var_thy.get()))
+                                if self.var_asym.get() else _fnum(self.var_th.get()))
+            except (ValueError, tk.TclError):
+                return 0.0
+            dz = max(0.0, float(dz))
+            cap = R * (1 - np.cos(th))
+            if dz <= cap:
+                return float(np.sqrt(max(2 * R * dz - dz * dz, 0.0)))
+            return float(R * np.sin(th) + (dz - cap) * np.tan(th))
+
         def _level_cross(self, surf, zlev, xpos=None):
             """等高量測：找『游標所指特徵』通過高度 zlev 的左右緣（亞像素內插）。
 
@@ -1446,20 +1467,27 @@ def launch_gui():
             if not self.section:
                 return
             xpos = self.section.get('xpos')
-            for surf, lab, tag in ((self.image, '影像', 'img'),
-                                   (self.recon, '還原', 'rec')):
-                if surf is None:
-                    continue
-                zlev, c = self._curve_chord(surf, xpos)
-                if c:
-                    vals = (lab, f'{zlev:.2f}', f"{c['xl']:.2f}",
-                            f"{c['xr']:.2f}", f"{c['w']:.2f}")
-                else:
-                    vals = (lab, '—' if zlev is None else f'{zlev:.2f}',
-                            '—', '—', '（游標處無交點）')
-                self.tbl.insert('', 'end', tags=(tag,), values=vals)
+            zi, ci = self._curve_chord(self.image, xpos)
+            if ci:
+                self.tbl.insert('', 'end', tags=('img',),
+                                values=('影像', f'{zi:.2f}', f"{ci['xl']:.2f}",
+                                        f"{ci['xr']:.2f}", f"{ci['w']:.2f}"))
+            if self.var_vwall.get():                     # 垂直壁：綠色真實寬列
+                L = self._section_lines(); vw = L.get('vw')
+                if vw:
+                    self.tbl.insert('', 'end', tags=('vw',),
+                                    values=('垂直壁真實', f'{vw["z"]:.2f}',
+                                            f'{vw["xl"]:.2f}', f'{vw["xr"]:.2f}',
+                                            f'{vw["wtrue"]:.2f}'))
+            elif self.recon is not None:
+                zr, cr = self._curve_chord(self.recon, xpos)
+                if cr:
+                    self.tbl.insert('', 'end', tags=('rec',),
+                                    values=('還原', f'{zr:.2f}', f"{cr['xl']:.2f}",
+                                            f"{cr['xr']:.2f}", f"{cr['w']:.2f}"))
             self.tbl.tag_configure('img', foreground='#d2691e')
             self.tbl.tag_configure('rec', foreground='#c0392b')
+            self.tbl.tag_configure('vw', foreground='#1a7a4a')
 
         # ── 頁3：3D 表面（切到該頁才繪，避免拖慢其他頁）────────
         def _on_tab_change(self, _evt=None):
@@ -1565,16 +1593,33 @@ def launch_gui():
             if zstar is None:
                 return {'h': '', 'i': '', 'r': '', 'd': ''}
             out = {'h': f'量測高度 {zstar:.2f} nm（影像基準）', 'i': '', 'r': '',
-                   'd': ''}
+                   'd': '', 'vw': None}
             _, ci = self._curve_chord(self.image, xpos)
             out['i'] = (f"影像寬度 {ci['w']:.2f} nm" if ci else '影像：此高度無交點')
-            cr = None
-            if self.recon is not None:
-                _, cr = self._curve_chord(self.recon, xpos)
-                out['r'] = (f"還原寬度 {cr['w']:.2f} nm" if cr
-                            else '還原：此高度無交點')
-            if ci and cr:
-                out['d'] = f"寬度差 {ci['w'] - cr['w']:+.2f} nm（探針撐寬量）"
+            if self.var_vwall.get() and ci:
+                # 已知垂直側壁：撐寬 = 2×探針側向寬 w(Δz)，Δz=特徵頂到量測高度
+                prof = self._section_profile(self.image)
+                ztop = float(prof[1].max())
+                dz = ztop - zstar
+                w = self._tip_lateral(dz)
+                wtrue = ci['w'] - 2 * w
+                out['r'] = f"垂直壁真實寬 {wtrue:.2f} nm"
+                out['d'] = f"撐寬量 {2*w:+.2f} nm（垂直壁 2·w，深 Δz={dz:.1f}nm）"
+                out['vw'] = {'wtrue': wtrue, 'xl': ci['cx'] - wtrue/2 if 'cx' in ci
+                             else (ci['xl']+ci['xr'])/2 - wtrue/2, 'z': zstar,
+                             'w2': 2*w}
+                # 以影像弦的中心為基準置中
+                mid = (ci['xl'] + ci['xr']) / 2
+                out['vw']['xl'] = mid - wtrue/2
+                out['vw']['xr'] = mid + wtrue/2
+            else:
+                cr = None
+                if self.recon is not None:
+                    _, cr = self._curve_chord(self.recon, xpos)
+                    out['r'] = (f"還原寬度 {cr['w']:.2f} nm" if cr
+                                else '還原：此高度無交點')
+                if ci and cr:
+                    out['d'] = f"寬度差 {ci['w'] - cr['w']:+.2f} nm（探針撐寬量）"
             return out
 
         def _draw_section(self, axi, axp):
@@ -1606,6 +1651,10 @@ def launch_gui():
                 sa['dr'], = axp.plot([], [], 'o', color='#d1495b', ms=7,
                                      mec='k', zorder=5)
                 sa['hlr'], = axp.plot([], [], ':', color='#d1495b', lw=1.6)
+                # 垂直壁幾何還原：綠色真實寬度弦
+                sa['gv'], = axp.plot([], [], '-', color='#1a7a4a', lw=2.4, zorder=6)
+                sa['gvd'], = axp.plot([], [], 'D', color='#1a7a4a', ms=6,
+                                      mec='white', zorder=6)
                 # 數字標註：色碼對應曲線，字放大加粗
                 tb = dict(boxstyle='round', fc='white', ec='#bbb', alpha=0.92)
                 sa['stxt_h'] = axp.text(0.02, 0.98, '', transform=axp.transAxes,
@@ -1659,22 +1708,34 @@ def launch_gui():
                 else:
                     sa['di'].set_data([], []); sa['hli'].set_data([], [])
                     sa['mi'].set_data([], [])
-                z_r, cr = (self._curve_chord(self.recon, xpos)
-                           if self.recon is not None else (None, None))
-                if cr:
-                    sa['dr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
-                    sa['hlr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
-                    ts = [cr['xl'] / total, cr['xr'] / total]
+                L = self._section_lines()
+                vw = L.get('vw')
+                if vw is not None:                       # 垂直壁模式：畫綠色真實寬弦
+                    sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
+                    sa['mr'].set_data([], [])
+                    sa['gv'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
+                    sa['gvd'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
+                    ts = [np.clip(vw['xl']/total, 0, 1), np.clip(vw['xr']/total, 0, 1)]
                     pts = [self._section_pt(t) for t in ts]
                     sa['mr'].set_data([p[1] for p in pts], [p[0] for p in pts])
                 else:
-                    sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
-                    sa['mr'].set_data([], [])
-                L = self._section_lines()
+                    sa['gv'].set_data([], []); sa['gvd'].set_data([], [])
+                    z_r, cr = (self._curve_chord(self.recon, xpos)
+                               if self.recon is not None else (None, None))
+                    if cr:
+                        sa['dr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
+                        sa['hlr'].set_data([cr['xl'], cr['xr']], [z_r, z_r])
+                        ts = [cr['xl'] / total, cr['xr'] / total]
+                        pts = [self._section_pt(t) for t in ts]
+                        sa['mr'].set_data([p[1] for p in pts], [p[0] for p in pts])
+                    else:
+                        sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
+                        sa['mr'].set_data([], [])
                 if 'stxt_h' in sa:
                     sa['stxt_h'].set_text(L['h'])
                     sa['stxt_i'].set_text(L['i'])
                     sa['stxt_r'].set_text(L['r'])
+                    sa['stxt_r'].set_color('#1a7a4a' if L.get('vw') else '#c0392b')
                     sa['stxt_d'].set_text(L['d'])
                 ax = sa['prof_img'].axes
                 ax.relim(); ax.autoscale_view()
