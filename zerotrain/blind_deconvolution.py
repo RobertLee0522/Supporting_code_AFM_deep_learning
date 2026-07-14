@@ -1299,20 +1299,46 @@ def launch_gui():
 
         def _vwall_profile(self, xs, zimg, xpos):
             """建構『垂直壁還原剖面』：每個高度把影像邊緣往內收 w(Δz)，Δz=頂−高度。
+            **鎖定含游標特徵的峰**逐高度往兩側走連通區（不用會亂跳的自動方向判斷），
             回傳與 xs 同長度的還原高度陣列（供綠色曲線）。"""
             bump = self.var_sample.get() == 'bump'
-            ztop = float(zimg.max()) if bump else float(zimg.min())
+            n = len(zimg)
+            # 以量測高度定位『游標所指特徵』，取其區間內的峰為種子
+            zstar = self._measure_level(xpos)
+            c0 = self._chord_1d(xs, zimg, zstar, xpos) if zstar is not None else None
+            if not c0:
+                return np.full_like(zimg, float(np.percentile(zimg, 10)))
+            i0 = int(np.clip(np.searchsorted(xs, c0['xl']), 1, n - 1))
+            i1 = int(np.clip(np.searchsorted(xs, c0['xr']), 1, n - 1))
+            seg = zimg[i0:i1 + 1]
+            pk = i0 + int(np.argmax(seg) if bump else np.argmin(seg))
+            ztop = float(zimg[pk])
             base = (float(np.percentile(zimg, 10)) if bump
                     else float(np.percentile(zimg, 90)))
             out = np.full_like(zimg, base)
-            for zl in np.linspace(base, ztop, 140):
-                c = self._chord_1d(xs, zimg, zl, xpos)
-                if not c:
+
+            def edge(a, b, zl):                  # a=內、b=外側鄰點：亞像素交點
+                if zimg[b] == zimg[a]:
+                    return float(xs[a])
+                f = (zl - zimg[a]) / (zimg[b] - zimg[a])
+                return float(xs[a] + f * (xs[b] - xs[a]))
+
+            for zl in np.linspace(base, ztop, 160):
+                inside = zimg >= zl if bump else zimg <= zl
+                if not inside[pk]:
                     continue
+                L = pk
+                while L > 0 and inside[L - 1]:
+                    L -= 1
+                R = pk
+                while R < n - 1 and inside[R + 1]:
+                    R += 1
+                xl = edge(L, L - 1, zl) if L > 0 else float(xs[0])
+                xr = edge(R, R + 1, zl) if R < n - 1 else float(xs[-1])
                 w = self._tip_lateral(abs(ztop - zl))
-                xl, xr = c['xl'] + w, c['xr'] - w
+                xl, xr = xl + w, xr - w
                 if xr <= xl:
-                    xl = xr = 0.5 * (c['xl'] + c['xr'])   # 收到極窄 → 中心
+                    xl = xr = 0.5 * (xl + xr)
                 m = (xs >= xl) & (xs <= xr)
                 out[m] = np.maximum(out[m], zl) if bump else np.minimum(out[m], zl)
             return out
