@@ -576,6 +576,7 @@ def launch_gui():
             self.frac = None
             self.meas = None           # 還原表面寬度量測結果
             self.meas_in = None        # 影像寬度量測結果（對照）
+            self.meas_vw = None        # 垂直壁幾何還原 X/Y
             self.pick = None           # 使用者點選的量測位置 (y, x)；None=自動
             self._auto_job = None      # 參數變更自動重跑（防抖）排程 id
             self._meas_job = None      # 半深比例變更自動重量測排程 id
@@ -717,9 +718,9 @@ def launch_gui():
                        command=self._section_clear).pack(side='left', padx=(4, 0))
             # 已知垂直側壁 → Section 改用幾何還原（撐寬 = 2×探針側向寬 w(Δz)）
             self.var_vwall = tk.BooleanVar(value=False)
-            ttk.Checkbutton(s5, text='☑ 已知垂直側壁（Section 用幾何還原 影像−2·w）',
+            ttk.Checkbutton(s5, text='☑ 已知垂直側壁（幾何還原 影像−2·w，含長寬比）',
                             variable=self.var_vwall,
-                            command=self._refresh_section).pack(anchor='w', pady=(3, 0))
+                            command=self._on_vwall_toggle).pack(anchor='w', pady=(3, 0))
             self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
                                                '👆 點影像=選特徵；按住拖曳=拉剖面線'
                                                '（Section）；點剖面圖高度=改門檻',
@@ -1309,6 +1310,13 @@ def launch_gui():
                 self._measure()
 
         # ── ⑤ 量測還原表面特徵寬度（FWHM；自動或點選位置）────
+        def _on_vwall_toggle(self):
+            """切換垂直壁模式：重量測 ⑤ 寬度（更新長寬比）+ 重繪 Section。"""
+            if self.recon is not None:
+                self._measure()
+            else:
+                self._refresh_section()
+
         def _measure(self):
             if self.recon is None:
                 messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
@@ -1323,19 +1331,35 @@ def launch_gui():
             m_in = measure_feature_width(self.image, px_nm, sample, frac,
                                          at=self.pick)
             self.meas_in = m_in
-            if self.meas:
+
+            def ar(a, b):                        # 長寬比（大/小），顯示成 x.xx:1
+                return (max(a, b)/min(a, b)) if min(a, b) > 0 else float('nan')
+
+            if self.var_vwall.get() and m_in:
+                # 已知垂直側壁：X/Y 兩軸各修 2·w(Δz)，Δz=(1−frac)×特徵高
+                dz = (1 - frac) * m_in['amp_nm']
+                w = self._tip_lateral(dz)
+                tx = m_in['width_x_nm'] - 2*w
+                ty = m_in['width_y_nm'] - 2*w
+                self.meas_vw = {'tx': tx, 'ty': ty, 'w2': 2*w, 'dz': dz}
+                self.lbl_wre.config(
+                    text=f"垂直壁 {tx:.1f}×{ty:.1f} nm  長寬比 {ar(tx, ty):.2f}:1")
+                self._log(f"垂直壁還原@{int(frac*100)}%（深Δz={dz:.1f}）："
+                          f"{tx:.1f}×{ty:.1f}nm 長寬比 {ar(tx, ty):.2f}:1；"
+                          f"影像 {m_in['width_x_nm']:.1f}×{m_in['width_y_nm']:.1f}")
+            elif self.meas:
+                self.meas_vw = None
                 self.lbl_wre.config(
                     text=f"{self.meas['width_x_nm']:.1f}×{self.meas['width_y_nm']:.1f}"
-                         f" nm ⌀{self.meas['equiv_diam_nm']:.1f}")
+                         f" nm ⌀{self.meas['equiv_diam_nm']:.1f}  "
+                         f"長寬比 {ar(self.meas['width_x_nm'], self.meas['width_y_nm']):.2f}:1")
             else:
+                self.meas_vw = None
                 self.lbl_wre.config(text='（無明顯特徵）')
             if m_in:
-                self.lbl_win.config(text=f"{m_in['equiv_diam_nm']:.1f} nm")
-            if self.meas and m_in:
-                self._log(f"寬度@{int(frac*100)}%：還原 "
-                          f"{self.meas['width_x_nm']:.1f}×{self.meas['width_y_nm']:.1f}nm "
-                          f"⌀{self.meas['equiv_diam_nm']:.1f}；"
-                          f"影像 ⌀{m_in['equiv_diam_nm']:.1f}nm")
+                self.lbl_win.config(
+                    text=f"{m_in['equiv_diam_nm']:.1f} nm  "
+                         f"長寬比 {ar(m_in['width_x_nm'], m_in['width_y_nm']):.2f}:1")
             self._refresh()
 
         # ── ⑥ 儲存 ───────────────────────────────────────────
