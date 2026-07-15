@@ -248,7 +248,14 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
-- **2026-07-14 — `zerotrain/blind_deconvolution.py`：垂直還原綠曲線改逐節點平移（不再掃描填充）**
+- **2026-07-14 — `zerotrain/blind_deconvolution.py`：新增「匯出 Section 結果」（CSV 逐點 + 摘要 txt + PNG）**
+  - **需求**：把 Section 剖面實際數據存檔，方便貼給 agent 理解形狀（不只截圖）。
+  - **`_save_section()`**：⑤ 新增「💾 匯出 Section 結果」鈕。輸出到選定資料夾：
+    `*_section_profile.csv`（沿線距離/影像高度/還原高度 逐點，UTF-8-BOM 供 Excel）、
+    `*_section_vwall.csv`（垂直壁還原折線節點，僅垂直壁模式）、
+    `*_section_summary.txt`（探針 R/θ、樣品、px_nm、剖面線端點/線長、游標位置、峰高、
+    各寬度/撐寬量、certainty）、`*_section.png`（目前剖面圖）。
+  - 驗證（30nm.003 長線, 垂直壁開）：四檔正確產出，摘要含「影像13.72/垂直壁真實7.28/撐寬+6.43」。
   - **需求**：使用者要綠曲線「按每一個節點重新畫」，如紅色形態學曲線般逐點還原。
   - **`_vwall_profile`（逐高度掃描填充）→ `_vwall_curve`（逐節點）**：鎖定含游標特徵的峰後，
     左翼每點水平右移 `w(Δz)`、右翼每點左移（Δz=頂−該點高度、頂點不動），回傳 (gx,gz) 折線。

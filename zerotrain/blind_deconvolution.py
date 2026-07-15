@@ -721,6 +721,8 @@ def launch_gui():
             ttk.Checkbutton(s5, text='☑ 已知垂直側壁（幾何還原 影像−2·w，含長寬比）',
                             variable=self.var_vwall,
                             command=self._on_vwall_toggle).pack(anchor='w', pady=(3, 0))
+            ttk.Button(s5, text='💾 匯出 Section 結果（CSV+摘要+PNG）',
+                       command=self._save_section).pack(fill='x', pady=(3, 0))
             self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
                                                '👆 點影像=選特徵；按住拖曳=拉剖面線'
                                                '（Section）；點剖面圖高度=改門檻',
@@ -1342,6 +1344,85 @@ def launch_gui():
             self.section = None
             self._log('已清除剖面線')
             self._refresh()
+
+        # ── 匯出 Section 結果（CSV 逐點資料 + 摘要 txt + PNG）─────
+        def _save_section(self):
+            if self.section is None or self.image is None:
+                messagebox.showwarning('沒有剖面線',
+                                       '請先在掃描影像上按住拖曳拉一條剖面線')
+                return
+            d = filedialog.askdirectory(title='選擇輸出資料夾')
+            if not d:
+                return
+            stem = os.path.splitext(os.path.basename(self.image_path or 'scan'))[0]
+            prof_i = self._section_profile(self.image)
+            xs, zi = prof_i
+            zr = (self._section_profile(self.recon)[1]
+                  if self.recon is not None else None)
+            xpos = self.section.get('xpos')
+            gx, gz = ((None, None) if not self.var_vwall.get()
+                      else self._vwall_curve(xs, zi, xpos))
+
+            # 1) CSV：沿線距離 / 影像高度 / 還原高度（逐點）
+            csv_path = os.path.join(d, f'{stem}_section_profile.csv')
+            with open(csv_path, 'w', encoding='utf-8-sig') as f:
+                f.write('沿線距離_nm,影像高度_nm,還原高度_nm\n')
+                for k in range(len(xs)):
+                    rk = '' if zr is None else f'{zr[k]:.4f}'
+                    f.write(f'{xs[k]:.4f},{zi[k]:.4f},{rk}\n')
+            # 1b) 垂直壁還原折線（節點，另存）
+            if gx is not None and len(gx):
+                with open(os.path.join(d, f'{stem}_section_vwall.csv'),
+                          'w', encoding='utf-8-sig') as f:
+                    f.write('沿線距離_nm,垂直壁還原高度_nm\n')
+                    for k in range(len(gx)):
+                        f.write(f'{gx[k]:.4f},{gz[k]:.4f}\n')
+
+            # 2) 摘要 txt（給人/agent 讀）
+            L = self._section_lines()
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            try:
+                px_nm = _fnum(self.var_px.get())
+            except ValueError:
+                px_nm = float('nan')
+            lines = [
+                f'# Section 量測摘要　{stem}',
+                f'掃描檔        : {os.path.basename(self.image_path or "")}',
+                f'px_nm         : {px_nm:.4f}',
+                f'樣品類型      : {self.var_sample.get()}',
+                f'探針          : R={self.var_R.get()}nm  '
+                + (f'θx={self.var_thx.get()}° θy={self.var_thy.get()}°'
+                   if self.var_asym.get() else f'θ={self.var_th.get()}°'),
+                f'視窗半徑      : {self.var_half.get()} px',
+                f'certainty     : '
+                + ('' if self.frac is None else f'{self.frac*100:.1f}%'),
+                '',
+                f'剖面線端點    : (x={x0:.1f},y={y0:.1f}) → (x={x1:.1f},y={y1:.1f})  '
+                f'線長={float(np.hypot(y1-y0, x1-x0))*px_nm:.2f} nm，取樣 {len(xs)} 點',
+                f'游標位置 xpos : {xpos:.2f} nm',
+                f'特徵峰高      : {float(zi.max()):.3f} nm',
+                '',
+                f'量測 : {L["h"]}',
+                f'       {L["i"]}',
+                f'       {L["r"]}',
+                f'       {L["d"]}',
+                f'垂直壁模式    : {"開" if self.var_vwall.get() else "關"}',
+                '',
+                '# 逐點剖面資料見 *_section_profile.csv'
+                + ('（+ *_section_vwall.csv 垂直壁折線）' if gx is not None
+                   and len(gx) else ''),
+            ]
+            with open(os.path.join(d, f'{stem}_section_summary.txt'),
+                      'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+
+            # 3) PNG（目前 Section 圖）
+            self.fig1.savefig(os.path.join(d, f'{stem}_section.png'),
+                              dpi=150, bbox_inches='tight')
+            self._log(f'已匯出 Section 結果至 {d}（csv/txt/png）')
+            messagebox.showinfo('完成',
+                                f'已匯出：\n{stem}_section_profile.csv\n'
+                                f'{stem}_section_summary.txt\n{stem}_section.png')
 
         def _pick_reset(self):
             self.pick = None
