@@ -1784,13 +1784,15 @@ def launch_gui():
             sa = {}
             (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
             xpos = self.section.get('xpos')
-            # 掃描影像上：白線 + 端點方塊 + 兩曲線交點（橘=影像、紅=還原）
+            # 掃描影像上：白線 + 端點方塊 + 兩曲線交點（橘=影像、紅=還原、綠=垂直壁真實寬）
             sa['line'], = axi.plot([x0, x1], [y0, y1], '-', color='white',
                                    lw=1.6, alpha=0.95)
             sa['ends'], = axi.plot([x0, x1], [y0, y1], 's', color='white',
                                    ms=7, mec='black')
             sa['mi'], = axi.plot([], [], 'o', color='#ff8c00', ms=7, mec='white')
             sa['mr'], = axi.plot([], [], 'o', color='#d1495b', ms=7, mec='white')
+            sa['mv'], = axi.plot([], [], 'D', color='#1a7a4a', ms=7, mec='white',
+                                 zorder=6)
             prof_i = self._section_profile(self.image)
             if prof_i is not None:
                 xs, zi = prof_i
@@ -1870,14 +1872,16 @@ def launch_gui():
                 vw = L.get('vw')
                 if vw is not None:                       # 垂直壁模式：綠色還原曲線 + 量測弦
                     sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
+                    sa['mr'].set_data([], [])
                     gx, gz = self._vwall_curve(xs, zi, xpos)   # 逐節點平移的還原折線
                     sa['gv'].set_data(gx, gz)
                     sa['gvd'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
                     ts = [np.clip(vw['xl']/total, 0, 1), np.clip(vw['xr']/total, 0, 1)]
                     pts = [self._section_pt(t) for t in ts]
-                    sa['mr'].set_data([p[1] for p in pts], [p[0] for p in pts])
+                    sa['mv'].set_data([p[1] for p in pts], [p[0] for p in pts])
                 else:
                     sa['gv'].set_data([], []); sa['gvd'].set_data([], [])
+                    sa['mv'].set_data([], [])
                     z_r, cr = (self._curve_chord(self.recon, xpos)
                                if self.recon is not None else (None, None))
                     if cr:

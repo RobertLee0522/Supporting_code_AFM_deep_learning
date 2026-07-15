@@ -248,6 +248,13 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：垂直壁真實寬左右邊界點加到左側掃描影像**
+  - **需求**：Section 剖面右側已用綠色菱形標出垂直壁真實寬的左右邊界，左側掃描影像上沒有對應標記。
+  - **修正**：`_draw_section` 新增 `sa['mv']`（綠色菱形 marker，獨立於原本共用的 `sa['mr']`）；
+    `_update_section_artists` 垂直壁分支改寫入 `mv`（非垂直壁模式時 `mv` 清空、`mr` 照舊標紅色還原點），
+    座標經 `_section_pt(t)` 由沿線比例映射回影像 (y,x)。
+  - 驗證（30nm.003, 垂直壁開）：左側影像正確顯示兩個綠色菱形，位置與右側 Section 綠色邊界點一致。
+
 - **2026-07-15 — `zerotrain/blind_deconvolution.py`：半錐角防呆（θ 出界警告+夾回，修「還原=影像」）**
   - **症狀**：使用者匯出的 profile.csv 影像/還原兩欄完全相同（還原=影像、紅線疊在橘線下看不見），
     summary 顯示 `θ=207°`——**小數點沒打，20.7 變 207**。θ=207° 做出退化尖探針 → erosion 幾乎不動。
