@@ -1297,17 +1297,17 @@ def launch_gui():
             xr = interp(R, R + 1) if R < n - 1 else float(xs[-1])
             return {'xl': xl, 'xr': xr, 'w': xr - xl}
 
-        def _vwall_profile(self, xs, zimg, xpos):
-            """建構『垂直壁還原剖面』：每個高度把影像邊緣往內收 w(Δz)，Δz=頂−高度。
-            **鎖定含游標特徵的峰**逐高度往兩側走連通區（不用會亂跳的自動方向判斷），
-            回傳與 xs 同長度的還原高度陣列（供綠色曲線）。"""
+        def _vwall_curve(self, xs, zimg, xpos):
+            """垂直壁還原曲線（**逐節點**）：影像特徵左翼每點水平右移 w(Δz)、
+            右翼每點左移 w(Δz)（Δz=特徵頂−該點高度），頂點不動。
+            回傳 (gx, gz) 折線，只涵蓋游標所指特徵；找不到特徵回空陣列。
+            （逐高度掃描填充版會被基線連通區污染出假平台，故改逐節點平移。）"""
             bump = self.var_sample.get() == 'bump'
-            n = len(zimg)
-            # 以量測高度定位『游標所指特徵』，取其區間內的峰為種子
             zstar = self._measure_level(xpos)
             c0 = self._chord_1d(xs, zimg, zstar, xpos) if zstar is not None else None
             if not c0:
-                return np.full_like(zimg, float(np.percentile(zimg, 10)))
+                return np.array([]), np.array([])
+            n = len(zimg)
             i0 = int(np.clip(np.searchsorted(xs, c0['xl']), 1, n - 1))
             i1 = int(np.clip(np.searchsorted(xs, c0['xr']), 1, n - 1))
             seg = zimg[i0:i1 + 1]
@@ -1315,33 +1315,26 @@ def launch_gui():
             ztop = float(zimg[pk])
             base = (float(np.percentile(zimg, 10)) if bump
                     else float(np.percentile(zimg, 90)))
-            out = np.full_like(zimg, base)
-
-            def edge(a, b, zl):                  # a=內、b=外側鄰點：亞像素交點
-                if zimg[b] == zimg[a]:
-                    return float(xs[a])
-                f = (zl - zimg[a]) / (zimg[b] - zimg[a])
-                return float(xs[a] + f * (xs[b] - xs[a]))
-
-            for zl in np.linspace(base, ztop, 160):
-                inside = zimg >= zl if bump else zimg <= zl
-                if not inside[pk]:
-                    continue
-                L = pk
-                while L > 0 and inside[L - 1]:
-                    L -= 1
-                R = pk
-                while R < n - 1 and inside[R + 1]:
-                    R += 1
-                xl = edge(L, L - 1, zl) if L > 0 else float(xs[0])
-                xr = edge(R, R + 1, zl) if R < n - 1 else float(xs[-1])
-                w = self._tip_lateral(abs(ztop - zl))
-                xl, xr = xl + w, xr - w
-                if xr <= xl:
-                    xl = xr = 0.5 * (xl + xr)
-                m = (xs >= xl) & (xs <= xr)
-                out[m] = np.maximum(out[m], zl) if bump else np.minimum(out[m], zl)
-            return out
+            feet = base + 0.05 * (ztop - base)     # 腳點門檻（略高於基線）
+            inside = zimg >= feet if bump else zimg <= feet
+            L = pk
+            while L > 0 and inside[L - 1]:
+                L -= 1
+            R = pk
+            while R < n - 1 and inside[R + 1]:
+                R += 1
+            gx, gz = [], []
+            xpk = float(xs[pk])
+            for i in range(L, R + 1):
+                w = self._tip_lateral(abs(ztop - float(zimg[i])))
+                if i < pk:                          # 左翼右移，不越過頂點
+                    gx.append(min(float(xs[i]) + w, xpk))
+                elif i > pk:                        # 右翼左移，不越過頂點
+                    gx.append(max(float(xs[i]) - w, xpk))
+                else:
+                    gx.append(xpk)
+                gz.append(float(zimg[i]))
+            return np.asarray(gx), np.asarray(gz)
 
         def _section_clear(self):
             if self.section is None:
@@ -1785,8 +1778,8 @@ def launch_gui():
                 vw = L.get('vw')
                 if vw is not None:                       # 垂直壁模式：綠色還原曲線 + 量測弦
                     sa['dr'].set_data([], []); sa['hlr'].set_data([], [])
-                    ztrue = self._vwall_profile(xs, zi, xpos)
-                    sa['gv'].set_data(xs, ztrue)         # 完整綠色垂直還原曲線
+                    gx, gz = self._vwall_curve(xs, zi, xpos)   # 逐節點平移的還原折線
+                    sa['gv'].set_data(gx, gz)
                     sa['gvd'].set_data([vw['xl'], vw['xr']], [vw['z'], vw['z']])
                     ts = [np.clip(vw['xl']/total, 0, 1), np.clip(vw['xr']/total, 0, 1)]
                     pts = [self._section_pt(t) for t in ts]
