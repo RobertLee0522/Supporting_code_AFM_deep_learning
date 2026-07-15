@@ -925,10 +925,18 @@ def launch_gui():
                 tip -= tip.max()
                 return tip
             R = _fnum(self.var_R.get())
+
+            def chk(th, name):               # 半錐角需在 0–90°，否則多半是小數點沒打
+                if not (0.0 < th < 90.0):
+                    self._log(f'⚠ {name}={th:g}° 超出合理範圍 0–90°（是不是小數點沒打？'
+                              f'例：20.7 打成 207）→ 已暫夾到 20.7° 計算')
+                    return 20.7
+                return th
             if self.var_asym.get():
-                tx, ty = _fnum(self.var_thx.get()), _fnum(self.var_thy.get())
+                tx = chk(_fnum(self.var_thx.get()), 'θx')
+                ty = chk(_fnum(self.var_thy.get()), 'θy')
                 return make_cone_tip_asym(half, px_nm, R, tx, ty)
-            th = _fnum(self.var_th.get())
+            th = chk(_fnum(self.var_th.get()), 'θ')
             return make_cone_tip(half, px_nm, R, th)
 
         # ── 預覽探針 ──────────────────────────────────────────
@@ -1233,10 +1241,13 @@ def launch_gui():
             用於『已知垂直側壁』時計算撐寬量（垂直壁單邊撐寬 = w(Δz)）。"""
             try:
                 R = _fnum(self.var_R.get())
-                th = np.radians(max(_fnum(self.var_thx.get()), _fnum(self.var_thy.get()))
-                                if self.var_asym.get() else _fnum(self.var_th.get()))
+                thd = (max(_fnum(self.var_thx.get()), _fnum(self.var_thy.get()))
+                       if self.var_asym.get() else _fnum(self.var_th.get()))
             except (ValueError, tk.TclError):
                 return 0.0
+            if not (0.0 < thd < 90.0):           # 無效角度（如 207）→ 夾回 20.7
+                thd = 20.7
+            th = np.radians(thd)
             dz = max(0.0, float(dz))
             cap = R * (1 - np.cos(th))
             if dz <= cap:

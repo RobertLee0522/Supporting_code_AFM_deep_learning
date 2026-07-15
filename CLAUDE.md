@@ -248,6 +248,14 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
 
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：半錐角防呆（θ 出界警告+夾回，修「還原=影像」）**
+  - **症狀**：使用者匯出的 profile.csv 影像/還原兩欄完全相同（還原=影像、紅線疊在橘線下看不見），
+    summary 顯示 `θ=207°`——**小數點沒打，20.7 變 207**。θ=207° 做出退化尖探針 → erosion 幾乎不動。
+  - **修正**：`_build_tip`／`_tip_lateral` 檢查半錐角須在 0–90°，否則 log 警告
+    「⚠ θ 超出合理範圍（是不是小數點沒打？例 20.7→207）」並暫夾回 20.7° 計算，
+    不再默默產生垃圾結果。（根因是使用者端鍵盤/IME 漏掉小數點，程式端以防呆擋下。）
+  - 驗證（30nm.003, θ=207）：防呆後 還原≠影像、log 出現警告。
+
 - **2026-07-14 — `zerotrain/blind_deconvolution.py`：新增「匯出 Section 結果」（CSV 逐點 + 摘要 txt + PNG）**
   - **需求**：把 Section 剖面實際數據存檔，方便貼給 agent 理解形狀（不只截圖）。
   - **`_save_section()`**：⑤ 新增「💾 匯出 Section 結果」鈕。輸出到選定資料夾：
