@@ -173,6 +173,9 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ```
 - Python 3.8+（建議 3.9–3.10）；GPU 可選（見 `GPU_SETUP_GUIDE.md`）。
 - `afm_gui.py` 需 Tkinter（`matplotlib` 用 `TkAgg`）。
+- **`vtk`（選用）**：`blind_deconvolution.py` 的 3D 分頁若偵測到 `vtk` 套件，改用硬體 GPU
+  渲染（off-screen render + Canvas blit，見 §9 2026-07-15 條目）取代 matplotlib CPU 3D，
+  拖曳旋轉更流暢；未安裝時自動退回 matplotlib，不影響其他功能。
 - **無頭測試**：以 `matplotlib.use('Agg')` 在無顯示環境驗證數值與繪圖邏輯。
 
 ---
@@ -247,6 +250,192 @@ pip install -r requirements.txt   # numpy scipy matplotlib Pillow tensorflow sci
 ## 9. 變更紀錄 (Changelog)
 
 > 每次更新都在此最上方追加一筆（日期 / 範圍 / 摘要）。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：修「調整角度時畫面有時消失」——改繞物體中心 turntable 旋轉**
+  - **症狀**：拖曳調整角度時畫面有時整片消失（跟上一筆的縮放消失不同來源）。
+  - **兩個根因**：
+    1. **焦點飄移**：指向性縮放（dolly）把相機焦點往滑鼠指的點推移後，舊版旋轉用
+       `cam.Azimuth/Elevation`（繞**相機焦點**公轉）；焦點已不在物體上，一轉就把物體甩出畫面。
+    2. **Gimbal lock**：`Elevation` 累積過 ±90°（南北極）時視線與 view-up 平行，
+       `OrthogonalizeViewUp` 會翻轉，畫面瞬間翻掉/消失。
+  - **修正 `_vtk_orbit()`**（取代直接呼叫 `Azimuth/Elevation`）：改繞**物體中心**
+    （`_vtk_fix_clip()` 每次 render 由聯集 bounds 算出 `self._vtk_center`）做 turntable——
+    方位角繞世界 Z 軸（不產生 roll、視覺穩定）、俯仰角繞相機右向量，並在套用俯仰前檢查
+    視線與世界 Z 的夾角、**夾在 8°~172°** 內（未過極點才套用）杜絕 gimbal 翻轉。旋轉樞紐是
+    物體中心而非焦點，故指向性縮放後焦點飄移也不會把物體轉出畫面。新增 `_rot_axis()`
+    （Rodrigues 公式，繞任意單位軸的旋轉矩陣）。
+  - 驗證：先縮放進角落讓焦點飄移，再連續 80 次「往上拖」（會逼近極點、舊版必翻）＋整圈方位角
+    旋轉，畫面非背景像素占比全程維持 ~0.93（單張）/ 最低 0.66（比對三格），物體從未消失；
+    `py_compile`（兩個 Python 環境）通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：修「放大時畫面消失」——縮放後重算裁切面**
+  - **症狀**：接續指向性縮放，使用者回報滾輪放大時整片畫面會消失。
+  - **根因**：`_vtk_zoom()` 用 dolly（平移相機 Position/FocalPoint）往滑鼠點靠近，但 VTK 的
+    near/far 裁切面（clipping range）只有在 `ResetCamera()` 時算過一次、之後不會自動跟著相機
+    位置更新。相機推近物體後，物體會落到 near 裁切面之外被裁掉 → 畫面整片變空（背景色）。
+  - **修正 `_vtk_fix_clip()`**：每次 `_vtk_render_to_canvas()` Render 前，取所有 viewport 可見
+    物件的**聯集 bounds**（`ComputeVisiblePropBounds()`）呼叫 `ResetCameraClippingRange(*b)`
+    依目前相機位置重算近/遠裁切面。多視圖共用同一顆相機，故取聯集一次設定即可涵蓋三格。
+    旋轉因距離不變較不會觸發，但放在 render 統一處理，兩種互動都保險。
+  - 驗證：單張模式連續放大 15 次，畫面非背景像素占比從 0.395 升到 0.938（表面持續可見、
+    沒有消失），再縮小 20 次回到 0.152；比對模式對左格放大 12 次占比 0.694→0.965，
+    三格幾何都在裁切範圍內；`py_compile` 通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：3D 滑鼠指向性縮放 + 視角換頁/換模式不重置**
+  - **需求 1（指向性縮放）**：滾輪縮放原本用 `camera.Zoom(factor)`——對透視相機是改變
+    視野角（FOV），永遠以畫面正中央為縮放中心，使用者想放大滑鼠指到的局部特徵時要先手動
+    轉到中間很麻煩。
+  - **`_vtk_zoom()`**：改用「往滑鼠指到的 3D 點 dolly 過去」——`vtkPropPicker` 對滑鼠位置
+    做真正的幾何 pick（沿視線對場景中的 actor 做 ray cast，off-screen render window 一樣
+    可用，不需讀 GPU depth buffer）；命中時 `target=` 該 3D 點，camera 的 Position 與
+    FocalPoint **同時**沿 `(target-pos)` 方向平移 `1-1/factor`，讓 target 點的螢幕投影位置
+    不變、但距離變近／變遠＝視覺上以該點為中心縮放。滾輪落在背景/沒有幾何處
+    （比對模式面板間空白、或轉到看不到物體的角度）時 pick 不到，退回舊行為（對焦點縮放）。
+  - **`_vtk_renderer_at()`**：比對模式一次有 3 個並排 viewport 共用同一顆相機，縮放前先
+    依滑鼠 canvas 座標（需轉成 VTK 座標系：Y 軸原點在左下、由下往上，跟 Tk 的左上原點相反）
+    判斷落在哪個 viewport 的 renderer，pick 只在該 renderer 內做。
+  - **需求 2（視角持續）**：使用者反應「每次切換頁面視角就被重置」——根因是
+    `⟳ 重繪 3D`／切換 recon/image/both 單選鈕／`_on_tab_change`（换到別的分頁再切回來，
+    `id(self.recon)` 因重新跑去卷積而改變導致 key 不同）都會呼叫 `_vtk_draw()`，而
+    `_vtk_draw()` 舊版**每次都** `ResetCamera()`，直接蓋掉使用者剛才轉好/縮放好的視角。
+  - **`self._vtk_cam_initialized`**：新增旗標，只有『第一次真的畫出幾何』才
+    `ResetCamera()`；之後不管重繪幾次（換頁簽、換 recon/image/both、新去卷積結果、
+    `⟳ 重繪 3D`）都保留使用者當下的相機位置/角度/縮放。只在真的建了 actor（`_vtk_actors`
+    非空）時才置旗標為 True——避免「尚無資料」的空白提示畫面被誤判成已初始化。
+  - **新增「⌂ 重置視角」按鈕**：`_vtk_reset_view()` 清掉旗標並重繪一次，讓使用者在視角跑
+    偏/迷路時可以手動框回目前資料，不必重開 App。
+  - 驗證：模擬拖曳旋轉→切換 recon/image/both→離開分頁再切回→camera 位置全程不變
+    （`np.allclose` 比對通過）；滾輪縮放後相機位置確實改變；`vtkPropPicker` 對準表面中心
+    確認能 pick 到真實 3D 座標（`PickProp` 回傳 1），畫面邊緣空白處正確 miss（回傳 0）
+    並退回舊行為；重置視角按鈕呼叫後旗標正確重置並重新框住資料；`py_compile` 通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：3D 分頁拖曳時疊字顯示即時 FPS**
+  - **需求**：使用者希望能直接看到拖曳旋轉時的 FPS 數字，用來客觀比對優化前後是否真的變順。
+  - **`_vtk_update_fps()`**：每次 `_vtk_render_to_canvas()` 完成 blit 後計算與上一幀的時間差
+    （`time.perf_counter()`），轉成瞬時 FPS 並用 EMA（`0.8*舊+0.2*新`）平滑，避免數字跳動
+    太劇烈；只在 `0<dt<0.5s`（連續拖曳中的相鄰兩幀）才計入平均，跳過分頁剛切換或閒置很久
+    後的第一幀（那種 dt 拉得很長會算出沒意義的極低瞬時值污染平均）。
+  - **顯示**：canvas 右上角綠色文字疊字（`create_text`/`itemconfig` 重用同一個 item，
+    不新建物件，跟 image blit 同樣的「重用不重建」原則），格式 `"NN FPS"`；image item
+    因視窗尺寸改變而重建時（`_vtk_render_to_canvas` 的尺寸分支）一併重置 `_vtk_fps_item`
+    確保疊字仍在最上層（`tag_raise`）。
+  - 驗證：模擬拖曳序列，`_vtk_fps_item` 正確建立、文字隨拖曳更新（如 `"30 FPS"`），
+    `py_compile` 通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：修「一開啟就超當」——`import vtk` 延後到第一次切到 3D 分頁**
+  - **症狀**：使用者回報整個 App **一打開就凍結**，懷疑是「同時開三張 3D 比對圖」造成。
+  - **診斷（`cProfile` 實測排除比對模式）**：`_vtk_draw()` 三格比對模式（128×128 資料）
+    僅耗時 ~40ms，**不是根因**。真正問題是 `launch_gui()` 開頭在 App 視窗都還沒顯示前就
+    同步執行 `import vtk`——`vtk.py` 相容殼一次載入全部 ~150 個 `vtkmodules` 原生 `.pyd`，
+    實測 `import vtk` 單獨要 **~0.9~1.0 秒**（若是這台機器上該 VTK 安裝第一次被觸碰，
+    Windows Defender 對新 DLL 的即時掃描還可能讓這個數字暴衝到數秒）；加上首次建立
+    `vtkRenderWindow`／`Render()` 的 OpenGL context/shader 初始化再 ~0.4~0.5 秒。這筆
+    1.3～數秒的成本全部發生在 `App.__init__`（`_build_ui()`）同步執行期間，Tk 視窗在此
+    之前完全不會出現、出現後也不會回應——Windows 對「長時間沒回應的視窗」顯示凍結狀態，
+    正是使用者看到的「一打開就超當」，跟同時渲染幾張 3D 圖無關。
+  - **修正**：`launch_gui()` 開頭改用零成本的 `importlib.util.find_spec('vtk')`
+    （只查套件是否存在、不執行任何程式碼，實測 0.000s）決定要不要建 VTK 版分頁 UI；
+    `vtk`/`vnp`/`Image`/`ImageTk` 先綁 `None`，真正的 `import vtk` 延後到
+    **`_vtk_ensure_loaded()`**——只在使用者第一次切到「3D 還原」分頁時才呼叫
+    （`_draw_3d()` 開頭觸發），內部用 `nonlocal` 把匯入結果回填給 `launch_gui` 的區域變數
+    （App 的方法本就透過閉包讀取這些變數，之前各處 `vtk.X`／`vnp.X` 呼叫完全不用改）。
+    呼叫匯入前先在畫布上畫「正在啟動 GPU 3D 渲染引擎（首次約 1~2 秒）…」提示文字並
+    `update_idletasks()` 強制先畫出來，使用者才不會以為畫面卡死；載入失敗（罕見：
+    `find_spec` 找到但實際 import 失敗，如安裝損毀）則顯示錯誤文字，不嘗試動態切換回
+    matplotlib（tab3 當初沒建那組 widget）也不讓整個 App 崩潰。`__init__` 的頁3 setup
+    現在只建純 Tkinter `Canvas` + 事件綁定（快），`self._vtk_rw`/`self._vtk_shared_cam`
+    等重物件延後到 `_vtk_ensure_loaded()` 才建立。
+  - 驗證：`py_compile` 通過；端到端量測——`App()` 建構時間從 ~2.3 秒降到 **~1.0 秒**
+    （`import vtk` 不再卡在啟動路徑上）；第一次切到 3D 分頁觸發 lazy import（該次會有
+    一次性停頓，畫布會先顯示「正在啟動」提示）；第二次切回同一分頁只需 **0.009 秒**
+    （`sys.modules` 快取，之後每次都快）；三種模式（單張/比對）渲染皆正常、無例外。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：修 VTK 3D 拖曳仍卡頓/當機——重用 PhotoImage + 節流渲染**
+  - **症狀**：改用 VTK off-screen render + Canvas blit 後（見下一條），使用者回報拖曳旋轉
+    「還是超當」。已用 `rw.ReportCapabilities()` 確認走的是真實 NVIDIA GPU（非軟體渲染 fallback），
+    排除硬體加速沒生效的可能。
+  - **根因**：`_vtk_render_to_canvas()` 舊版**每一幀**（每個 `<B1-Motion>` 滑鼠事件）都
+    `vtk.vtkWindowToImageFilter()` 建新物件、`ImageTk.PhotoImage(...)` 建新 Tcl photo image、
+    `canvas.delete('all')`+`create_image()` 建新 canvas item。快速拖曳時 Tk 每秒可能觸發
+    數十次 motion 事件，大量新建的 Tcl 端影像物件來不及被回收，記憶體/物件數持續累積，
+    越拖越頓、最終疑似當機。
+  - **修正**：
+    1. `_vtk_w2i`／`_vtk_photo`／`_vtk_img_item` 改為**重用**（`__init__` 建一次）；
+       `_vtk_render_to_canvas()` 用 `w2i.Modified()+Update()` 重新讀取畫面（不新建 filter），
+       用 `PhotoImage.paste(pil)` **原地更新像素**（不新建 Tcl photo image），只有 canvas
+       尺寸真的改變時才重建 image item。
+    2. 新增 `_vtk_request_render()` 節流：拖曳/縮放/`<Configure>` 觸發的重繪一律走這個
+       入口，用 `_vtk_render_pending` 旗標 + `self.after_idle()` 合併——同一個 idle 週期內
+       多次觸發只會實際渲染一次，避免事件佇列塞滿大量「GPU 讀回＋像素搬移」拖垮畫面。
+       `_vtk_on_drag`／`_vtk_on_wheel`／`_vtk_on_resize`／`_vtk_apply_z`（Z 滑桿）都改呼叫
+       這個入口，直接呼叫 `_vtk_render_to_canvas()` 的只剩 `_vtk_draw()`（換資料/換模式時的
+       一次性完整重繪，不需節流）。
+  - 驗證：模擬 200 次連續 `<B1-Motion>` 拖曳事件（每次都 `self.update()` 強制處理），
+    canvas 上的 image item 數量全程維持 1（無累積）、200 次事件耗時 2.9s（14.5ms/次，
+    含測試腳本本身強制 `update()` 的開銷，實際使用中經節流合併會更快）；另外用
+    `vtkWindowToImageFilter` 直接比對拖曳前後像素陣列，確認畫面仍正確跟著旋轉更新
+    （非卡死不動的假流暢）。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：探針 R/θ 預設值改為 R=8nm、θ=20°**
+  - **需求**：GUI 側欄探針參數預設 R=2.0nm/θ=25°，使用者要求改成更貼近實際探針規格的
+    R=8nm/θ=20°。`self.var_R` 初始值 `'2.0'`→`'8.0'`、`self.var_th` 初始值 `'25'`→`'20'`；
+    非對稱模式 θx/θy 欄位（僅勾選「非對稱探針」時使用）未動。
+  - 驗證：`py_compile` 通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：3D 分頁改用 VTK GPU 渲染，修正拖曳旋轉卡頓**
+  - **需求**：matplotlib `mplot3d`（Agg 後端）純 CPU 光柵化，拖曳旋轉時要整張重新 rasterize，
+    比對模式一次三張表面更明顯卡頓；使用者要求能否用 GPU 顯示。
+  - **技術路線確認（實測排除）**：官方 PyPI `vtk` wheel **不含 `vtkRenderingTk` 原生模組**，
+    `vtkTkRenderWindowInteractor` 直接嵌入 Tkinter 會拋
+    `couldn't load library "vtkRenderingTk.dll"`（已用最小重現腳本確認，非本機環境問題）。
+    改採 **off-screen `vtkRenderWindow` 渲染 → `vtkWindowToImageFilter` 讀回像素 → PIL/Tkinter
+    Canvas blit**：仍是硬體 OpenGL 光柵化（GPU），旋轉只搬動 `vtkCamera` 後重新 `Render()`
+    一次（不重建幾何），CPU 端只做像素陣列搬移，經實測（off-screen sphere render + 兩視圖共用
+    相機 azimuth/elevation 後像素差異驗證）可行。
+  - **`launch_gui()` 頂部**新增 `try: import vtk/numpy_support/PIL.Image,ImageTk` 偵測
+    `HAS_VTK`；無 vtk 套件時自動退回原 matplotlib 路徑（零額外依賴、較卡但保證能跑）。
+  - **頁3 UI**：`HAS_VTK` 時建立 `self.vtk_canvas`（`tk.Canvas`，非 `vtkTkRenderWindowInteractor`）
+    + off-screen `self._vtk_rw`（`vtkRenderWindow`，`SetOffScreenRendering(1)`）+
+    `self._vtk_shared_cam`（多視圖共用同一顆 `vtkCamera`→拖曳一次全部視圖同步旋轉，
+    比對模式三個 viewport 皆套用）。滑鼠事件手動綁定（無 `vtkRenderWindowInteractor`）：
+    `<ButtonPress/B1-Motion/ButtonRelease-1>` 用 `camera.Azimuth/Elevation` 模擬 trackball、
+    `<MouseWheel>` 用 `camera.Zoom`、`<Configure>` 視窗改變時重繪。
+  - **`_vtk_surface_actor()`**：`vtkStructuredGrid`（規則網格，維度=取樣後 cols×rows×1）+
+    `numpy_to_vtk` 直接餵點座標／純量（避免 Python 迴圈逐點插入），色階用 `_vtk_lut()`
+    從 matplotlib colormap（`afmhot`/`RdBu_r`）取樣 256 階建 `vtkLookupTable`，與既有
+    matplotlib 圖表色階視覺一致。
+  - **前後比對三格差值視覺一致化**：差值 Z 範圍遠小於原始表面（`zspan/(2·dmax)`），
+    `_vtk_add_view(..., zboost=...)` 對差值 actor 額外乘一個縮放係數，讓三格視覺高度相近；
+    `_vtk_apply_z()`（Z 高度比例滑桿）重繪時同步套用每個 actor 各自的 `zboost`
+    （`self._vtk_actor_boosts` 與 `_vtk_actors` 平行陣列）。相機只在最後對第一個 renderer
+    呼叫一次 `ResetCamera()`（共用相機被多次呼叫會互相覆蓋，故只呼叫一次）。
+  - **`requirements.txt`** 新增 `vtk`（選用；缺此套件時自動退回 matplotlib，不影響其他功能）。
+  - 驗證：`py_compile` 通過；以 monkeypatch `Tk.mainloop` 驅動真實 `App` 做端到端煙霧測試——
+    (1) VTK 路徑：recon/image/both 三種模式渲染、拖曳旋轉（相機 azimuth/elevation 改變）、
+    Z 滑桿、無資料時顯示提示，全部無例外；(2) 強制 `import vtk` 失敗模擬無此套件環境，
+    確認自動退回 matplotlib 路徑三種模式皆正常渲染。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：3D「前後比對」新增第三張差值圖（影像−還原）**
+  - **需求**：接續前一筆前後比對，使用者要能直接看「兩者相減」的差異，不用自己心算兩張圖的落差。
+  - **`_draw_3d_compare()` 改 121/122 → 131/132/133**：新增 `ax_d`，`zd = zi[:h,:w] - zr[:h,:w]`
+    （裁到共同 shape，避免降取樣邊界不一致時相減出錯）；用發散色階 `RdBu_r`、`vmin/vmax=±dmax`
+    （`dmax` 取差值絕對值最大者）置中於 0，正值＝探針撐寬/變淺量、負值理論上不應出現
+    （erosion 保證 `recon≤image`，若出現代表數值/取樣誤差）。`ax_d.set_zlim(-dmax, dmax)`
+    對稱顯示，與 detect.py `visualize_results()` 既有「RdBu_r 差值圖」慣例一致。
+  - 驗證：`py_compile` 通過。
+
+- **2026-07-15 — `zerotrain/blind_deconvolution.py`：3D 分頁新增「前後比對」（輸入影像／還原表面並排同尺度）**
+  - **需求**：3D 分頁原本一次只能單看「還原表面」或「輸入影像」其中一個，看不到去卷積前後差異。
+  - **`_draw_3d_compare()`**：新增 radio 選項「前後比對」（`var_3dsrc='both'`）。`fig3` 切成
+    左右兩個 3D 子圖（`121`/`122`），分別畫輸入影像與還原表面；**共用同一組 Z 範圍**
+    （`zmin/zmax` 取兩者聯集並各自 `set_zlim`），避免各自 auto-scale 讓「變淺/變窄」的視覺差異
+    被掩蓋，與 Section 頁「共用色階」的既有原則一致。
+  - **重構**：`_3d_sample()` 抽出降取樣＋座標網格產生（原單圖與比對模式共用）；`_draw_3d()`
+    改為 `fig3.clear()` 後依模式呼叫單圖或 `_draw_3d_compare()`；`self.ax3` 只在單圖模式賦值，
+    新增 `self._3d_axes`（目前圖上所有 3D 軸列表）供 `_apply_3d_z()` 套用 Z 高度比例滑桿到
+    全部子圖（比對模式兩張都跟著滑桿旋轉出的縱向誇張同步變化）。`_on_tab_change`/`_draw_3d`
+    的重繪快取 key 比對模式改記 `(image id, recon id)` 雙 id，任一變動才重畫。
+  - 驗證：`py_compile` 通過；無資料時比對模式顯示「尚無資料」提示、不崩潰。
 
 - **2026-07-15 — `zerotrain/blind_deconvolution.py`：垂直壁真實寬左右邊界點加到左側掃描影像**
   - **需求**：Section 剖面右側已用綠色菱形標出垂直壁真實寬的左右邊界，左側掃描影像上沒有對應標記。

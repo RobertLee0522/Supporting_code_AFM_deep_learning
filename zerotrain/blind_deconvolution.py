@@ -561,6 +561,27 @@ def launch_gui():
     from matplotlib.figure import Figure
     from mpl_toolkits.mplot3d import Axes3D            # noqa: F401 (註冊 3d 投影)
 
+    # 3D 分頁優先用 VTK（硬體 OpenGL GPU 渲染，經 off-screen render window
+    # 產生畫面後 blit 進 Tkinter Canvas；旋轉只需重繪相機，不重算幾何，不卡頓）。
+    # 注意：官方 PyPI `vtk` wheel 不含 vtkRenderingTk 原生模組
+    # （`vtkTkRenderWindowInteractor` 會因缺少 vtkRenderingTk.dll 而載入失敗，已實測確認），
+    # 故不採用該原生 Tk widget，改用「off-screen render + WindowToImageFilter 轉
+    # numpy/PIL + Canvas blit」，純 Python/Pillow 即可運作，仍是硬體 GPU 渲染。
+    # 無 vtk 套件的環境自動退回 matplotlib mplot3d（純 CPU，較卡但零額外依賴）。
+    #
+    # [FIX] `import vtk` 是重量級匯入（cProfile 實測 ~0.8s：`vtk.py` 相容殼會一次載入
+    # 全部 ~150 個 vtkmodules 原生 .pyd）、加上首次 vtkRenderWindow 建立/Render()（OpenGL
+    # context+shader 初始化）再 ~0.4-0.5s，若放在 App 啟動時同步做，整個視窗會被卡住
+    # 1.3~2.3 秒沒有回應——正是使用者回報「一打開就超當」的根因（Windows 對「沒回應超過
+    # 一定時間」的視窗會顯示凍結狀態），跟同時開幾張 3D 圖無關（3 張圖疊加渲染實測僅
+    # 多花 ~40ms，見 CLAUDE.md 2026-07-15 條目）。改為「啟動時只用 `importlib.util.find_spec`
+    # 做零成本的套件存在性檢查」決定要不要建 VTK 版分頁 UI，實際 `import vtk` 延後到使用者
+    # 第一次切到「3D 還原」分頁時才做（`_vtk_ensure_loaded()`），並先在畫布上顯示「正在啟動」
+    # 提示，讓那一次性的短暫停頓看得出原因、且不擋住主視窗開啟。
+    import importlib.util
+    HAS_VTK = importlib.util.find_spec('vtk') is not None
+    vtk = vnp = Image = ImageTk = None   # 實際模組在 _vtk_ensure_loaded() 才綁定
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -644,7 +665,7 @@ def launch_gui():
             cone = ttk.Frame(s3); cone.pack(fill='x', padx=(14, 0), pady=2)
             r1 = ttk.Frame(cone); r1.pack(fill='x')
             ttk.Label(r1, text='球冠半徑 R = ').pack(side='left')
-            self.var_R = tk.StringVar(value='2.0')
+            self.var_R = tk.StringVar(value='8.0')
             self.e_R = ttk.Entry(r1, textvariable=self.var_R, width=7)
             self.e_R.pack(side='left'); ttk.Label(r1, text=' nm').pack(side='left')
 
@@ -668,7 +689,7 @@ def launch_gui():
 
             r3 = ttk.Frame(cone); r3.pack(fill='x')
             ttk.Label(r3, text='半錐角 θ = ').pack(side='left')
-            self.var_th = tk.StringVar(value='25')
+            self.var_th = tk.StringVar(value='20')
             self.e_th = ttk.Entry(r3, textvariable=self.var_th, width=7)
             self.e_th.pack(side='left'); ttk.Label(r3, text=' °（對稱）').pack(side='left')
 
@@ -784,20 +805,67 @@ def launch_gui():
             ttk.Radiobutton(top3, text='輸入影像', value='image',
                             variable=self.var_3dsrc,
                             command=self._draw_3d).pack(side='left')
+            ttk.Radiobutton(top3, text='前後比對', value='both',
+                            variable=self.var_3dsrc,
+                            command=self._draw_3d).pack(side='left')
             ttk.Button(top3, text='⟳ 重繪 3D',
                        command=self._draw_3d).pack(side='left', padx=6)
+            ttk.Button(top3, text='⌂ 重置視角',
+                       command=lambda: self._vtk_reset_view()).pack(side='left')
             ttk.Label(top3, text='  Z 高度比例').pack(side='left')
             self.var_3dz = tk.DoubleVar(value=0.6)
             tk.Scale(top3, from_=0.1, to=3.0, resolution=0.05,
                      orient='horizontal', variable=self.var_3dz, length=150,
                      command=self._apply_3d_z, showvalue=True).pack(side='left')
-            ttk.Label(top3, text='（拖曳旋轉；滑桿調 Z 軸高度）',
+            engine = 'VTK/GPU' if HAS_VTK else 'matplotlib/CPU（未裝 vtk，較卡）'
+            ttk.Label(top3,
+                      text=f'（拖曳旋轉；滑桿調 Z 軸高度；前後比對＝影像/還原/差值三張並排同尺度；繪圖引擎：{engine}）',
                       foreground='#888').pack(side='left')
-            self.fig3 = Figure(figsize=(8, 6))
-            self.ax3 = self.fig3.add_subplot(111, projection='3d')
-            self.canvas3 = FigureCanvasTkAgg(self.fig3, master=tab3)
-            self.canvas3.get_tk_widget().pack(fill='both', expand=True)
-            self._3d_drawn_for = None          # 記錄已繪的 (來源, recon物件id)
+            self.has_vtk = HAS_VTK
+            if HAS_VTK:
+                # VTK 路徑：off-screen GPU 渲染 + blit 到 Canvas；拖曳只轉相機、
+                # 不重算幾何（_vtk_render_to_canvas 才重繪畫面）→ 不卡頓。
+                # 這裡只建純 Tkinter widget（快）；真正 `import vtk` + 建立
+                # vtkRenderWindow（慢，~1~2秒）延後到第一次切到本分頁時才做
+                # （見 _vtk_ensure_loaded），避免拖慢 App 啟動、卡住主視窗。
+                self.vtk_canvas = tk.Canvas(tab3, bg='#15151a',
+                                            highlightthickness=0)
+                self.vtk_canvas.pack(fill='both', expand=True)
+                self.vtk_canvas.create_text(
+                    10, 10, anchor='nw', fill='#888', tags='placeholder',
+                    text='（切到本分頁時才初始化 GPU 渲染引擎）')
+                self._vtk_loaded = False    # import vtk + 建 render window 是否已完成
+                self._vtk_photo = None      # 目前顯示中的 PhotoImage（重用，paste() 原地更新）
+                self._vtk_img_item = None   # canvas 上的 image item id（重用，不重建）
+                self._vtk_w2i = None        # vtkWindowToImageFilter（重用）
+                self._vtk_render_pending = False  # 節流旗標，見 _vtk_request_render
+                self._vtk_rw = None
+                self._vtk_shared_cam = None  # 多視圖共用同一相機→同步旋轉（載入後才建立）
+                self._vtk_renderers = []
+                self._vtk_actors = []
+                self._vtk_actor_boosts = []
+                self._vtk_drawn_for = None
+                self._vtk_drag = None
+                self._vtk_fps_item = None   # FPS 疊字 canvas item（重用）
+                self._vtk_fps_ema = None    # 指數移動平均 FPS（平滑數字，不要跳太快）
+                self._vtk_last_frame_t = None
+                self._vtk_cam_initialized = False  # 相機是否已框過資料一次
+                                                     # （之後重繪/換頁/換模式都保留使用者視角，
+                                                     # 不要每次都 ResetCamera 重置）
+                self._vtk_center = None     # 物體中心（旋轉樞紐），render 時由 bounds 更新
+                self.vtk_canvas.bind('<ButtonPress-1>', self._vtk_on_press)
+                self.vtk_canvas.bind('<B1-Motion>', self._vtk_on_drag)
+                self.vtk_canvas.bind('<ButtonRelease-1>', self._vtk_on_release)
+                self.vtk_canvas.bind('<MouseWheel>', self._vtk_on_wheel)
+                self.vtk_canvas.bind('<Configure>', self._vtk_on_resize)
+            else:
+                # 退回 matplotlib（純 CPU，見 _draw_3d 系列）
+                self.fig3 = Figure(figsize=(8, 6))
+                self.ax3 = self.fig3.add_subplot(111, projection='3d')
+                self._3d_axes = [self.ax3]     # 目前圖上所有 3D 軸（比對模式為兩個）
+                self.canvas3 = FigureCanvasTkAgg(self.fig3, master=tab3)
+                self.canvas3.get_tk_widget().pack(fill='both', expand=True)
+                self._3d_drawn_for = None      # 記錄已繪的 (來源, recon物件id)
             self.nb.bind('<<NotebookTabChanged>>', self._on_tab_change)
             # 探針 R/θ/尺度/樣品變動時，若「自動」開啟則重算視窗半徑
             for v in (self.var_R, self.var_th, self.var_thx, self.var_thy,
@@ -1648,22 +1716,23 @@ def launch_gui():
             self.tbl.tag_configure('vw', foreground='#1a7a4a')
 
         # ── 頁3：3D 表面（切到該頁才繪，避免拖慢其他頁）────────
+        def _3d_key(self):
+            src = self.var_3dsrc.get()
+            if src == 'both':
+                return (src, id(self.image), id(self.recon))
+            return (src, id(self.recon) if src == 'recon' else id(self.image))
+
         def _on_tab_change(self, _evt=None):
             if self.nb.index('current') == 2:            # 第3頁 = 3D
-                key = (self.var_3dsrc.get(),
-                       id(self.recon) if self.var_3dsrc.get() == 'recon'
-                       else id(self.image))
-                if key != self._3d_drawn_for:            # 資料沒變就不重畫
+                key = self._3d_key()
+                drawn = self._vtk_drawn_for if self.has_vtk else self._3d_drawn_for
+                if key != drawn:                          # 資料沒變就不重畫
                     self._draw_3d()
 
-        def _draw_3d(self):
-            surf = self.recon if self.var_3dsrc.get() == 'recon' else self.image
-            self.ax3.clear()
-            if surf is None:
-                self.ax3.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
-                self.canvas3.draw(); return
+        def _3d_sample(self, surf):
+            """降取樣供旋轉流暢，回傳 (X, Y, z)（nm 座標）。"""
             H, W = surf.shape
-            step = max(1, max(H, W) // 90)               # 降取樣到 ~90 供旋轉流暢
+            step = max(1, max(H, W) // 90)
             z = np.asarray(surf[::step, ::step], dtype=float)
             try:
                 px = _fnum(self.var_px.get())
@@ -1672,32 +1741,502 @@ def launch_gui():
             xs = np.arange(z.shape[1]) * step * px
             ys = np.arange(z.shape[0]) * step * px
             X, Y = np.meshgrid(xs, ys)
-            self.ax3.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
-                                  antialiased=False,
-                                  rcount=z.shape[0], ccount=z.shape[1])
-            lab = '還原表面' if self.var_3dsrc.get() == 'recon' else '輸入影像'
-            self.ax3.set_title(f'{lab} 3D（{z.shape[1]}×{z.shape[0]} 取樣；拖曳旋轉）',
-                               fontsize=10)
-            self.ax3.set_xlabel('X (nm)'); self.ax3.set_ylabel('Y (nm)')
-            self.ax3.set_zlabel('Z (nm)')
-            try:
-                self.ax3.set_box_aspect((1, 1, float(self.var_3dz.get())))
-            except Exception:
-                pass
+            return X, Y, z
+
+        def _draw_3d(self):
+            if self.has_vtk:
+                if not self._vtk_loaded and not self._vtk_ensure_loaded():
+                    # 罕見情況：find_spec 找到套件但實際 import 失敗（例如安裝損毀）。
+                    # 不嘗試動態切換回 matplotlib（tab3 當初沒建那組 widget），
+                    # 只在畫布顯示錯誤，避免整個 App 崩潰。
+                    self.vtk_canvas.delete('all')
+                    self.vtk_canvas.create_text(
+                        10, 10, anchor='nw', fill='#e07a7a',
+                        text='VTK 載入失敗，3D 顯示無法使用（詳見終端機錯誤訊息）')
+                    return
+                self._vtk_draw()
+                return
+            src = self.var_3dsrc.get()
+            self.fig3.clear()
+            if src == 'both':
+                self._draw_3d_compare()
+            else:
+                surf = self.recon if src == 'recon' else self.image
+                self.ax3 = self.fig3.add_subplot(111, projection='3d')
+                self._3d_axes = [self.ax3]
+                if surf is None:
+                    self.ax3.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
+                    self.canvas3.draw(); return
+                X, Y, z = self._3d_sample(surf)
+                self.ax3.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
+                                      antialiased=False,
+                                      rcount=z.shape[0], ccount=z.shape[1])
+                lab = '還原表面' if src == 'recon' else '輸入影像'
+                self.ax3.set_title(
+                    f'{lab} 3D（{z.shape[1]}×{z.shape[0]} 取樣；拖曳旋轉）',
+                    fontsize=10)
+                self.ax3.set_xlabel('X (nm)'); self.ax3.set_ylabel('Y (nm)')
+                self.ax3.set_zlabel('Z (nm)')
+            self._apply_3d_z()
             self.canvas3.draw()
-            self._3d_drawn_for = (self.var_3dsrc.get(),
-                                  id(self.recon) if self.var_3dsrc.get() == 'recon'
-                                  else id(self.image))
+            if src == 'both':
+                self._3d_drawn_for = (src, id(self.image), id(self.recon))
+            else:
+                self._3d_drawn_for = (src,
+                                      id(self.recon) if src == 'recon'
+                                      else id(self.image))
+
+        def _draw_3d_compare(self):
+            """前後比對：影像／還原／差值(影像−還原) 並排 3D，方便對照撐寬/變淺量。"""
+            if self.image is None or self.recon is None:
+                ax = self.fig3.add_subplot(111, projection='3d')
+                ax.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
+                self._3d_axes = [ax]
+                return
+            ax_i = self.fig3.add_subplot(131, projection='3d')
+            ax_r = self.fig3.add_subplot(132, projection='3d')
+            ax_d = self.fig3.add_subplot(133, projection='3d')
+            self._3d_axes = [ax_i, ax_r, ax_d]
+            Xi, Yi, zi = self._3d_sample(self.image)
+            Xr, Yr, zr = self._3d_sample(self.recon)
+            zmin = min(zi.min(), zr.min())
+            zmax = max(zi.max(), zr.max())
+            for ax, X, Y, z, lab in ((ax_i, Xi, Yi, zi, '輸入影像'),
+                                      (ax_r, Xr, Yr, zr, '還原表面')):
+                ax.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
+                                antialiased=False,
+                                rcount=z.shape[0], ccount=z.shape[1],
+                                vmin=zmin, vmax=zmax)
+                ax.set_zlim(zmin, zmax)             # 同一 Z 範圍，撐寬/變淺一眼可比
+                ax.set_title(f'{lab}（{z.shape[1]}×{z.shape[0]} 取樣）', fontsize=10)
+                ax.set_xlabel('X (nm)'); ax.set_ylabel('Y (nm)')
+                ax.set_zlabel('Z (nm)')
+            # 差值圖：影像 − 還原（正值＝探針造成的撐寬/變淺量）；兩者取樣格點一致
+            # （同一表面 shape 降取樣，步長相同）才能逐點相減。
+            h = min(zi.shape[0], zr.shape[0]); w = min(zi.shape[1], zr.shape[1])
+            zd = zi[:h, :w] - zr[:h, :w]
+            dmax = max(abs(zd.min()), abs(zd.max()), 1e-9)
+            ax_d.plot_surface(Xi[:h, :w], Yi[:h, :w], zd, cmap='RdBu_r',
+                              linewidth=0, antialiased=False,
+                              rcount=h, ccount=w, vmin=-dmax, vmax=dmax)
+            ax_d.set_zlim(-dmax, dmax)
+            ax_d.set_title(f'差值（影像−還原）（{w}×{h} 取樣）', fontsize=10)
+            ax_d.set_xlabel('X (nm)'); ax_d.set_ylabel('Y (nm)')
+            ax_d.set_zlabel('ΔZ (nm)')
 
         def _apply_3d_z(self, *_):
-            """只調 Z 軸高度比例（不重算表面），保持滑桿拖曳流暢。"""
-            if getattr(self, 'ax3', None) is None or self._3d_drawn_for is None:
+            """只調 Z 軸高度比例（不重算表面），保持滑桿拖曳流暢；套用到所有目前的 3D 軸。"""
+            if self.has_vtk:
+                self._vtk_apply_z()
+                return
+            axes = getattr(self, '_3d_axes', None)
+            if not axes:
                 return
             try:
-                self.ax3.set_box_aspect((1, 1, float(self.var_3dz.get())))
+                zr = float(self.var_3dz.get())
+                for ax in axes:
+                    ax.set_box_aspect((1, 1, zr))
                 self.canvas3.draw_idle()
             except Exception:
                 pass
+
+        # ── VTK（GPU/OpenGL）3D 渲染路徑 ──────────────────────────────
+        # 官方 PyPI vtk wheel 不含 vtkRenderingTk 原生模組，無法用
+        # vtkTkRenderWindowInteractor 直接嵌入 Tkinter（實測會拋
+        # 「couldn't load library vtkRenderingTk.dll」）。改用
+        # off-screen vtkRenderWindow 渲染 → vtkWindowToImageFilter 讀回像素
+        # → PIL/Canvas blit；旋轉只搬動 vtkCamera + 重新 Render()一次
+        # （硬體 GPU 光柵化，不重建幾何），比 matplotlib 逐頂點 CPU 重算快很多。
+        def _vtk_ensure_loaded(self):
+            """第一次切到 3D 分頁才真正 `import vtk` + 建 render window（各 ~0.5~1秒），
+            避免這筆一次性成本卡在 App 啟動時（見 launch_gui 開頭 [FIX] 說明）。
+            回傳是否成功；成功後 self._vtk_loaded=True，之後呼叫直接跳過。"""
+            nonlocal vtk, vnp, Image, ImageTk
+            if self._vtk_loaded:
+                return True
+            self.vtk_canvas.delete('all')
+            self.vtk_canvas.create_text(
+                10, 10, anchor='nw', fill='#aaa',
+                text='正在啟動 GPU 3D 渲染引擎（首次約 1~2 秒）…')
+            self.update_idletasks()           # 先讓提示文字真的畫出來，再進行阻塞式匯入
+            try:
+                import vtk as _vtk
+                from vtk.util import numpy_support as _vnp
+                from PIL import Image as _Image, ImageTk as _ImageTk
+            except Exception as e:
+                self._log(f'⚠ VTK 載入失敗，3D 顯示無法使用：{e}')
+                self.has_vtk = False
+                return False
+            vtk, vnp, Image, ImageTk = _vtk, _vnp, _Image, _ImageTk
+            self._vtk_rw = vtk.vtkRenderWindow()
+            self._vtk_rw.SetOffScreenRendering(1)
+            self._vtk_rw.SetMultiSamples(0)
+            self._vtk_shared_cam = vtk.vtkCamera()
+            self._vtk_loaded = True
+            return True
+
+        def _vtk_lut(self, cmap_name, vmin, vmax, n=256):
+            lut = vtk.vtkLookupTable()
+            lut.SetNumberOfTableValues(n)
+            cmap = plt.get_cmap(cmap_name)
+            for i in range(n):
+                r, g, b, a = cmap(i / (n - 1))
+                lut.SetTableValue(i, r, g, b, a)
+            lut.SetRange(vmin, vmax)
+            lut.Build()
+            return lut
+
+        def _vtk_surface_actor(self, X, Y, z, cmap_name, vmin, vmax):
+            rows, cols = z.shape
+            pts = np.stack([X.ravel(), Y.ravel(), z.ravel()], axis=1).astype(np.float64)
+            vtk_pts = vtk.vtkPoints()
+            vtk_pts.SetData(vnp.numpy_to_vtk(pts, deep=True))
+            grid = vtk.vtkStructuredGrid()
+            grid.SetDimensions(cols, rows, 1)
+            grid.SetPoints(vtk_pts)
+            scalars = vnp.numpy_to_vtk(z.ravel().astype(np.float64), deep=True)
+            grid.GetPointData().SetScalars(scalars)
+
+            mapper = vtk.vtkDataSetMapper()
+            mapper.SetInputData(grid)
+            mapper.SetScalarRange(vmin, vmax)
+            mapper.SetLookupTable(self._vtk_lut(cmap_name, vmin, vmax))
+            mapper.SetScalarModeToUsePointData()
+
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetInterpolationToGouraud()
+            return actor
+
+        def _vtk_clear(self):
+            for r in list(self._vtk_renderers):
+                self._vtk_rw.RemoveRenderer(r)
+            self._vtk_renderers = []
+            self._vtk_actors = []
+            self._vtk_actor_boosts = []
+
+        def _vtk_add_view(self, viewport, X, Y, z, cmap_name, vmin, vmax, title,
+                          zboost=1.0):
+            ren = vtk.vtkRenderer()
+            ren.SetViewport(*viewport)
+            ren.SetBackground(0.08, 0.08, 0.1)
+            actor = self._vtk_surface_actor(X, Y, z, cmap_name, vmin, vmax)
+            try:
+                zr = float(self.var_3dz.get())
+            except (ValueError, tk.TclError):
+                zr = 0.6
+            actor.SetScale(1, 1, zr * zboost)
+            ren.AddActor(actor)
+            txt = vtk.vtkTextActor()
+            txt.SetInput(title)
+            txt.GetTextProperty().SetFontSize(14)
+            txt.GetTextProperty().SetColor(1, 1, 1)
+            txt.SetPosition(10, 8)
+            ren.AddActor2D(txt)
+            ren.SetActiveCamera(self._vtk_shared_cam)  # 共用相機→多視圖同步旋轉
+            self._vtk_rw.AddRenderer(ren)
+            self._vtk_renderers.append(ren)
+            self._vtk_actors.append(actor)
+            self._vtk_actor_boosts.append(zboost)
+            return ren
+
+        def _vtk_empty(self, msg='（尚無資料——請先載入並去卷積）'):
+            ren = vtk.vtkRenderer()
+            ren.SetViewport(0.0, 0.0, 1.0, 1.0)
+            ren.SetBackground(0.08, 0.08, 0.1)
+            txt = vtk.vtkTextActor()
+            txt.SetInput(msg)
+            txt.GetTextProperty().SetFontSize(16)
+            txt.GetTextProperty().SetColor(1, 1, 1)
+            txt.SetPosition(20, 300)
+            ren.AddActor2D(txt)
+            self._vtk_rw.AddRenderer(ren)
+            self._vtk_renderers.append(ren)
+
+        def _vtk_draw(self):
+            self._vtk_clear()
+            src = self.var_3dsrc.get()
+            if src == 'both':
+                if self.image is None or self.recon is None:
+                    self._vtk_empty()
+                else:
+                    Xi, Yi, zi = self._3d_sample(self.image)
+                    Xr, Yr, zr = self._3d_sample(self.recon)
+                    zmin = min(zi.min(), zr.min())
+                    zmax = max(zi.max(), zr.max())
+                    zspan = max(zmax - zmin, 1e-9)
+                    self._vtk_add_view((0.0, 0.0, 1/3, 1.0), Xi, Yi, zi,
+                                       'afmhot', zmin, zmax, '輸入影像')
+                    self._vtk_add_view((1/3, 0.0, 2/3, 1.0), Xr, Yr, zr,
+                                       'afmhot', zmin, zmax, '還原表面')
+                    h = min(zi.shape[0], zr.shape[0])
+                    w = min(zi.shape[1], zr.shape[1])
+                    zd = zi[:h, :w] - zr[:h, :w]
+                    dmax = max(abs(zd.min()), abs(zd.max()), 1e-9)
+                    # 差值絕對量遠小於原始 Z 範圍，額外放大顯示比例讓三張圖視覺高度相近
+                    self._vtk_add_view((2/3, 0.0, 1.0, 1.0), Xi[:h, :w], Yi[:h, :w],
+                                       zd, 'RdBu_r', -dmax, dmax, '差值（影像−還原）',
+                                       zboost=zspan / (2 * dmax))
+                    # 只在最後對「輸入影像」那格 ResetCamera（相機共用，呼叫者的
+                    # 視角會套用到全部視圖；三格 X/Y/Z 範圍已對齊，框一次即可）。
+                    if not self._vtk_cam_initialized:
+                        self._vtk_renderers[0].ResetCamera()
+            else:
+                surf = self.recon if src == 'recon' else self.image
+                if surf is None:
+                    self._vtk_empty()
+                else:
+                    X, Y, z = self._3d_sample(surf)
+                    lab = '還原表面' if src == 'recon' else '輸入影像'
+                    self._vtk_add_view((0.0, 0.0, 1.0, 1.0), X, Y, z,
+                                       'afmhot', float(z.min()), float(z.max()), lab)
+                    if not self._vtk_cam_initialized:
+                        self._vtk_renderers[0].ResetCamera()
+            if self._vtk_actors:
+                # 只在真的畫出幾何時才標記「已初始化」——無資料時的空白提示畫面
+                # 不算數，否則之後真的有資料了會因為旗標已 True 而永遠不 ResetCamera。
+                self._vtk_cam_initialized = True   # 之後重繪／換頁／換模式都保留使用者視角
+            self._vtk_render_to_canvas()
+            self._vtk_drawn_for = self._3d_key()
+
+        def _vtk_reset_view(self):
+            """手動重置視角（框住目前資料），供使用者迷失方向時使用。"""
+            self._vtk_cam_initialized = False
+            self._draw_3d()      # 走 _draw_3d 而非直接呼叫 _vtk_draw，確保尚未
+                                  # lazy-load 時（HAS_VTK 但 _vtk_loaded=False）安全
+
+        def _vtk_apply_z(self, *_):
+            """Z 高度比例：只對 actor 做 GPU 端縮放變換，不重建幾何，拖曳滑桿極流暢。"""
+            actors = getattr(self, '_vtk_actors', None)
+            if not actors:
+                return
+            try:
+                zr = float(self.var_3dz.get())
+                for actor, boost in zip(actors, self._vtk_actor_boosts):
+                    actor.SetScale(1, 1, zr * boost)
+                self._vtk_request_render()
+            except Exception:
+                pass
+
+        def _vtk_fix_clip(self):
+            """依目前相機位置重算近/遠裁切面（near/far clipping range）。
+            指向性縮放（dolly）把相機位置往物體推近後，若不更新裁切面，物體會落到
+            near/far 之外被裁掉 → 畫面整片消失（使用者回報「放大時畫面會消失」的根因）。
+            多視圖共用同一顆相機，取所有 viewport 可見物件的聯集 bounds 一次設定，
+            確保三格的幾何都在裁切範圍內。"""
+            b = None
+            for ren in self._vtk_renderers:
+                rb = ren.ComputeVisiblePropBounds()   # (xmin,xmax,ymin,ymax,zmin,zmax)
+                if rb[0] > rb[1]:                     # 空 renderer（無可見物件）
+                    continue
+                if b is None:
+                    b = list(rb)
+                else:
+                    for i in (0, 2, 4):
+                        b[i] = min(b[i], rb[i])
+                    for i in (1, 3, 5):
+                        b[i] = max(b[i], rb[i])
+            if b is not None:
+                self._vtk_renderers[0].ResetCameraClippingRange(*b)
+                # 物體中心（旋轉樞紐）：讓「調整角度」永遠繞著物體轉，不會因指向性縮放
+                # 讓焦點飄移後、旋轉時把物體甩出畫面（使用者回報「調角度畫面消失」的根因）。
+                self._vtk_center = np.array([(b[0] + b[1]) / 2,
+                                             (b[2] + b[3]) / 2,
+                                             (b[4] + b[5]) / 2])
+
+        @staticmethod
+        def _rot_axis(u, deg):
+            """繞單位軸 u 旋轉 deg 度的 3x3 旋轉矩陣（Rodrigues 公式）。"""
+            u = np.asarray(u, dtype=float)
+            n = np.linalg.norm(u)
+            if n < 1e-12:
+                return np.eye(3)
+            u = u / n
+            th = np.radians(deg)
+            c, s = np.cos(th), np.sin(th)
+            ux, uy, uz = u
+            K = np.array([[0, -uz, uy], [uz, 0, -ux], [-uy, ux, 0]])
+            return np.eye(3) * c + s * K + (1 - c) * np.outer(u, u)
+
+        def _vtk_render_to_canvas(self):
+            """Render 一次 off-screen 畫面並 blit 到 Canvas（GPU 光柵化，CPU 只做搬像素）。
+
+            重用同一個 vtkWindowToImageFilter／PhotoImage／canvas image item，改用
+            PhotoImage.paste() 原地更新像素，避免每幀都新建 Tcl photo image 物件——
+            舊版每次都 create_image+新 PhotoImage，快速拖曳時大量物件來不及被
+            Tcl 端釋放，會越拖越頓甚至卡死（使用者回報「還是超當」的根因）。
+            """
+            if not getattr(self, '_vtk_renderers', None):
+                return
+            w = max(int(self.vtk_canvas.winfo_width()), 50)
+            h = max(int(self.vtk_canvas.winfo_height()), 50)
+            if tuple(self._vtk_rw.GetSize()) != (w, h):
+                self._vtk_rw.SetSize(w, h)
+            self._vtk_fix_clip()               # 依目前相機位置重算近/遠裁切面（見下）
+            self._vtk_rw.Render()
+            if self._vtk_w2i is None:
+                self._vtk_w2i = vtk.vtkWindowToImageFilter()
+                self._vtk_w2i.SetInput(self._vtk_rw)
+                self._vtk_w2i.ReadFrontBufferOff()
+            self._vtk_w2i.Modified()           # 標記需要重新讀取（輸入畫面已變）
+            self._vtk_w2i.Update()
+            img = self._vtk_w2i.GetOutput()
+            dw, dh, _ = img.GetDimensions()
+            arr = vnp.vtk_to_numpy(img.GetPointData().GetScalars())
+            arr = arr.reshape(dh, dw, -1)[::-1]        # VTK 影像 Y 軸由下往上
+            pil = Image.fromarray(arr)
+            if self._vtk_photo is None or self._vtk_photo.width() != dw \
+                    or self._vtk_photo.height() != dh:
+                self._vtk_photo = ImageTk.PhotoImage(pil, master=self.vtk_canvas)
+                self.vtk_canvas.delete('all')
+                self._vtk_img_item = self.vtk_canvas.create_image(
+                    0, 0, anchor='nw', image=self._vtk_photo)
+                self._vtk_fps_item = None      # image item 重建了，FPS 疊字也要重建
+            else:
+                self._vtk_photo.paste(pil)     # 原地更新像素，不新建 Tcl 影像物件
+            self._vtk_update_fps(w)
+
+        def _vtk_update_fps(self, canvas_w):
+            """疊字顯示拖曳時的即時 FPS（1/frame-to-frame 時間，EMA 平滑），
+            方便肉眼比對優化前後是否真的變流暢。"""
+            import time as _time
+            now = _time.perf_counter()
+            if self._vtk_last_frame_t is not None:
+                dt = now - self._vtk_last_frame_t
+                # 只在 dt<0.5s（連續拖曳中的兩幀）才計入平均；閒置很久後的第一幀
+                # 間隔會被拉得很長、算出的瞬時 FPS 沒有意義，直接跳過不污染 EMA。
+                if 0 < dt < 0.5:
+                    inst_fps = 1.0 / dt
+                    self._vtk_fps_ema = (inst_fps if self._vtk_fps_ema is None
+                                         else 0.8 * self._vtk_fps_ema + 0.2 * inst_fps)
+            self._vtk_last_frame_t = now
+            if self._vtk_fps_ema is None:
+                return
+            txt = f'{self._vtk_fps_ema:.0f} FPS'
+            if self._vtk_fps_item is None:
+                self._vtk_fps_item = self.vtk_canvas.create_text(
+                    canvas_w - 8, 8, anchor='ne', fill='#5cff5c',
+                    font=('Consolas', 12, 'bold'), text=txt, tags='fps')
+            else:
+                self.vtk_canvas.itemconfig(self._vtk_fps_item, text=txt)
+                self.vtk_canvas.coords(self._vtk_fps_item, canvas_w - 8, 8)
+            self.vtk_canvas.tag_raise(self._vtk_fps_item)
+
+        def _vtk_request_render(self):
+            """節流：拖曳/縮放時快速連續觸發，合併到下一個 idle 週期只渲染一次，
+            避免滑鼠事件佇列塞滿大量『GPU 讀回+像素搬移』造成畫面卡死。"""
+            if self._vtk_render_pending:
+                return
+            self._vtk_render_pending = True
+
+            def _run():
+                self._vtk_render_pending = False
+                self._vtk_render_to_canvas()
+            self.after_idle(_run)
+
+        def _vtk_on_press(self, evt):
+            self._vtk_drag = (evt.x, evt.y)
+
+        def _vtk_on_drag(self, evt):
+            if self._vtk_drag is None or not self._vtk_renderers:
+                return
+            lx, ly = self._vtk_drag
+            dx, dy = evt.x - lx, evt.y - ly
+            self._vtk_drag = (evt.x, evt.y)
+            self._vtk_orbit(dx, dy)
+            self._vtk_request_render()
+
+        def _vtk_orbit(self, dx, dy):
+            """繞『物體中心』做 turntable 旋轉（方位角繞世界 Z、俯仰角繞相機右向量），
+            並夾住俯仰避免翻過南北極（gimbal lock 會讓畫面翻轉/消失）。
+            繞物體中心而非相機焦點 → 指向性縮放後焦點飄移也不會把物體轉出畫面。"""
+            cam = self._vtk_shared_cam
+            C = (self._vtk_center if getattr(self, '_vtk_center', None) is not None
+                 else np.array(cam.GetFocalPoint()))
+            pos = np.array(cam.GetPosition())
+            fp = np.array(cam.GetFocalPoint())
+            up = np.array(cam.GetViewUp())
+            dop = fp - pos
+            nd = np.linalg.norm(dop)
+            if nd < 1e-9:
+                return
+            right = np.cross(dop / nd, up)
+            rn = np.linalg.norm(right)
+            if rn < 1e-9:
+                return
+            right = right / rn
+            world_up = np.array([0.0, 0.0, 1.0])
+
+            # 方位角：繞世界 Z 轉（turntable，不產生 roll）
+            Raz = self._rot_axis(world_up, -dx * 0.4)
+            pos = C + Raz @ (pos - C)
+            fp = C + Raz @ (fp - C)
+            up = Raz @ up
+            right = Raz @ right
+
+            # 俯仰角：繞相機右向量轉，但先檢查會不會翻過極點（視線與世界 Z 夾角保持 8~172°）
+            Rel = self._rot_axis(right, dy * 0.4)
+            new_pos = C + Rel @ (pos - C)
+            vdir = new_pos - C
+            vn = np.linalg.norm(vdir)
+            if vn > 1e-9:
+                ang = np.degrees(np.arccos(
+                    np.clip(np.dot(vdir / vn, world_up), -1.0, 1.0)))
+                if 8.0 <= ang <= 172.0:            # 未過極點才套用俯仰
+                    pos = new_pos
+                    fp = C + Rel @ (fp - C)
+                    up = Rel @ up
+
+            cam.SetPosition(*pos)
+            cam.SetFocalPoint(*fp)
+            cam.SetViewUp(*up)
+            cam.OrthogonalizeViewUp()
+
+        def _vtk_on_release(self, _evt):
+            self._vtk_drag = None
+
+        def _vtk_renderer_at(self, disp_x, disp_y):
+            """找滑鼠所在的 renderer（比對模式有 3 個並排 viewport）；
+            disp_x/disp_y 需為 VTK 座標（左下角原點，Y 軸由下往上）。"""
+            w, h = self._vtk_rw.GetSize()
+            if w <= 0 or h <= 0:
+                return None
+            for ren in self._vtk_renderers:
+                x0, y0, x1, y1 = ren.GetViewport()
+                if x0 * w <= disp_x <= x1 * w and y0 * h <= disp_y <= y1 * h:
+                    return ren
+            return None
+
+        def _vtk_on_wheel(self, evt):
+            if not self._vtk_renderers or self._vtk_rw is None:
+                return
+            factor = 1.1 if evt.delta > 0 else (1 / 1.1)
+            _, h = self._vtk_rw.GetSize()
+            disp_y = h - evt.y          # Tk 原點左上、Y 向下；VTK 原點左下、Y 向上
+            ren = self._vtk_renderer_at(evt.x, disp_y)
+            self._vtk_zoom(ren, evt.x, disp_y, factor)
+            self._vtk_request_render()
+
+        def _vtk_zoom(self, ren, disp_x, disp_y, factor):
+            """滑鼠指向性縮放：往『滑鼠底下實際指到的 3D 點』dolly 過去，而不是
+            永遠對著畫面正中央縮放——沒點到物體（比對模式空白處/背景）時退回
+            對焦點縮放，行為等同舊版。"""
+            cam = self._vtk_shared_cam
+            pos = np.array(cam.GetPosition())
+            fp = np.array(cam.GetFocalPoint())
+            target = fp
+            if ren is not None:
+                picker = vtk.vtkPropPicker()
+                if picker.PickProp(disp_x, disp_y, ren):
+                    target = np.array(picker.GetPickPosition())
+            frac = 1.0 - 1.0 / factor        # factor>1（滾輪往前/放大）→ frac>0 → 往 target 靠近
+            d = (target - pos) * frac
+            cam.SetPosition(*(pos + d))
+            cam.SetFocalPoint(*(fp + d))
+
+        def _vtk_on_resize(self, _evt):
+            if getattr(self, '_vtk_drawn_for', None) is not None:
+                self._vtk_request_render()
 
         # ── 特徵剖面圖：影像(橘) vs 還原(紅)，量測跨距畫在門檻高度 ──
         def _draw_feature_profile(self, ax, horiz=True):
