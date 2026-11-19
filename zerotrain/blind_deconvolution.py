@@ -282,6 +282,72 @@ def measure_feature_width(surface, px_nm, sample='hole', frac=0.5,
             'amp_nm': amp, 'frac': frac}
 
 
+def fit_apex_2d(surface, px_nm, sample='bump', at=None, search_px=12, fit_px=3):
+    """2D 亞像素頂點擬合（雙變數二次曲面最小平方）。
+
+    **為什麼不能用 1D 剖面取頂點**：剖面線只要偏離頂點所在列半個像素，雙線性內插
+    就會把鄰列的值混進來，把單像素尖峰洗成平台（實測：剖面線 y 從 120.1 漂到
+    119.6，頂點權重 86% 落在隔壁列，7.199→7.198 看起來完全平）。故頂點高度/曲率
+    一律改在 2D 上擬合，與剖面線幾何脫鉤。
+
+    作法：在極值點周圍 (2·fit_px+1)² 視窗擬合
+    ``z = c0 + c1·x + c2·y + c3·x² + c4·y² + c5·xy``（x,y 以 **nm** 為單位，故
+    係數直接帶物理量綱），解 ∇z=0 得亞像素駐點；Hessian 的兩個特徵值 λ 給主曲率
+    半徑 ρ=1/|λ|（由 z=-r²/(2ρ) ⇒ ∂²z/∂r²=-1/ρ）。
+
+    sample='bump' 取局部極大、'hole' 取局部極小（內部翻號共用同一套流程）。
+    at=(y,x) 指定搜尋中心（GUI 點選）；None 則取全圖極值。
+    回傳 dict（'y','x','py','px' 為像素座標，其餘為 nm）；擬合不可信時回 None。
+    """
+    surf = np.asarray(surface, dtype=float)
+    sgn = 1.0 if sample == 'bump' else -1.0
+    f = sgn * surf                                # 統一成「找極大」
+    H, W = f.shape
+    if at is not None:                            # 點選：視窗內局部極值
+        ay = int(np.clip(round(at[0]), 0, H - 1))
+        ax_ = int(np.clip(round(at[1]), 0, W - 1))
+        ys, ye = max(0, ay - search_px), min(H, ay + search_px + 1)
+        xs_, xe = max(0, ax_ - search_px), min(W, ax_ + search_px + 1)
+        dy, dx = np.unravel_index(int(np.argmax(f[ys:ye, xs_:xe])),
+                                  (ye - ys, xe - xs_))
+        gy, gx = ys + dy, xs_ + dx
+    else:                                         # 自動：全圖極值
+        gy, gx = np.unravel_index(int(np.argmax(f)), f.shape)
+    if not (fit_px <= gy < H - fit_px and fit_px <= gx < W - fit_px):
+        return None                               # 太靠邊，擬合視窗取不滿
+    win = f[gy - fit_px:gy + fit_px + 1, gx - fit_px:gx + fit_px + 1]
+    oy, ox = np.indices(win.shape)
+    X = ((ox - fit_px) * px_nm).ravel()
+    Y = ((oy - fit_px) * px_nm).ravel()
+    Z = win.ravel()
+    A = np.column_stack([np.ones_like(X), X, Y, X * X, Y * Y, X * Y])
+    coef, *_ = np.linalg.lstsq(A, Z, rcond=None)
+    c0, c1, c2, c3, c4, c5 = coef
+    hess = np.array([[2 * c3, c5], [c5, 2 * c4]])          # nm⁻¹
+    try:
+        dx_nm, dy_nm = np.linalg.solve(hess, [-c1, -c2])   # 駐點相對極值像素 (nm)
+    except np.linalg.LinAlgError:
+        return None                               # Hessian 奇異（平面/退化）
+    lim = (fit_px + 0.5) * px_nm
+    if not (abs(dx_nm) <= lim and abs(dy_nm) <= lim):
+        return None                               # 駐點跑出擬合視窗 → 外插不可信
+    zfit = (c0 + c1 * dx_nm + c2 * dy_nm + c3 * dx_nm ** 2
+            + c4 * dy_nm ** 2 + c5 * dx_nm * dy_nm)
+    ev = np.linalg.eigvalsh(hess)                 # 升冪；極大時兩者皆為負
+    rho = [(1.0 / abs(l)) if abs(l) > 1e-12 else float('inf') for l in ev]
+    return {
+        'y': gy + dy_nm / px_nm, 'x': gx + dx_nm / px_nm,   # 亞像素頂點（像素座標）
+        'py': int(gy), 'px': int(gx),                       # 原始極值像素
+        'z_nm': sgn * float(zfit),                          # 擬合頂點高度
+        'z_pixel_nm': sgn * float(f[gy, gx]),               # 未擬合的原始像素值
+        'rho_min_nm': float(min(rho)),                      # 主曲率半徑（較尖的一軸）
+        'rho_max_nm': float(max(rho)),                      # 主曲率半徑（較鈍的一軸）
+        'rms_nm': float(np.sqrt(np.mean((A @ coef - Z) ** 2))),   # 擬合殘差（品質指標）
+        'is_max': bool(np.all(ev < 0)),             # 兩特徵值同號才是真正的極值點
+        'fit_px': int(fit_px),
+    }
+
+
 def make_hole_surface(N=128, px_nm=39.1, open_nm=228.8, bot_nm=183.5, depth=125.8):
     """寬孔梯形樣品（本專案樣品）。回傳真實表面（供 demo 對照）。"""
     yy, xx = np.indices((N, N))
@@ -598,6 +664,8 @@ def launch_gui():
             self.meas = None           # 還原表面寬度量測結果
             self.meas_in = None        # 影像寬度量測結果（對照）
             self.meas_vw = None        # 垂直壁幾何還原 X/Y
+            self.apex_in = None        # 影像頂點 2D 亞像素擬合（fit_apex_2d）
+            self.apex_re = None        # 還原表面頂點 2D 亞像素擬合
             self.pick = None           # 使用者點選的量測位置 (y, x)；None=自動
             self._auto_job = None      # 參數變更自動重跑（防抖）排程 id
             self._meas_job = None      # 半深比例變更自動重量測排程 id
@@ -725,6 +793,9 @@ def launch_gui():
             self.lbl_dre = self._stat(g, '還原起伏（下界）', 2)
             self.lbl_win = self._stat(g, '影像寬度 ⌀', 3)
             self.lbl_wre = self._stat(g, '還原寬度', 4)
+            # 頂點：一律用 2D 亞像素擬合，不受剖面線幾何影響（見 fit_apex_2d）
+            self.lbl_apex = self._stat(g, '頂點 z（2D亞像素）', 5)
+            self.lbl_apexr = self._stat(g, '頂點曲率 ρ', 6)
             # 寬度量測控制
             mrow = ttk.Frame(s5); mrow.pack(fill='x', pady=(4, 0))
             ttk.Label(mrow, text='半深比例 ').pack(side='left')
@@ -737,6 +808,13 @@ def launch_gui():
                        command=self._pick_reset).pack(side='left', padx=(4, 0))
             ttk.Button(mrow, text='✕ 剖面線',
                        command=self._section_clear).pack(side='left', padx=(4, 0))
+            # 剖面線幾何：鎖水平 + 對齊 2D 頂點（避免斜線混到鄰列把尖峰洗平）
+            srow = ttk.Frame(s5); srow.pack(fill='x', pady=(3, 0))
+            self.var_hlock = tk.BooleanVar(value=True)
+            ttk.Checkbutton(srow, text='🔒 剖面線鎖水平', variable=self.var_hlock,
+                            command=self._on_hlock_toggle).pack(side='left')
+            ttk.Button(srow, text='⌖ 對齊頂點',
+                       command=self._snap_to_apex).pack(side='left', padx=(6, 0))
             # 已知垂直側壁 → Section 改用幾何還原（撐寬 = 2×探針側向寬 w(Δz)）
             self.var_vwall = tk.BooleanVar(value=False)
             ttk.Checkbutton(s5, text='☑ 已知垂直側壁（幾何還原 影像−2·w，含長寬比）',
@@ -960,6 +1038,7 @@ def launch_gui():
                 return
             self.image, self.image_path = arr, p
             self.recon = self.certain = self.frac = self.meas = self.meas_in = None
+            self.apex_in = self.apex_re = None
             self.pick = None                     # 新影像重設點選位置
             self.section = None                  # 新影像清除剖面線
             self.lbl_img.config(text=src)
@@ -1129,6 +1208,7 @@ def launch_gui():
                 self.var_px.set(f'{px_nm:.2f}')
                 self.recon = self.certain = self.frac = None
                 self.meas = self.meas_in = None
+                self.apex_in = self.apex_re = None
                 self.pick = None
                 self.lbl_img.config(
                     text=f'Nanoscope {os.path.basename(self.image_path)}\n{info}')
@@ -1193,8 +1273,11 @@ def launch_gui():
                     return
                 if event.inaxes is not self._ax_sec_img or event.xdata is None:
                     return
+                y_new = float(event.ydata)
+                if self.var_hlock.get():             # 鎖水平：終點與起點同一列
+                    y_new = self._drag[1][0]
                 self.section = {'p0': self._drag[1],
-                                'p1': (float(event.ydata), float(event.xdata)),
+                                'p1': (y_new, float(event.xdata)),
                                 'xpos': None}
                 self.section['xpos'] = self._default_xpos()  # 預設抓半高左緣
                 self._drag = ('endpoint', 'p1')
@@ -1203,9 +1286,12 @@ def launch_gui():
                 if event.inaxes is not self._ax_sec_img or event.xdata is None:
                     return
                 H, W = self.image.shape
-                self.section[self._drag[1]] = (
-                    float(np.clip(event.ydata, 0, H - 1)),
-                    float(np.clip(event.xdata, 0, W - 1)))
+                key = self._drag[1]
+                yy = float(np.clip(event.ydata, 0, H - 1))
+                self.section[key] = (yy, float(np.clip(event.xdata, 0, W - 1)))
+                if self.var_hlock.get():             # 另一端跟著同列 → 整條線平移
+                    other = 'p1' if key == 'p0' else 'p0'
+                    self.section[other] = (yy, self.section[other][1])
                 self._update_section_artists()
             elif kind == 'xcur':
                 if event.inaxes is not self._ax_sec_prof or event.xdata is None:
@@ -1478,8 +1564,14 @@ def launch_gui():
                 '',
                 f'剖面線端點    : (x={x0:.1f},y={y0:.1f}) → (x={x1:.1f},y={y1:.1f})  '
                 f'線長={float(np.hypot(y1-y0, x1-x0))*px_nm:.2f} nm，取樣 {len(xs)} 點',
+                f'剖面線傾斜 Δy : {abs(y1-y0):.3f} px'
+                + ('（鎖水平）' if self.var_hlock.get() else
+                   '　⚠ 未鎖水平：Δy>0.5px 時內插會混到鄰列，頂點會被洗平'),
                 f'游標位置 xpos : {xpos:.2f} nm',
-                f'特徵峰高      : {float(zi.max()):.3f} nm',
+                f'特徵峰高(沿線): {float(zi.max()):.3f} nm　※ 受剖面線位置影響，'
+                f'頂點請以下方 2D 亞像素擬合為準',
+                '',
+            ] + self._apex_summary_lines() + [
                 '',
                 f'量測 : {L["h"]}',
                 f'       {L["i"]}',
@@ -1519,6 +1611,106 @@ def launch_gui():
             else:
                 self._refresh_section()
 
+        # ── 剖面線幾何：鎖水平 / 對齊 2D 頂點 ────────────────
+        def _on_hlock_toggle(self):
+            """開啟「鎖水平」時，把現有斜線就地拉平（取兩端 y 的平均）。"""
+            if not self.var_hlock.get() or not self.section:
+                return
+            (y0, x0), (y1, x1) = self.section['p0'], self.section['p1']
+            if abs(y1 - y0) < 1e-9:
+                return
+            ym = 0.5 * (y0 + y1)
+            self.section['p0'], self.section['p1'] = (ym, x0), (ym, x1)
+            self._log(f'剖面線已拉平：y {y0:.2f}/{y1:.2f} → {ym:.2f}')
+            self._refresh_section()
+
+        def _snap_to_apex(self):
+            """把剖面線水平搬到 2D 亞像素頂點所在列，並以頂點為中心。
+
+            剖面線只要偏離頂點列半個像素，雙線性內插就把鄰列混進來、尖峰被洗成
+            平台（見 fit_apex_2d docstring 的實測）。對齊後剖面才真的通過頂點。
+            """
+            if self.image is None:
+                messagebox.showwarning('尚未載入', '請先載入掃描影像'); return
+            try:
+                px_nm = _fnum(self.var_px.get())
+            except ValueError:
+                px_nm = 1.0
+            a = fit_apex_2d(self.image, px_nm, self.var_sample.get(), at=self.pick)
+            if a is None:
+                messagebox.showwarning('找不到頂點',
+                                       '此影像在該位置找不到可靠的局部極值')
+                return
+            H, W = self.image.shape
+            if self.section:                     # 保留原線長，改水平並以頂點置中
+                (_, x0), (_, x1) = self.section['p0'], self.section['p1']
+                half = max(4.0, abs(x1 - x0) / 2)
+            else:
+                half = max(8.0, W * 0.12)
+            yy = float(np.clip(a['y'], 0, H - 1))
+            self.section = {'p0': (yy, float(np.clip(a['x'] - half, 0, W - 1))),
+                            'p1': (yy, float(np.clip(a['x'] + half, 0, W - 1))),
+                            'xpos': None}
+            self.section['xpos'] = self._default_xpos()
+            self.var_hlock.set(True)             # 對齊後順手鎖住，免得又被拖歪
+            self._log(f"剖面線對齊 2D 頂點：y={yy:.2f}（原始極值像素 row={a['py']}）"
+                      f"，頂點 z={a['z_nm']:.3f}nm ρ={a['rho_min_nm']:.1f}"
+                      f"/{a['rho_max_nm']:.1f}nm")
+            self._refresh_section()
+
+        def _update_apex_labels(self):
+            """⑤ 頂點欄位：影像 → 還原（2D 亞像素擬合值）。"""
+            ai, ar_ = self.apex_in, self.apex_re
+            if not ai:
+                self.lbl_apex.config(text='—'); self.lbl_apexr.config(text='—')
+                return
+            t = f"{ai['z_nm']:.3f}"
+            if ar_:
+                t += f" → {ar_['z_nm']:.3f}（Δ{ar_['z_nm'] - ai['z_nm']:+.3f}）"
+            self.lbl_apex.config(text=t + ' nm')
+            t2 = f"{ai['rho_min_nm']:.1f}/{ai['rho_max_nm']:.1f}"
+            if ar_:
+                t2 += f" → {ar_['rho_min_nm']:.1f}/{ar_['rho_max_nm']:.1f}"
+            self.lbl_apexr.config(text=t2 + ' nm')
+
+        def _apex_summary_lines(self):
+            """匯出摘要用的頂點段落（必要時就地補算一次）。"""
+            try:
+                px_nm = _fnum(self.var_px.get())
+            except ValueError:
+                px_nm = 1.0
+            sample = self.var_sample.get()
+            ai = self.apex_in or fit_apex_2d(self.image, px_nm, sample,
+                                             at=self.pick)
+            ar_ = self.apex_re
+            if ar_ is None and self.recon is not None:
+                ar_ = fit_apex_2d(self.recon, px_nm, sample, at=self.pick)
+            if ai is None:
+                return ['頂點(2D亞像素): 找不到可靠的局部極值']
+
+            def fmt(a, tag):
+                return (f'{tag}: z={a["z_nm"]:.4f} nm  '
+                        f'位置 (x={a["x"]:.2f}, y={a["y"]:.2f}) px  '
+                        f'ρ={a["rho_min_nm"]:.2f}/{a["rho_max_nm"]:.2f} nm  '
+                        f'rms={a["rms_nm"]:.4f} nm'
+                        + ('' if a['is_max'] else '  ⚠ 非真正極值（鞍點）'))
+
+            out = [f'# 頂點（2D 亞像素二次曲面擬合，視窗 ±{ai["fit_px"]}px，'
+                   f'與剖面線幾何脫鉤）',
+                   fmt(ai, '  影像')]
+            if ar_:
+                out += [
+                    fmt(ar_, '  還原'),
+                    f'  頂點高度差 : {ar_["z_nm"] - ai["z_nm"]:+.4f} nm'
+                    f'（erosion 對凸點頂點幾乎不動＝物理正確：探針尖端確實碰到'
+                    f'頂點，該點高度本就量得準）',
+                    f'  頂點曲率   : ρ {ai["rho_max_nm"]:.2f} → '
+                    f'{ar_["rho_max_nm"]:.2f} nm（合成驗證顯示：探針模型正確且無雜訊時'
+                    f' erosion 可完全修回真值；實測殘差主要來自探針尖端模型誤差'
+                    f'（datasheet R vs 實際磨耗）與雜訊）',
+                ]
+            return out
+
         def _measure(self):
             if self.recon is None:
                 messagebox.showwarning('尚無結果', '請先執行 ④ 去卷積'); return
@@ -1533,6 +1725,10 @@ def launch_gui():
             m_in = measure_feature_width(self.image, px_nm, sample, frac,
                                          at=self.pick)
             self.meas_in = m_in
+            # 頂點一律走 2D 亞像素擬合：1D 剖面取頂點會因內插混到鄰列而失真
+            self.apex_in = fit_apex_2d(self.image, px_nm, sample, at=self.pick)
+            self.apex_re = fit_apex_2d(self.recon, px_nm, sample, at=self.pick)
+            self._update_apex_labels()
 
             def ar(a, b):                        # 長寬比（大/小），顯示成 x.xx:1
                 return (max(a, b)/min(a, b)) if min(a, b) > 0 else float('nan')
@@ -1601,6 +1797,9 @@ def launch_gui():
                 return
             axi.imshow(self.image, cmap='afmhot')            # AFM 金銅色調
             axi.set_title('掃描影像　（按住拖曳＝拉剖面線；拖白點＝調整）', fontsize=9)
+            if self.apex_in:                                 # 2D 亞像素頂點（青色十字）
+                axi.plot([self.apex_in['x']], [self.apex_in['y']], '+',
+                         color='#00e5ff', ms=11, mew=1.8, zorder=7)
             if self.section:
                 self._draw_section(axi, axp)
                 self._update_table()

@@ -11,6 +11,7 @@
 # Small runtime / setup inputs that are useful to version.
 !requirements.txt
 !install_tf_gpu.bat
+!啟動去卷積工具.bat
 
 # Optional text-based references that are still lightweight.
 !CLAUDE.md
