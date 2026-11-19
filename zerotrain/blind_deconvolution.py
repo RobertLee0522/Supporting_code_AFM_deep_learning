@@ -282,8 +282,29 @@ def measure_feature_width(surface, px_nm, sample='hole', frac=0.5,
             'amp_nm': amp, 'frac': frac}
 
 
-def fit_apex_2d(surface, px_nm, sample='bump', at=None, search_px=12, fit_px=3):
-    """2D 亞像素頂點擬合（雙變數二次曲面最小平方）。
+def fit_apex_2d(surface, px_nm, sample='bump', at=None, search_px=12, fit_px=3,
+                max_fit_px=7):
+    """2D 亞像素頂點擬合，視窗自動放大（fit_px → max_fit_px）。
+
+    [FIX] 真實掃描（30nm.003）頂端常是比 7×7 還寬的平台，且高度有量化階梯
+    （該檔每階 ≈0.345nm），固定 ±3px 視窗擬合出的曲面在某方向幾乎不彎
+    （Hessian 特徵值≈0），駐點外插到幾百 nm 外 → 回 None，GUI「對齊頂點」失敗。
+    實測視窗越大越是在擬合側壁而非頂點（影像 z 7.35→6.47、rms 0.20→1.06），
+    故從最小視窗起逐步放大，**取第一個『兩方向皆下彎（真極值）且駐點落在視窗內』**
+    的結果；回傳的 'fit_px' 記錄實際採用的視窗。
+    """
+    last = None
+    for fp in range(fit_px, max(fit_px, max_fit_px) + 1):
+        a = _fit_apex_once(surface, px_nm, sample, at, search_px, fp)
+        if a is not None:
+            if a['is_max']:
+                return a
+            last = last or a
+    return last
+
+
+def _fit_apex_once(surface, px_nm, sample='bump', at=None, search_px=12, fit_px=3):
+    """2D 亞像素頂點擬合（雙變數二次曲面最小平方，單一視窗）。
 
     **為什麼不能用 1D 剖面取頂點**：剖面線只要偏離頂點所在列半個像素，雙線性內插
     就會把鄰列的值混進來，把單像素尖峰洗成平台（實測：剖面線 y 從 120.1 漂到
@@ -648,6 +669,30 @@ def launch_gui():
     HAS_VTK = importlib.util.find_spec('vtk') is not None
     vtk = vnp = Image = ImageTk = None   # 實際模組在 _vtk_ensure_loaded() 才綁定
 
+    class ToolTip:
+        """滑鼠停留 0.5 秒顯示說明（取代面板上大量灰色說明文字，介面保持乾淨）。"""
+        def __init__(self, widget, text):
+            self.w, self.text, self.tw, self.job = widget, text, None, None
+            widget.bind('<Enter>', self._sched, add='+')
+            widget.bind('<Leave>', self._hide, add='+')
+            widget.bind('<ButtonPress>', self._hide, add='+')
+
+        def _sched(self, _e=None):
+            self._hide(); self.job = self.w.after(500, self._show)
+
+        def _show(self):
+            x = self.w.winfo_rootx() + 12
+            y = self.w.winfo_rooty() + self.w.winfo_height() + 4
+            self.tw = tw = tk.Toplevel(self.w); tw.wm_overrideredirect(True)
+            tw.wm_geometry(f'+{x}+{y}')
+            tk.Label(tw, text=self.text, justify='left', background='#fffbe6',
+                     relief='solid', borderwidth=1, font=('Microsoft JhengHei', 9),
+                     padx=6, pady=3).pack()
+
+        def _hide(self, _e=None):
+            if self.job: self.w.after_cancel(self.job); self.job = None
+            if self.tw: self.tw.destroy(); self.tw = None
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -675,174 +720,218 @@ def launch_gui():
             self.section = None
             self._drag = None          # 進行中的拖曳 ('newline'|'endpoint'|'cursor'|'pick')
             self._sa = {}              # 剖面線 artists（拖曳時輕量更新用）
+            # [FIX] 啟動晃動：先隱藏視窗，等全部元件與圖表建好、版面算完再一次顯示；
+            # 否則使用者會看到「空視窗 → 元件陸續長出 → 圖表縮放重畫」的跳動過程。
+            self.withdraw()
             self._build_ui()
+            self.update_idletasks()
+            self.deiconify()
 
         # ── 版面 ──────────────────────────────────────────────
         def _build_ui(self):
-            left = ttk.Frame(self, padding=8)
+            # ── 左側面板：白話版（給非 AFM 專業的人也看得懂）──
+            # 只把「使用者真的要填」的兩個探針規格放在主畫面；每格大小（從 .000 自動
+            # 帶入）、計算範圍（自動換算）、探針檔、非對稱等收進「進階設定」。
+            # 結果用一張大字卡片呈現「修正前 → 修正後」，其餘專業數據收進「詳細數據」。
+            # 介面文字刻意不用 emoji：Windows 上 Tk 首次遇到 emoji 要做字型 fallback
+            # 搜尋（實測單一按鈕首次建立 ~0.6s），是啟動卡頓來源之一。
+            F = 'Microsoft JhengHei'
+            st = ttk.Style(self)
+            st.configure('Head.TLabel', font=(F, 11, 'bold'), foreground='#1E2761')
+            st.configure('Hint.TLabel', font=(F, 9), foreground='#7a808a')
+            st.configure('Val.TLabel', foreground='#0a7c5a')
+            st.configure('Run.TButton', font=(F, 11, 'bold'))
+            self._folds = {}
+
+            left = ttk.Frame(self, padding=(10, 4))
             left.pack(side='left', fill='y')
             right = ttk.Frame(self)
             right.pack(side='right', fill='both', expand=True)
 
-            def step(title):
-                lf = ttk.LabelFrame(left, text=title, padding=6)
-                lf.pack(fill='x', pady=4)
-                return lf
+            def section(title, hint=None):
+                ttk.Label(left, text=title, style='Head.TLabel').pack(
+                    anchor='w', pady=(8, 0))
+                if hint:
+                    ttk.Label(left, text=hint, style='Hint.TLabel',
+                              wraplength=280).pack(anchor='w')
+                ttk.Separator(left).pack(fill='x', pady=(2, 4))
+                f = ttk.Frame(left); f.pack(fill='x')
+                return f
 
-            # ① 影像
-            s1 = step('① 載入掃描檔')
-            ttk.Button(s1, text='📂 選擇掃描檔 (.000 原始檔 或 .npy)',
+            def param(parent, row, name, var, unit, tip, width=7, note=None):
+                """參數列：名稱｜輸入框｜單位｜白話註解；滑鼠停留顯示詳細說明。"""
+                lb = ttk.Label(parent, text=name)
+                lb.grid(row=row, column=0, sticky='w', pady=2)
+                e = ttk.Entry(parent, textvariable=var, width=width, justify='right',
+                              font=(F, 11))
+                e.grid(row=row, column=1, sticky='w', padx=(6, 3), pady=2)
+                ttk.Label(parent, text=unit).grid(row=row, column=2, sticky='w')
+                if note:
+                    ttk.Label(parent, text=note, style='Hint.TLabel').grid(
+                        row=row, column=3, sticky='w', padx=(6, 0))
+                ToolTip(lb, tip); ToolTip(e, tip)
+                return e
+
+            # ── 1 打開圖檔 ──
+            s1 = section('1　打開 AFM 圖檔')
+            ttk.Button(s1, text='開啟圖檔…', style='Run.TButton',
                        command=self._load_image).pack(fill='x')
-            self.lbl_img = ttk.Label(s1, text='（尚未載入）', wraplength=250,
-                                     foreground='#666')
-            self.lbl_img.pack(fill='x', pady=(4, 0))
-            srow = ttk.Frame(s1); srow.pack(fill='x', pady=(4, 0))
-            ttk.Label(srow, text='樣品類型：').pack(side='left')
+            self.lbl_img = ttk.Label(s1, text='還沒開啟圖檔', style='Hint.TLabel',
+                                     wraplength=280)
+            self.lbl_img.pack(fill='x', pady=(2, 2))
+            srow = ttk.Frame(s1); srow.pack(fill='x')
+            ttk.Label(srow, text='樣品表面是').pack(side='left')
             self.var_sample = tk.StringVar(value='hole')
-            ttk.Radiobutton(srow, text='孔洞', value='hole',
-                            variable=self.var_sample,
-                            command=self._on_sample_change).pack(side='left')
-            ttk.Radiobutton(srow, text='凸起', value='bump',
-                            variable=self.var_sample,
-                            command=self._on_sample_change).pack(side='left')
-            ttk.Label(s1, text='※ .000 原始檔會自動去尖刺+去傾斜並帶入 px_nm；'
-                              '樣品類型只影響基線方向，不改變 erosion 還原結果',
-                      wraplength=250, foreground='#999',
-                      font=('', 8)).pack(fill='x')
+            for txt, val in (('凹下去的洞', 'hole'), ('凸起來的點', 'bump')):
+                ttk.Radiobutton(srow, text=txt, value=val, variable=self.var_sample,
+                                command=self._on_sample_change).pack(
+                                    side='left', padx=(8, 0))
 
-            # ② 尺度
-            s2 = step('② 影像尺度')
-            row = ttk.Frame(s2); row.pack(fill='x')
-            ttk.Label(row, text='每 px = ').pack(side='left')
+            # ── 2 探針規格 ──
+            s2 = section('2　填入探針規格', '看探針盒子或規格書上的數字；改完會自動重算')
+            g2 = ttk.Frame(s2); g2.pack(fill='x')
+            self.var_R = tk.StringVar(value='8.0')
+            self.e_R = param(g2, 0, '針尖圓角 R', self.var_R, 'nm',
+                             '探針最尖端的圓角半徑（規格書 Tip Radius）。\n'
+                             '數字越小，針越尖、圖越準。', note='越小越尖')
+            self.var_th = tk.StringVar(value='20')
+            self.e_th = param(g2, 1, '針的斜度 θ', self.var_th, '度',
+                              '探針側面跟中心線的夾角（半角）。\n'
+                              '規格書若寫全角（例 41.4°），請輸入 41.4/2。',
+                              note='全角要除以 2')
+            ttk.Button(s2, text='▶  開始修正', style='Run.TButton',
+                       command=self._run).pack(fill='x', pady=(4, 0))
+
+            adv = self._make_fold(s2, '進階設定（每格大小、計算範圍、探針檔）')
+            self._adv_frame = adv
+            ga = ttk.Frame(adv); ga.pack(fill='x')
             self.var_px = tk.StringVar(value='39.1')
-            self.e_px = ttk.Entry(row, textvariable=self.var_px, width=8)
-            self.e_px.pack(side='left')
-            ttk.Label(row, text=' nm').pack(side='left')
-
-            # ③ 探針
-            s3 = step('③ 探針設定')
+            self.e_px = param(ga, 0, '每格大小', self.var_px, 'nm',
+                              '圖上每一格代表多長。\n開啟 .000 圖檔時會自動填好，通常不用改。',
+                              width=6, note='開檔自動填')
+            self.var_half = tk.StringVar(value='5')
+            self.e_half = param(ga, 1, '計算範圍', self.var_half, '格',
+                                '探針形狀要算多大範圍。\n勾「自動」會依樣品高度與探針規格換算。',
+                                width=6)
+            self.var_autohalf = tk.BooleanVar(value=True)
+            ttk.Checkbutton(ga, text='自動', variable=self.var_autohalf,
+                            command=self._update_tip_mode).grid(row=1, column=3,
+                                                                sticky='w', padx=(6, 0))
             self.var_source = tk.StringVar(value='cone')
-            ttk.Radiobutton(s3, text='廠商 cone（輸入規格）', value='cone',
+            ttk.Radiobutton(adv, text='用規格數字（R、θ）', value='cone',
+                            variable=self.var_source,
+                            command=self._update_tip_mode).pack(anchor='w', pady=(4, 0))
+            ttk.Radiobutton(adv, text='用探針形狀檔（Gwyddion .npy）', value='npy',
                             variable=self.var_source,
                             command=self._update_tip_mode).pack(anchor='w')
-            ttk.Radiobutton(s3, text='載入探針檔（Gwyddion itip_estimate .npy）',
-                            value='npy', variable=self.var_source,
-                            command=self._update_tip_mode).pack(anchor='w')
-
-            # cone 參數
-            cone = ttk.Frame(s3); cone.pack(fill='x', padx=(14, 0), pady=2)
-            r1 = ttk.Frame(cone); r1.pack(fill='x')
-            ttk.Label(r1, text='球冠半徑 R = ').pack(side='left')
-            self.var_R = tk.StringVar(value='8.0')
-            self.e_R = ttk.Entry(r1, textvariable=self.var_R, width=7)
-            self.e_R.pack(side='left'); ttk.Label(r1, text=' nm').pack(side='left')
-
-            r2 = ttk.Frame(cone); r2.pack(fill='x')
-            ttk.Label(r2, text='視窗半徑 = ').pack(side='left')
-            self.var_half = tk.StringVar(value='5')
-            self.e_half = ttk.Entry(r2, textvariable=self.var_half, width=6)
-            self.e_half.pack(side='left'); ttk.Label(r2, text=' px').pack(side='left')
-            self.var_autohalf = tk.BooleanVar(value=True)
-            ttk.Checkbutton(r2, text='自動', variable=self.var_autohalf,
-                            command=self._update_tip_mode).pack(side='left', padx=(6, 0))
-            ttk.Label(cone, text='（自動 = 依載入孔深 + R/θ 換算；θ 為半錐角）',
-                      foreground='#999', font=('', 8)).pack(anchor='w')
-
-            # 對稱 / 非對稱
-            self.var_asym = tk.BooleanVar(value=False)
-            self.chk_asym = ttk.Checkbutton(
-                cone, text='☑ 非對稱探針（θx / θy 分開設定）',
-                variable=self.var_asym, command=self._update_tip_mode)
-            self.chk_asym.pack(anchor='w', pady=(4, 0))
-
-            r3 = ttk.Frame(cone); r3.pack(fill='x')
-            ttk.Label(r3, text='半錐角 θ = ').pack(side='left')
-            self.var_th = tk.StringVar(value='20')
-            self.e_th = ttk.Entry(r3, textvariable=self.var_th, width=7)
-            self.e_th.pack(side='left'); ttk.Label(r3, text=' °（對稱）').pack(side='left')
-
-            r4 = ttk.Frame(cone); r4.pack(fill='x')
-            ttk.Label(r4, text='θx = ').pack(side='left')
-            self.var_thx = tk.StringVar(value='25')
-            self.e_thx = ttk.Entry(r4, textvariable=self.var_thx, width=6)
-            self.e_thx.pack(side='left')
-            ttk.Label(r4, text=' °   θy = ').pack(side='left')
-            self.var_thy = tk.StringVar(value='15')
-            self.e_thy = ttk.Entry(r4, textvariable=self.var_thy, width=6)
-            self.e_thy.pack(side='left'); ttk.Label(r4, text=' °').pack(side='left')
-
-            # 載入探針檔
-            self.btn_tipnpy = ttk.Button(s3, text='📂 選擇探針 .npy',
+            self.btn_tipnpy = ttk.Button(adv, text='選擇探針檔…',
                                          command=self._load_tip_npy)
-            self.btn_tipnpy.pack(fill='x', pady=(4, 0))
-            self.lbl_tip = ttk.Label(s3, text='', wraplength=250, foreground='#666')
+            self.btn_tipnpy.pack(fill='x', pady=(2, 0))
+            self.lbl_tip = ttk.Label(adv, text='', style='Hint.TLabel', wraplength=260)
             self.lbl_tip.pack(fill='x')
-
-            ttk.Button(s3, text='👁 預覽探針形狀',
+            self.var_asym = tk.BooleanVar(value=False)
+            self.chk_asym = ttk.Checkbutton(adv, text='探針左右、前後斜度不一樣',
+                                            variable=self.var_asym,
+                                            command=self._update_tip_mode)
+            self.chk_asym.pack(anchor='w', pady=(4, 0))
+            gb = ttk.Frame(adv); gb.pack(fill='x')
+            self.var_thx = tk.StringVar(value='25')
+            self.e_thx = param(gb, 0, '左右斜度 θx', self.var_thx, '度',
+                               '探針 X 方向的半角。', width=6)
+            self.var_thy = tk.StringVar(value='15')
+            self.e_thy = param(gb, 1, '前後斜度 θy', self.var_thy, '度',
+                               '探針 Y 方向的半角。', width=6)
+            ttk.Button(adv, text='看探針長什麼樣子',
                        command=self._preview_tip).pack(fill='x', pady=(4, 0))
 
-            # ④ 執行
-            s4 = step('④ 執行')
-            ttk.Button(s4, text='▶ 執行去卷積', command=self._run).pack(fill='x')
-
-            # ⑤ 結果
-            s5 = step('⑤ 結果')
-            g = ttk.Frame(s5); g.pack(fill='x')
-            self.lbl_cert = self._stat(g, '可信像素 certain', 0)
-            self.lbl_din = self._stat(g, '影像起伏', 1)
-            self.lbl_dre = self._stat(g, '還原起伏（下界）', 2)
-            self.lbl_win = self._stat(g, '影像寬度 ⌀', 3)
-            self.lbl_wre = self._stat(g, '還原寬度', 4)
-            # 頂點：一律用 2D 亞像素擬合，不受剖面線幾何影響（見 fit_apex_2d）
-            self.lbl_apex = self._stat(g, '頂點 z（2D亞像素）', 5)
-            self.lbl_apexr = self._stat(g, '頂點曲率 ρ', 6)
-            # 寬度量測控制
-            mrow = ttk.Frame(s5); mrow.pack(fill='x', pady=(4, 0))
-            ttk.Label(mrow, text='半深比例 ').pack(side='left')
-            self.var_wfrac = tk.StringVar(value='0.5')
-            self.e_wfrac = ttk.Entry(mrow, textvariable=self.var_wfrac, width=5)
-            self.e_wfrac.pack(side='left')
-            ttk.Button(mrow, text='📏 量測寬度',
-                       command=self._measure).pack(side='left', padx=(6, 0))
-            ttk.Button(mrow, text='↺ 自動',
-                       command=self._pick_reset).pack(side='left', padx=(4, 0))
-            ttk.Button(mrow, text='✕ 剖面線',
-                       command=self._section_clear).pack(side='left', padx=(4, 0))
-            # 剖面線幾何：鎖水平 + 對齊 2D 頂點（避免斜線混到鄰列把尖峰洗平）
-            srow = ttk.Frame(s5); srow.pack(fill='x', pady=(3, 0))
-            self.var_hlock = tk.BooleanVar(value=True)
-            ttk.Checkbutton(srow, text='🔒 剖面線鎖水平', variable=self.var_hlock,
-                            command=self._on_hlock_toggle).pack(side='left')
-            ttk.Button(srow, text='⌖ 對齊頂點',
-                       command=self._snap_to_apex).pack(side='left', padx=(6, 0))
-            # 已知垂直側壁 → Section 改用幾何還原（撐寬 = 2×探針側向寬 w(Δz)）
+            # ── 3 量大小 ──
+            s3 = section('3　量大小', '在右邊的圖上「按住滑鼠拖一條線」穿過要量的點')
+            brow = ttk.Frame(s3); brow.pack(fill='x')
+            for txt, fn in (('把線移到最高點', self._snap_to_apex),
+                            ('清除線', self._section_clear)):
+                ttk.Button(brow, text=txt, command=fn).pack(
+                    side='left', fill='x', expand=True, padx=(0, 3))
             self.var_vwall = tk.BooleanVar(value=False)
-            ttk.Checkbutton(s5, text='☑ 已知垂直側壁（幾何還原 影像−2·w，含長寬比）',
-                            variable=self.var_vwall,
-                            command=self._on_vwall_toggle).pack(anchor='w', pady=(3, 0))
-            ttk.Button(s5, text='💾 匯出 Section 結果（CSV+摘要+PNG）',
-                       command=self._save_section).pack(fill='x', pady=(3, 0))
-            self.lbl_pick = ttk.Label(s5, text='量測位置：自動（全圖最大特徵）\n'
-                                               '👆 點影像=選特徵；按住拖曳=拉剖面線'
-                                               '（Section）；點剖面圖高度=改門檻',
-                                      wraplength=250, foreground='#999', font=('', 8))
-            self.lbl_pick.pack(fill='x')
+            cb = ttk.Checkbutton(s3, text='樣品側邊是直的（像柱子一樣）',
+                                 variable=self.var_vwall,
+                                 command=self._on_vwall_toggle)
+            cb.pack(anchor='w', pady=(4, 0))
+            ToolTip(cb, '確定樣品側壁垂直時勾選，改用幾何公式修正，修正量會比較大。\n'
+                        '真實寬 = 量到的寬 − 2 × 探針在該深度的寬度')
+            g3 = ttk.Frame(s3); g3.pack(fill='x', pady=(2, 0))
+            self.var_wfrac = tk.StringVar(value='0.5')
+            self.e_wfrac = param(g3, 0, '在多高處量', self.var_wfrac, '倍高度',
+                                 '0.5 = 在一半高的地方量寬度（業界常用 FWHM）；\n'
+                                 '0.1 = 接近底部量。可填 0.05～0.95。',
+                                 width=5, note='0.5＝一半高')
+            mfold = self._make_fold(s3, '量測小工具')
+            self.var_hlock = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(mfold, text='畫的線自動拉成水平（建議開著）',
+                                 variable=self.var_hlock,
+                                 command=self._on_hlock_toggle)
+            cb.pack(anchor='w')
+            ToolTip(cb, '斜的線會混到隔壁那排的資料，讓最高點看起來變平。')
+            mrow = ttk.Frame(mfold); mrow.pack(fill='x', pady=(2, 0))
+            ttk.Button(mrow, text='重新量測', command=self._measure).pack(
+                side='left', fill='x', expand=True, padx=(0, 3))
+            ttk.Button(mrow, text='自動找最大的點', command=self._pick_reset).pack(
+                side='left', fill='x', expand=True)
+            self.lbl_pick = ttk.Label(mfold, text='量測位置：自動（全圖最大特徵）',
+                                      style='Hint.TLabel', wraplength=270)
+            self.lbl_pick.pack(fill='x', pady=(2, 0))
 
-            # ⑥ 儲存
-            s6 = step('⑥ 儲存')
-            ttk.Button(s6, text='💾 儲存結果（npy + PNG）',
-                       command=self._save).pack(fill='x')
+            # ── 4 結果：大字卡片 ──
+            s4 = section('4　結果')
+            card = tk.Frame(s4, background='#eaf5f1', padx=10, pady=8)
+            card.pack(fill='x')
+            BG = '#eaf5f1'
+            tk.Label(card, text='寬度', bg=BG, fg='#1E2761',
+                     font=(F, 10, 'bold')).grid(row=0, column=0, rowspan=2,
+                                                sticky='nw', padx=(0, 10))
+            tk.Label(card, text='修正前', bg=BG, fg='#7a808a',
+                     font=(F, 10)).grid(row=0, column=1, sticky='w')
+            self.lbl_hl_before = tk.Label(card, text='—', bg=BG, fg='#d2691e',
+                                          font=(F, 13, 'bold'))
+            self.lbl_hl_before.grid(row=0, column=2, sticky='w', padx=(8, 0))
+            tk.Label(card, text='修正後', bg=BG, fg='#7a808a',
+                     font=(F, 10)).grid(row=1, column=1, sticky='w')
+            self.lbl_hl_after = tk.Label(card, text='—', bg=BG, fg='#1f8a70',
+                                         font=(F, 17, 'bold'))
+            self.lbl_hl_after.grid(row=1, column=2, sticky='w', padx=(8, 0))
+            self.lbl_hl_note = tk.Label(card, text='開啟圖檔並拉一條線後顯示',
+                                        bg=BG, fg='#444', font=(F, 9),
+                                        justify='left', wraplength=265)
+            self.lbl_hl_note.grid(row=2, column=0, columnspan=3, sticky='w',
+                                  pady=(4, 0))
 
-            # log
-            self.txt = tk.Text(left, height=7, width=38, font=('Consolas', 8))
-            self.txt.pack(fill='x', pady=(6, 0))
+            det = self._make_fold(s4, '詳細數據（給專業人員）')
+            g = ttk.Frame(det); g.pack(fill='x')
+            self.lbl_cert = self._stat(g, '量得準的區域', 0)
+            self.lbl_din = self._stat(g, '原圖高低差', 1)
+            self.lbl_dre = self._stat(g, '修正後高低差', 2)
+            self.lbl_win = self._stat(g, '原圖寬度(自動)', 3)
+            self.lbl_wre = self._stat(g, '修正後寬度(自動)', 4)
+            # 頂點：一律用 2D 亞像素擬合，不受剖面線幾何影響（見 fit_apex_2d）
+            self.lbl_apex = self._stat(g, '最高點高度', 5)
+            self.lbl_apexr = self._stat(g, '最高點圓角 ρ', 6)
+            # log 放在詳細數據裡：一般使用者不需要看
+            self.txt = tk.Text(det, height=4, width=40, font=('Consolas', 8),
+                               relief='flat', background='#f4f6f8')
+            self.txt.pack(fill='x', pady=(4, 0))
+
+            orow = ttk.Frame(s4); orow.pack(fill='x', pady=(6, 0))
+            ttk.Button(orow, text='匯出量測結果',
+                       command=self._save_section).pack(side='left', fill='x',
+                                                        expand=True, padx=(0, 3))
+            ttk.Button(orow, text='儲存修正後的圖',
+                       command=self._save).pack(side='left', fill='x', expand=True)
 
             # 右側：分頁（頁1 Section 量測＝NanoScope 式；頁2 去卷積詳情）
             self.nb = ttk.Notebook(right)
             self.nb.pack(fill='both', expand=True)
             tab1 = ttk.Frame(self.nb); tab2 = ttk.Frame(self.nb)
-            self.nb.add(tab1, text='  Section 量測  ')
-            self.nb.add(tab2, text='  去卷積詳情  ')
+            self.nb.add(tab1, text='  量大小  ')
+            self.nb.add(tab2, text='  詳細圖（專業）  ')
 
             # ── 頁1：左大影像 + 右 Section 剖面 + 下方數據表 ──
             self.fig1 = Figure(figsize=(11, 5.2))
@@ -856,8 +945,8 @@ def launch_gui():
                            ('button_release_event', self._on_release)):
                 self.canvas1.mpl_connect(ev, fn)
             cols = ('curve', 'z', 'xl', 'xr', 'w')
-            heads = ('曲線', '量測高度 (nm)', '左緣位置 (nm)',
-                     '右緣位置 (nm)', '寬度 (nm)')
+            heads = ('', '在多高處量 (nm)', '左邊位置 (nm)',
+                     '右邊位置 (nm)', '寬度 (nm)')
             self.tbl = ttk.Treeview(tab1, columns=cols, show='headings', height=2)
             for c, h in zip(cols, heads):
                 self.tbl.heading(c, text=h)
@@ -874,30 +963,30 @@ def launch_gui():
 
             # ── 頁3：3D 還原表面（可滑鼠旋轉）──
             tab3 = ttk.Frame(self.nb)
-            self.nb.add(tab3, text='  3D 還原  ')
+            self.nb.add(tab3, text='  3D 立體圖  ')
             top3 = ttk.Frame(tab3); top3.pack(fill='x', pady=2)
             self.var_3dsrc = tk.StringVar(value='recon')
-            ttk.Radiobutton(top3, text='還原表面', value='recon',
+            ttk.Radiobutton(top3, text='修正後', value='recon',
                             variable=self.var_3dsrc,
                             command=self._draw_3d).pack(side='left')
-            ttk.Radiobutton(top3, text='輸入影像', value='image',
+            ttk.Radiobutton(top3, text='修正前（原圖）', value='image',
                             variable=self.var_3dsrc,
                             command=self._draw_3d).pack(side='left')
-            ttk.Radiobutton(top3, text='前後比對', value='both',
+            ttk.Radiobutton(top3, text='前後比較', value='both',
                             variable=self.var_3dsrc,
                             command=self._draw_3d).pack(side='left')
-            ttk.Button(top3, text='⟳ 重繪 3D',
+            ttk.Button(top3, text='重畫',
                        command=self._draw_3d).pack(side='left', padx=6)
-            ttk.Button(top3, text='⌂ 重置視角',
+            ttk.Button(top3, text='回到原本角度',
                        command=lambda: self._vtk_reset_view()).pack(side='left')
-            ttk.Label(top3, text='  Z 高度比例').pack(side='left')
+            ttk.Label(top3, text='  高度放大').pack(side='left')
             self.var_3dz = tk.DoubleVar(value=0.6)
             tk.Scale(top3, from_=0.1, to=3.0, resolution=0.05,
                      orient='horizontal', variable=self.var_3dz, length=150,
                      command=self._apply_3d_z, showvalue=True).pack(side='left')
             engine = 'VTK/GPU' if HAS_VTK else 'matplotlib/CPU（未裝 vtk，較卡）'
             ttk.Label(top3,
-                      text=f'（拖曳旋轉；滑桿調 Z 軸高度；前後比對＝影像/還原/差值三張並排同尺度；繪圖引擎：{engine}）',
+                      text=f'（滑鼠拖曳可旋轉、滾輪可放大；繪圖：{engine}）',
                       foreground='#888').pack(side='left')
             self.has_vtk = HAS_VTK
             if HAS_VTK:
@@ -964,9 +1053,66 @@ def launch_gui():
             self._refresh()
             self._update_tip_mode()
 
+        def _make_fold(self, parent, title):
+            """可展開/收合的區塊（預設收合），回傳內容 Frame。"""
+            var = tk.BooleanVar(value=False)
+            frame = ttk.Frame(parent, padding=(8, 2, 0, 2))
+            btn = ttk.Checkbutton(parent, text='▸ ' + title, variable=var,
+                                  style='Toolbutton',
+                                  command=lambda: self._toggle_adv(frame))
+            btn.pack(fill='x', pady=(4, 0))
+            self._folds[frame] = (var, btn, title)
+            return frame
+
+        def _toggle_adv(self, frame, open_=None):
+            var, btn, title = self._folds[frame]
+            if open_ is not None:
+                var.set(open_)
+            btn.config(text=('▾ ' if var.get() else '▸ ') + title)
+            if var.get():
+                frame.pack(fill='x', after=btn)
+            else:
+                frame.pack_forget()
+
+        # ── 結果卡片：修正前 → 修正後（白話）──────────────────
+        def _update_headline(self):
+            """有畫線用畫線量測；沒畫線用自動量測（等效直徑）。"""
+            b = a = None
+            how = ''
+            if self.image is not None and self.section:
+                xpos = self.section.get('xpos')
+                _, ci = self._curve_chord(self.image, xpos)
+                if ci:
+                    b = ci['w']
+                    if self.var_vwall.get():
+                        vw = self._section_lines().get('vw')
+                        if vw:
+                            a, how = vw['wtrue'], '依你畫的線量測（側邊是直的，用幾何公式）'
+                    elif self.recon is not None:
+                        _, cr = self._curve_chord(self.recon, xpos)
+                        if cr:
+                            a, how = cr['w'], '依你畫的線量測'
+            elif self.meas_in and self.recon is not None:
+                b = self.meas_in['equiv_diam_nm']
+                if self.var_vwall.get() and self.meas_vw:
+                    a = 0.5 * (self.meas_vw['tx'] + self.meas_vw['ty'])
+                    how = '自動量最大的點（側邊是直的）；拉線可指定位置'
+                elif self.meas:
+                    a, how = self.meas['equiv_diam_nm'], '自動量最大的點；拉線可指定位置'
+            self.lbl_hl_before.config(text='—' if b is None else f'{b:.2f} nm')
+            self.lbl_hl_after.config(text='—' if a is None else f'{a:.2f} nm')
+            if b and a is not None:
+                d = b - a
+                self.lbl_hl_note.config(
+                    text=f'探針多算了 {d:.2f} nm（{d / b * 100:.0f}%），已扣除\n{how}')
+            elif self.image is None:
+                self.lbl_hl_note.config(text='開啟圖檔後會自動計算')
+            else:
+                self.lbl_hl_note.config(text='在右邊圖上拉一條線，穿過要量的點')
+
         def _stat(self, parent, name, row):
             ttk.Label(parent, text=name + '：').grid(row=row, column=0, sticky='w')
-            v = ttk.Label(parent, text='—', foreground='#0a7')
+            v = ttk.Label(parent, text='—', style='Val.TLabel')
             v.grid(row=row, column=1, sticky='w')
             return v
 
@@ -1024,12 +1170,13 @@ def launch_gui():
                     sample = self.var_sample.get()
                     arr, px_nm, info = load_nanoscope_surface(p, sample)
                     self.var_px.set(f'{px_nm:.2f}')            # 自動帶入尺度
-                    src = f'Nanoscope {os.path.basename(p)}\n{info}'
+                    src = (f'{os.path.basename(p)}｜{arr.shape[1]}×{arr.shape[0]} 格'
+                           f'｜每格 {px_nm:.2f} nm')
                     self._log(f'解析 Nanoscope：{info}（樣品={sample}）')
                 else:
                     arr = np.squeeze(np.load(p)).astype(np.float64)
-                    src = (f'{os.path.basename(p)}\nshape={arr.shape}  '
-                           f'[{arr.min():.1f}, {arr.max():.1f}] nm')
+                    src = (f'{os.path.basename(p)}｜{arr.shape[1]}×{arr.shape[0]} 格'
+                           f'｜高低差 {arr.max() - arr.min():.1f} nm')
             except Exception as e:
                 messagebox.showerror('讀取失敗', str(e)); return
             if arr.ndim != 2:
@@ -1211,7 +1358,8 @@ def launch_gui():
                 self.apex_in = self.apex_re = None
                 self.pick = None
                 self.lbl_img.config(
-                    text=f'Nanoscope {os.path.basename(self.image_path)}\n{info}')
+                    text=f'{os.path.basename(self.image_path)}｜{arr.shape[1]}×'
+                         f'{arr.shape[0]} 格｜每格 {px_nm:.2f} nm')
                 self._log(f'樣品類型 → {sample}：已重新載入並重新去傾斜')
                 self._refresh()
             self._refresh_auto_half()
@@ -1318,7 +1466,7 @@ def launch_gui():
             self.pick = (float(y), float(x))
             self.lbl_pick.config(
                 text=f'量測位置：點選 (x={int(x)}, y={int(y)})'
-                     f'　→ 按「↺ 自動」可還原')
+                     f'（按「自動找最大的點」還原）')
             self._log(f'點選量測位置 (x={int(x)}, y={int(y)})')
             self._measure()
 
@@ -1597,9 +1745,7 @@ def launch_gui():
 
         def _pick_reset(self):
             self.pick = None
-            self.lbl_pick.config(text='量測位置：自動（全圖最大特徵）\n'
-                                      '👆 點影像/還原圖=選特徵；'
-                                      '點剖面圖高度=改量測門檻')
+            self.lbl_pick.config(text='量測位置：自動（全圖最大的點）')
             if self.recon is not None:
                 self._measure()
 
@@ -1789,14 +1935,14 @@ def launch_gui():
             axi.clear(); axp.clear()
             axi.set_xticks([]); axi.set_yticks([])
             if self.image is None:
-                axi.set_title('掃描影像（尚未載入）', fontsize=9)
+                axi.set_title('AFM 圖（請先在左邊按「開啟圖檔」）', fontsize=10)
                 axp.set_xticks([]); axp.set_yticks([])
-                axp.set_title('Section 剖面（載入後在左圖拖線量測）', fontsize=9)
+                axp.set_title('切面圖（開啟圖檔後，在左圖拖一條線）', fontsize=10)
                 self._clear_table(); self._sa = {}
                 self.fig1.tight_layout(); self.canvas1.draw()
                 return
             axi.imshow(self.image, cmap='afmhot')            # AFM 金銅色調
-            axi.set_title('掃描影像　（按住拖曳＝拉剖面線；拖白點＝調整）', fontsize=9)
+            axi.set_title('AFM 圖　按住滑鼠拖一條線來量大小（拖白色方塊可調整）', fontsize=10)
             if self.apex_in:                                 # 2D 亞像素頂點（青色十字）
                 axi.plot([self.apex_in['x']], [self.apex_in['y']], '+',
                          color='#00e5ff', ms=11, mew=1.8, zorder=7)
@@ -1805,8 +1951,9 @@ def launch_gui():
                 self._update_table()
             else:
                 axp.set_xticks([]); axp.set_yticks([])
-                axp.set_title('Section 剖面\n（在左圖按住滑鼠拖出一條線）', fontsize=9)
+                axp.set_title('切面圖\n（在左圖按住滑鼠拖一條線，就會顯示這條線的高低起伏）', fontsize=10)
                 self._clear_table(); self._sa = {}
+            self._update_headline()
             self.fig1.tight_layout(); self.canvas1.draw()
 
         # ── 頁2：去卷積詳情（原 2×4 圖）───────────────────────
@@ -1895,20 +2042,20 @@ def launch_gui():
             zi, ci = self._curve_chord(self.image, xpos)
             if ci:
                 self.tbl.insert('', 'end', tags=('img',),
-                                values=('影像', f'{zi:.2f}', f"{ci['xl']:.2f}",
+                                values=('修正前', f'{zi:.2f}', f"{ci['xl']:.2f}",
                                         f"{ci['xr']:.2f}", f"{ci['w']:.2f}"))
             if self.var_vwall.get():                     # 垂直壁：綠色真實寬列
                 L = self._section_lines(); vw = L.get('vw')
                 if vw:
                     self.tbl.insert('', 'end', tags=('vw',),
-                                    values=('垂直壁真實', f'{vw["z"]:.2f}',
+                                    values=('修正後（側邊直）', f'{vw["z"]:.2f}',
                                             f'{vw["xl"]:.2f}', f'{vw["xr"]:.2f}',
                                             f'{vw["wtrue"]:.2f}'))
             elif self.recon is not None:
                 zr, cr = self._curve_chord(self.recon, xpos)
                 if cr:
                     self.tbl.insert('', 'end', tags=('rec',),
-                                    values=('還原', f'{zr:.2f}', f"{cr['xl']:.2f}",
+                                    values=('修正後', f'{zr:.2f}', f"{cr['xl']:.2f}",
                                             f"{cr['xr']:.2f}", f"{cr['w']:.2f}"))
             self.tbl.tag_configure('img', foreground='#d2691e')
             self.tbl.tag_configure('rec', foreground='#c0392b')
@@ -1964,13 +2111,13 @@ def launch_gui():
                 self.ax3 = self.fig3.add_subplot(111, projection='3d')
                 self._3d_axes = [self.ax3]
                 if surf is None:
-                    self.ax3.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
+                    self.ax3.set_title('（請先開啟圖檔）', fontsize=10)
                     self.canvas3.draw(); return
                 X, Y, z = self._3d_sample(surf)
                 self.ax3.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
                                       antialiased=False,
                                       rcount=z.shape[0], ccount=z.shape[1])
-                lab = '還原表面' if src == 'recon' else '輸入影像'
+                lab = '修正後' if src == 'recon' else '修正前（原圖）'
                 self.ax3.set_title(
                     f'{lab} 3D（{z.shape[1]}×{z.shape[0]} 取樣；拖曳旋轉）',
                     fontsize=10)
@@ -1989,7 +2136,7 @@ def launch_gui():
             """前後比對：影像／還原／差值(影像−還原) 並排 3D，方便對照撐寬/變淺量。"""
             if self.image is None or self.recon is None:
                 ax = self.fig3.add_subplot(111, projection='3d')
-                ax.set_title('（尚無資料——請先載入並去卷積）', fontsize=10)
+                ax.set_title('（請先開啟圖檔）', fontsize=10)
                 self._3d_axes = [ax]
                 return
             ax_i = self.fig3.add_subplot(131, projection='3d')
@@ -2000,8 +2147,8 @@ def launch_gui():
             Xr, Yr, zr = self._3d_sample(self.recon)
             zmin = min(zi.min(), zr.min())
             zmax = max(zi.max(), zr.max())
-            for ax, X, Y, z, lab in ((ax_i, Xi, Yi, zi, '輸入影像'),
-                                      (ax_r, Xr, Yr, zr, '還原表面')):
+            for ax, X, Y, z, lab in ((ax_i, Xi, Yi, zi, '修正前（原圖）'),
+                                      (ax_r, Xr, Yr, zr, '修正後')):
                 ax.plot_surface(X, Y, z, cmap='afmhot', linewidth=0,
                                 antialiased=False,
                                 rcount=z.shape[0], ccount=z.shape[1],
@@ -2019,7 +2166,7 @@ def launch_gui():
                               linewidth=0, antialiased=False,
                               rcount=h, ccount=w, vmin=-dmax, vmax=dmax)
             ax_d.set_zlim(-dmax, dmax)
-            ax_d.set_title(f'差值（影像−還原）（{w}×{h} 取樣）', fontsize=10)
+            ax_d.set_title('探針多算的部分', fontsize=10)
             ax_d.set_xlabel('X (nm)'); ax_d.set_ylabel('Y (nm)')
             ax_d.set_zlabel('ΔZ (nm)')
 
@@ -2139,7 +2286,7 @@ def launch_gui():
             self._vtk_actor_boosts.append(zboost)
             return ren
 
-        def _vtk_empty(self, msg='（尚無資料——請先載入並去卷積）'):
+        def _vtk_empty(self, msg='（請先開啟圖檔）'):
             ren = vtk.vtkRenderer()
             ren.SetViewport(0.0, 0.0, 1.0, 1.0)
             ren.SetBackground(0.08, 0.08, 0.1)
@@ -2165,16 +2312,16 @@ def launch_gui():
                     zmax = max(zi.max(), zr.max())
                     zspan = max(zmax - zmin, 1e-9)
                     self._vtk_add_view((0.0, 0.0, 1/3, 1.0), Xi, Yi, zi,
-                                       'afmhot', zmin, zmax, '輸入影像')
+                                       'afmhot', zmin, zmax, '修正前（原圖）')
                     self._vtk_add_view((1/3, 0.0, 2/3, 1.0), Xr, Yr, zr,
-                                       'afmhot', zmin, zmax, '還原表面')
+                                       'afmhot', zmin, zmax, '修正後')
                     h = min(zi.shape[0], zr.shape[0])
                     w = min(zi.shape[1], zr.shape[1])
                     zd = zi[:h, :w] - zr[:h, :w]
                     dmax = max(abs(zd.min()), abs(zd.max()), 1e-9)
                     # 差值絕對量遠小於原始 Z 範圍，額外放大顯示比例讓三張圖視覺高度相近
                     self._vtk_add_view((2/3, 0.0, 1.0, 1.0), Xi[:h, :w], Yi[:h, :w],
-                                       zd, 'RdBu_r', -dmax, dmax, '差值（影像−還原）',
+                                       zd, 'RdBu_r', -dmax, dmax, '探針多算的部分',
                                        zboost=zspan / (2 * dmax))
                     # 只在最後對「輸入影像」那格 ResetCamera（相機共用，呼叫者的
                     # 視角會套用到全部視圖；三格 X/Y/Z 範圍已對齊，框一次即可）。
@@ -2186,7 +2333,7 @@ def launch_gui():
                     self._vtk_empty()
                 else:
                     X, Y, z = self._3d_sample(surf)
-                    lab = '還原表面' if src == 'recon' else '輸入影像'
+                    lab = '修正後' if src == 'recon' else '修正前（原圖）'
                     self._vtk_add_view((0.0, 0.0, 1.0, 1.0), X, Y, z,
                                        'afmhot', float(z.min()), float(z.max()), lab)
                     if not self._vtk_cam_initialized:
@@ -2488,10 +2635,10 @@ def launch_gui():
             zstar = self._measure_level(xpos)
             if zstar is None:
                 return {'h': '', 'i': '', 'r': '', 'd': ''}
-            out = {'h': f'量測高度 {zstar:.2f} nm（影像基準）', 'i': '', 'r': '',
+            out = {'h': f'在 {zstar:.2f} nm 高的地方量', 'i': '', 'r': '',
                    'd': '', 'vw': None}
             _, ci = self._curve_chord(self.image, xpos)
-            out['i'] = (f"影像寬度 {ci['w']:.2f} nm" if ci else '影像：此高度無交點')
+            out['i'] = (f"修正前寬度 {ci['w']:.2f} nm" if ci else '修正前：這個高度量不到')
             if self.var_vwall.get() and ci:
                 # 已知垂直側壁：撐寬 = 2×探針側向寬 w(Δz)，Δz=特徵頂到量測高度
                 prof = self._section_profile(self.image)
@@ -2499,8 +2646,8 @@ def launch_gui():
                 dz = ztop - zstar
                 w = self._tip_lateral(dz)
                 wtrue = ci['w'] - 2 * w
-                out['r'] = f"垂直壁真實寬 {wtrue:.2f} nm"
-                out['d'] = f"撐寬量 {2*w:+.2f} nm（垂直壁 2·w，深 Δz={dz:.1f}nm）"
+                out['r'] = f"修正後寬度 {wtrue:.2f} nm（側邊直）"
+                out['d'] = f"探針多算了 {2*w:.2f} nm"
                 out['vw'] = {'wtrue': wtrue, 'xl': ci['cx'] - wtrue/2 if 'cx' in ci
                              else (ci['xl']+ci['xr'])/2 - wtrue/2, 'z': zstar,
                              'w2': 2*w}
@@ -2512,10 +2659,10 @@ def launch_gui():
                 cr = None
                 if self.recon is not None:
                     _, cr = self._curve_chord(self.recon, xpos)
-                    out['r'] = (f"還原寬度 {cr['w']:.2f} nm" if cr
-                                else '還原：此高度無交點')
+                    out['r'] = (f"修正後寬度 {cr['w']:.2f} nm" if cr
+                                else '修正後：這個高度量不到')
                 if ci and cr:
-                    out['d'] = f"寬度差 {ci['w'] - cr['w']:+.2f} nm（探針撐寬量）"
+                    out['d'] = f"探針多算了 {ci['w'] - cr['w']:.2f} nm"
             return out
 
         def _draw_section(self, axi, axp):
@@ -2535,11 +2682,11 @@ def launch_gui():
             if prof_i is not None:
                 xs, zi = prof_i
                 sa['prof_img'], = axp.plot(xs, zi, color='#ff8c00', lw=1.5,
-                                           label='影像')
+                                           label='修正前（原圖）')
                 if self.recon is not None:
                     _, zr = self._section_profile(self.recon)
                     sa['prof_rec'], = axp.plot(xs, zr, color='#d1495b', lw=1.5,
-                                               label='還原')
+                                               label='修正後')
                 # 位置游標（灰垂線）＋兩曲線在同一 z*(影像高度) 的水平弦
                 sa['vcur'] = axp.axvline(xpos, color='#555', ls='--', lw=1.3,
                                          alpha=0.8)
@@ -2567,9 +2714,9 @@ def launch_gui():
                 sa['stxt_d'] = axp.text(0.02, 0.695, '', transform=axp.transAxes,
                                         va='top', fontsize=11, fontweight='bold',
                                         color='#1a7a4a', bbox=tb)
-                axp.set_title('Section 剖面（點/拖游標選高度，影像/還原同高比寬）',
-                              fontsize=9)
-                axp.set_xlabel('沿線距離 nm'); axp.set_ylabel('高度 nm')
+                axp.set_title('切面圖　橘＝修正前、紅＝修正後（點圖可換量的高度）',
+                              fontsize=10)
+                axp.set_xlabel('沿著線的距離 (nm)'); axp.set_ylabel('高度 (nm)')
                 axp.grid(alpha=0.3); axp.legend(fontsize=8, loc='upper right')
             self._sa = sa
             self._update_section_artists(light=False)
@@ -2640,6 +2787,7 @@ def launch_gui():
                 ax = sa['prof_img'].axes
                 ax.relim(); ax.autoscale_view()
             self._update_table()
+            self._update_headline()
             if light:
                 self.canvas1.draw_idle()
 
